@@ -1,0 +1,24 @@
+{
+  "name": "penguin-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "飞书机器人 ⇄ PenguinHarness 桥接程序（Bridge）",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "start": "node --enable-source-maps dist/src/index.js"
+  },
+  "dependencies": {
+    "@prismshadow/amsp": "0.2.16"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
