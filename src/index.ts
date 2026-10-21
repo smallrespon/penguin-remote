@@ -56,9 +56,6 @@ async function main(): Promise<void> {
     },
   });
 
-  await gateway.start();
-  logger.info("Bridge 已启动，等待飞书消息");
-
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`收到 ${signal}，正在退出`);
     await gateway.stop();
@@ -66,8 +63,12 @@ async function main(): Promise<void> {
     await runLog.flush();
     process.exit(0);
   };
+  // 先装信号处理再启动：否则启动日志到 handler 注册之间的 SIGTERM 会走默认行为（被信号杀死）。
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+
+  await gateway.start();
+  logger.info("Bridge 已启动，等待飞书消息");
 }
 
 main().catch((error: unknown) => {

@@ -113,3 +113,29 @@ test("409 会话忙：回复忙提示而非错误堆栈，且不重试", async (
   assert.match(report.error ?? "", /Task in progress/);
   assert.equal(channel.sent.at(-1)?.markdown, BUSY_HINT);
 });
+
+test("审批请求：v1 一律拒绝，并在预览里说明（allow-all 模式下不会发生）", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const reportPromise = runOnce(server, channel);
+  await waitFor(() => server.runs.length > 0);
+  const run = server.lastRun();
+  server.push(run, {
+    type: "approval.requested",
+    at: new Date().toISOString(),
+    tool_call: { tool_call_id: "call_9", name: "exec_command", arguments: '{"command":"ls"}' },
+  });
+  server.push(run, textDone("被拒绝后继续"));
+  server.push(run, runDone());
+  server.close(run);
+
+  const report = await reportPromise;
+  assert.equal(report.status, "completed");
+  assert.deepEqual(server.approvalCalls, [
+    { sessionId: run.sessionId, toolCallId: "call_9", decision: "deny" },
+  ]);
+  // 预览里既有「等待审批」也有「已拒绝」的说明
+  const preview = channel.edited.map((e) => e.markdown).join("\n");
+  assert.match(preview, /等待审批：`exec_command`/);
+  assert.match(preview, /已拒绝 `exec_command`/);
+});

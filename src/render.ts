@@ -129,6 +129,11 @@ export class RunPreview {
   noteFlushed(now: number): void {
     this.lastFlush = { at: now, chars: previewLength(this.state) };
   }
+
+  /** 追加一条非正文提示（如审批结果）。 */
+  addNotice(text: string): void {
+    this.state = { ...this.state, notices: [...this.state.notices, text] };
+  }
 }
 
 function formatUsage(usage: { total: number } | null): string {
