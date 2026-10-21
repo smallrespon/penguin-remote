@@ -17,6 +17,9 @@ export const TOOL_OUTPUT_LIMIT = 200;
 
 export const PLACEHOLDER_TEXT = "🦐 思考中…";
 
+/** 聊天正在执行中的提示（Lane 忙、409 会话忙共用）。 */
+export const BUSY_HINT = "⏳ 这个聊天正在执行中，`/stop` 可中断，请稍候再发。";
+
 export interface PreviewState {
   /** 累积的正文（assistant 文本）。 */
   text: string;

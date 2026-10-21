@@ -1,6 +1,6 @@
 // 日志：级别过滤 + 密钥打码。Agent API key（penguin_…）与 owner 会话令牌绝不进日志。
 
-import type { LogLevel } from "./config.ts";
+import type { LogLevel } from "./config.js";
 
 const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
