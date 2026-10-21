@@ -79,7 +79,8 @@ function errorOf(payload: Record<string, unknown>): { code: string; message: str
 export function toRunEvents(message: OmniMessage): RunEvent[] {
   if (message.type !== "model_msg") return [];
   const p = message.payload;
-  const at = message.timestamp ?? new Date(0).toISOString();
+  // 缺 timestamp 时用当前时间兜底（思考分区按起止时间算耗时，不能拿纪元时间充数）
+  const at = message.timestamp ?? new Date().toISOString();
   switch (p.type) {
     case "partial_text": {
       if (p.event_type === "stop" || p.role !== "assistant") return [];

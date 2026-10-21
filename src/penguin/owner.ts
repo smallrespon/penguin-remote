@@ -1,5 +1,6 @@
 // Owner 会话：用 `penguin auth token` 自铸临时人类登录态，调 owner 级路由
-// （改 Agent API 设置、建 Agent、铸 key）。令牌只驻内存，过期前重铸，不落盘、不进日志。
+// （列 Project / Agent / 模型）；`fetchAuthed` 供会话 API 客户端复用（ADR-0005）。
+// 令牌只驻内存，过期前重铸，401 自动重铸重试，不落盘、不进日志。
 
 import type { Logger } from "../logger.js";
 import { runCommand } from "../proc.js";
@@ -35,26 +36,6 @@ export interface ModelCatalog {
   models: ModelInfo[];
   /** Project 配置里的默认模型；没有则 null。 */
   defaultModel: ModelRef | null;
-}
-
-export interface AgentApiSettings {
-  enabled: boolean;
-  open: boolean;
-  approvalMode: "allow-all" | "deny-all" | "read-only" | "always-ask";
-  model: { provider: string; modelId: string } | null;
-  thinkingLevel: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
-  workspace: string | null;
-  maxConcurrentRuns: number;
-}
-
-export interface AgentApiResponse {
-  api: AgentApiSettings;
-  serverEnabled: boolean;
-}
-
-export interface CreatedKey {
-  keyId: string;
-  secret: string;
 }
 
 export interface OwnerSessionOptions {
@@ -203,50 +184,6 @@ export class OwnerSession {
       `/projects/${encodeURIComponent(projectId)}/models`,
     );
     return { models: data.models ?? [], defaultModel: data.defaultModel ?? null };
-  }
-
-  async getAgentApi(projectId: string, agentId: string): Promise<AgentApiResponse> {
-    return this.request<AgentApiResponse>(
-      `/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/api`,
-    );
-  }
-
-  async putAgentApi(
-    projectId: string,
-    agentId: string,
-    patch: {
-      enabled?: boolean;
-      approvalMode?: string;
-      model?: { provider: string; modelId: string } | null;
-      thinkingLevel?: string | null;
-      workspace?: string | null;
-      maxConcurrentRuns?: number;
-    },
-  ): Promise<AgentApiResponse> {
-    return this.request<AgentApiResponse>(
-      `/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/api`,
-      { method: "PUT", body: patch },
-    );
-  }
-
-  async createAgent(projectId: string, agentId: string, name: string): Promise<void> {
-    await this.request(`/projects/${encodeURIComponent(projectId)}/agents`, {
-      method: "POST",
-      body: { agentId, name },
-    });
-  }
-
-  /** 铸一个 Agent 的 AMSP key；响应是 `{ key: { keyId, ... }, secret }`，只取这两个字段。 */
-  async createKey(projectId: string, agentId: string, name: string): Promise<CreatedKey> {
-    const data = await this.request<{ key?: { keyId?: string }; secret?: string }>(
-      `/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/api/keys`,
-      { method: "POST", body: { name } },
-    );
-    const keyId = data.key?.keyId;
-    if (typeof keyId !== "string" || typeof data.secret !== "string") {
-      throw new OwnerError("铸造 key 失败：响应里没有 keyId / secret");
-    }
-    return { keyId, secret: data.secret };
   }
 }
 

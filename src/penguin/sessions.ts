@@ -143,22 +143,16 @@ export class SessionStream implements AsyncIterable<StreamItem> {
   private readonly frames: AsyncGenerator<SseFrame>;
   private primed: IteratorResult<SseFrame> | null = null;
   private finished = false;
-  private readonly readyPromise: Promise<void>;
-  private resolveReady!: () => void;
 
   constructor(frames: AsyncGenerator<SseFrame>) {
     this.frames = frames;
-    this.readyPromise = new Promise((resolve) => {
-      this.resolveReady = resolve;
-    });
   }
 
-  /** 首帧到达即 resolve；连接建立失败则 reject。 */
+  /** 首帧到达即返回（服务端订阅后立刻发 task_state 快照）；连接建立失败则抛错。 */
   async ready(): Promise<void> {
     if (this.primed === null && !this.finished) {
       this.primed = await this.frames.next();
     }
-    this.resolveReady();
   }
 
   async next(): Promise<IteratorResult<StreamItem>> {

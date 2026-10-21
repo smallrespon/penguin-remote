@@ -97,7 +97,7 @@ test("owner 令牌：401 时重铸一次再试，仍失败则抛错", async () =
   assert.equal(failing.requests.length, 2);
 });
 
-test("owner 路由：projects / agents / models / api 读写 / 建 Agent / 铸 key", async () => {
+test("owner 路由：projects / agents / models 只读清单", async () => {
   const fake = fakeRun("---penguin-auth-token---\ntok");
   const owner = new FakeOwnerServer({
     "GET /api/projects": { projects: [{ projectId: "p1", name: "默认" }] },
@@ -106,10 +106,6 @@ test("owner 路由：projects / agents / models / api 读写 / 建 Agent / 铸 k
       models: [{ provider: "stepfun", modelId: "step-3" }],
       defaultModel: { provider: "stepfun", modelId: "step-3" },
     },
-    "GET /api/projects/p1/agents/a1/api": { api: { enabled: true }, serverEnabled: true },
-    "PUT /api/projects/p1/agents/a1/api": { api: { enabled: true }, serverEnabled: true },
-    "POST /api/projects/p1/agents": {},
-    "POST /api/projects/p1/agents/a1/api/keys": { key: { keyId: "k1" }, secret: "penguin_secret" },
   });
   const session = makeSession(fake, owner);
 
@@ -119,19 +115,6 @@ test("owner 路由：projects / agents / models / api 读写 / 建 Agent / 铸 k
     models: [{ provider: "stepfun", modelId: "step-3" }],
     defaultModel: { provider: "stepfun", modelId: "step-3" },
   });
-  assert.equal((await session.getAgentApi("p1", "a1")).api.enabled, true);
-
-  await session.putAgentApi("p1", "a1", { model: { provider: "stepfun", modelId: "step-3" } });
-  const put = owner.requests.find((r) => r.method === "PUT");
-  assert.deepEqual(put?.path, "/api/projects/p1/agents/a1/api");
-  assert.deepEqual(put?.body, { model: { provider: "stepfun", modelId: "step-3" } });
-
-  await session.createAgent("p1", "feishu_abc", "Feishu oc_x");
-  const created = owner.requests.find((r) => r.method === "POST" && r.path === "/api/projects/p1/agents");
-  assert.deepEqual(created?.body, { agentId: "feishu_abc", name: "Feishu oc_x" });
-
-  const key = await session.createKey("p1", "a1", "penguin-remote-bridge");
-  assert.deepEqual(key, { keyId: "k1", secret: "penguin_secret" });
 
   // 路径片段被转义：不会被注入
   await session.listAgents("p 1/x");
@@ -140,6 +123,8 @@ test("owner 路由：projects / agents / models / api 读写 / 建 Agent / 铸 k
     "/api/projects/p%201%2Fx/agents",
     "projectId 应被 encodeURIComponent",
   );
+  // ADR-0005 起 Bridge 只读 owner 路由：没有任何写方法留在 OwnerSession 上
+  assert.deepEqual(["createAgent", "createKey", "getAgentApi", "putAgentApi"].filter((m) => m in session), []);
 });
 
 test("owner 路由：非 2xx 抛出 OwnerError 且带状态码", async () => {

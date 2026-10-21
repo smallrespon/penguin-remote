@@ -4,21 +4,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { SessionClient } from "../src/penguin/sessions.js";
 import { executeRun, type RunHandle } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
-import { FakeSessionServer, frame } from "./helpers/fake-sessions.js";
+import { FakeSessionServer, frame, sessionClient } from "./helpers/fake-sessions.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
 import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
 
 const AGENT = { projectId: "default_project", agentId: "default_agent" };
-
-function api(server: FakeSessionServer): SessionClient {
-  return new SessionClient({ fetchAuthed: server.fetchAuthed });
-}
 
 /** 一轮正常 Run 的帧脚本：思考 → 工具 → 正文 → 用量 → idle。 */
 function happyScript(): Array<string | { hang: true }> {
@@ -51,7 +46,7 @@ async function runOnce(
       input: "今天几号",
       agent: AGENT,
       sessionId: null,
-      client: api(server),
+      client: sessionClient(server),
       preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
       ...overrides,
       ...(onStart ? { onStart } : {}),
@@ -96,7 +91,7 @@ test("新建会话：档位下发 + thinking PATCH + 定稿含分区与用量页
 
 test("续接会话：不再建会话，直接投递", async () => {
   const server = new FakeSessionServer();
-  const client = api(server);
+  const client = sessionClient(server);
   const existing = await client.createSession("default_project", "default_agent");
   server.defaultScript = happyScript();
   const channel = new FakeChannel();
@@ -177,7 +172,7 @@ test("/stop：abort 后流补发 abort 事件与 idle，结局为 aborted", asyn
   assert.match(final, /未正常完成（aborted）/);
 });
 
-test("审批请求：按策略拒绝并把决定写进预览", async () => {
+test("审批请求：先落「等待审批」预览，再按策略拒绝并把决定写进预览", async () => {
   const server = new FakeSessionServer();
   server.defaultScript = [
     frame.taskState("running"),
@@ -193,6 +188,7 @@ test("审批请求：按策略拒绝并把决定写进预览", async () => {
     { sessionId: "session-fake-1", toolCallId: "tc7", decision: "deny" },
   ]);
   const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /⚠️ 等待审批：`exec_command`/);
   assert.match(final, /🚫 已拒绝 `exec_command`/);
   assert.equal(report.status, "completed");
 });
@@ -233,7 +229,7 @@ test("编辑全部失败：降级为最终一次性发送", async () => {
 
 test("建会话失败：占位消息里写失败原因", async () => {
   const server = new FakeSessionServer();
-  const client = api(server);
+  const client = sessionClient(server);
   client.createSession = async () => {
     throw new Error("model not found");
   };

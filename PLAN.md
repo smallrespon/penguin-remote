@@ -145,7 +145,7 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 - Registry 记录每个 chat 用过的所有 session（task 投递返回时落盘），`/sessions` 列最近 N 条（标题取服务端生成的标题或首条消息摘要），`/use <n>` 把绑定切回该 session，下一条消息继续往这个会话投递。
 - 会话列表仍靠 Bridge 自己的 Registry（OpenClaw 式「Gateway 是单一事实来源」）；会话 API 虽能按 Agent 列会话，但跨聊天/跨项目的汇总视图没有，自持更简单。
 - `/new` = 清掉当前 sessionId 绑定，下一条消息新建（新建时带上当前档位）。
-- 迁移约定：v1.0 时期 AMSP 建的会话是 `source: "api"`（已归档）。它们仍可被会话 API 续接（续了也保持归档），绑定保留、自然老化；自 ADR-0005 起新建的会话都是普通会话。
+- 迁移约定：v1.0 时期 AMSP 建的会话是 `source: "api"`（已归档）。2026-10-21 实测：默认 Agent 名下的旧会话仍可被会话 API 续接（续了也保持归档），绑定保留、自然老化；按聊天懒建的 `feishu_*` 专属 Agent 名下的旧会话经会话 API 不可达（404，随 Agent 清理一并消失），这类绑定在 Registry 加载时迁回默认 Agent 并清掉会话引用（历史记录按归属自然过滤）。自 ADR-0005 起新建的会话都是普通会话（`source: "user"`，不归档）。
 
 ### 4.4 使用 Skill
 
@@ -163,14 +163,14 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 - 每条 Run 开始：发一条占位消息（markdown，内容为「🦐 思考中…」），拿到 `message_id`。
 - **订阅先于投递**：先连 `GET /api/sessions/:id/stream`（SSE，首事件是 `task_state` 快照），再 `POST .../tasks`，保证不丢事件。
 - 事件映射（OmniMessage → 回复分区，格式细节见 §13）：`partial_text` 增量累积正文分区，完整的 assistant `text` 消息收尾；`partial_thinking`/`thinking` 折叠成思考标签行「🧠 思考中…（n 字）」；`tool_call` 追加「🔧 工具名」+ 一行截断到 80 字的参数（先 redact 后截断）；`tool_call_output` 回填 `output:` 围栏代码块（末尾 8 行、每行 ≤100 字符）；`compaction_begin` 记一条「🗜️ 正在压缩上下文…」提示分区。
-- 终局判定：`task_state` 从 running 回 idle 即 Run 结束；`request_end` 的 status（completed / aborted / fatal / retryable）与 `abort` 事件的 error_code 决定结局文案；`token_usage` 的 session 累计值做用量页脚。
+- 终局判定：`task_state` 从 running 回 idle 即 Run 结束；`request_end` 的 status（completed / aborted / fatal / retryable）与 `abort` 事件的 error_code 决定结局文案；用量按请求累计（每个 `request_begin` 配对的 `token_usage.request.total` 求和，压缩期间的用量也计入；一个请求都没跑过则没有用量页脚），与 v1.0 AMSP 客户端口径一致。
 - 节流：每 ≥1.5s 或累积 ≥300 字符才 `messages-edit` 一次；最终定稿一次。编辑失败（频率限制）退化为「不编辑，最后一次性发总结」；单条消息编辑次数用尽（实测 20 次）换新消息续接预览。
 - 断流处置：SSE 中途断开不会让服务端停止任务，Bridge 显式 `POST .../abort` 中止并把该 Run 记为失败，避免僵尸任务占住会话。
 
 ### 4.6 并发与限流
 
 - Lane Queue：同一 `chatId` 串行；Run 进行中该聊天再来消息 → 回复「正在执行中，`/stop` 可中断」并丢弃（不排队，避免惊鹜）。
-- 会话 API 的并发语义是「忙时入队」（`queueIfBusy`）而非 409；Bridge 的 Lane 已经保证一个聊天同时只投递一个任务，正常不会撞上。撞上就等队列自然排空（仍在同一个 SSE 订阅里守到 idle）。
+- 会话 API 的 tasks 支持 `queueIfBusy`（忙时入队、空闲自动起，202 响应的 `queued` 区分）；Bridge **不发送**它——Lane 已经保证一个聊天同时只投递一个任务，撞上 409 只可能是同一个会话被别的客户端占着，按「正在执行中」提示、不排队（与 Lane 语义一致）。要改成排队语义需同时改终局判定（排队期间会话一直忙，现在的「活跃过再回 idle」会在别人那个任务结束时误判定稿）。
 - Bridge 重启 = 所有在途 Run 的订阅断开 → 显式 abort 掉；重启后 Registry 里的 session 仍可 `/use` 续聊。
 
 ---

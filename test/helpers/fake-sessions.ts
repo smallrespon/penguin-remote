@@ -2,6 +2,8 @@
 // abort / approvals / SSE 订阅。帧用真实 ReadableStream 推送，走真实 SSE 解析路径。
 
 import type { AuthedFetch } from "../../src/penguin/sessions.js";
+import { SessionClient } from "../../src/penguin/sessions.js";
+import { waitFor } from "./wait.js";
 
 export interface FakeRequest {
   method: string;
@@ -55,6 +57,11 @@ export class FakeSessionServer {
       }
     }
     return null;
+  }
+
+  /** 所有 tasks 投递请求（按时间序）。 */
+  taskPosts(): FakeRequest[] {
+    return this.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
   }
 
   /** 往一条仍在订阅中的事件流补发一帧（模拟 Run 进行中的事件）。 */
@@ -211,6 +218,18 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/** 等下一次 tasks 投递出现（此刻订阅已就绪），返回会话 id。 */
+export async function waitForTask(server: FakeSessionServer): Promise<string> {
+  const before = server.taskPosts().length;
+  await waitFor(() => server.taskPosts().length > before);
+  return server.lastTaskSession() ?? "";
+}
+
+/** 测试共用的会话 API 客户端（传输层直接打假服务器）。 */
+export function sessionClient(server: FakeSessionServer): SessionClient {
+  return new SessionClient({ fetchAuthed: server.fetchAuthed });
 }
 
 function emptySession(sessionId: string): FakeSession {

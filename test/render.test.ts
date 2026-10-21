@@ -11,11 +11,10 @@ import {
   shouldFlush,
   type PreviewOptions,
 } from "../src/render.js";
-import { SessionClient } from "../src/penguin/sessions.js";
 import { executeRun } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
-import { FakeSessionServer, frame } from "./helpers/fake-sessions.js";
+import { FakeSessionServer, frame, sessionClient, waitForTask } from "./helpers/fake-sessions.js";
 import type { RunEvent } from "../src/run-event.js";
 
 // 单元测试用的事件构造器（旧 AMSP fake 的同款形态，现在直接用 Bridge 自有事件）。
@@ -393,18 +392,9 @@ test("formatFinalText：未正常完成时页脚带上状态与原因", () => {
 
 const AGENT = { projectId: "default_project", agentId: "default_agent" };
 
-function client(server: FakeSessionServer): SessionClient {
-  return new SessionClient({ fetchAuthed: server.fetchAuthed });
-}
-
 /** 等 Bridge 把任务投递出去（此刻订阅已就绪），返回会话 id。 */
 async function startedSession(server: FakeSessionServer): Promise<string> {
-  const started = Date.now();
-  while (server.lastTaskSession() === null) {
-    if (Date.now() - started > 1000) throw new Error("waitFor timeout");
-    await tick();
-  }
-  return server.lastTaskSession() ?? "";
+  return waitForTask(server);
 }
 
 /** 收尾三件套 + 流终止。 */
@@ -424,7 +414,7 @@ function startRun(server: FakeSessionServer, channel: FakeChannel) {
       input: "长任务",
       agent: AGENT,
       sessionId: null,
-      client: client(server),
+      client: sessionClient(server),
       preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
     },
   );
