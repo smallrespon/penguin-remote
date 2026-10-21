@@ -362,7 +362,7 @@ allowlist（配置项，留空 = 开放访问，见 §7）、日志脱敏、cons
 ## 11. 风险与未验证点
 
 1. **lark-cli 长驻稳定性**：consume 的 bus daemon「最后一个消费者退出 30s 后自动退出」——Bridge 必须始终持有 consume 进程；进程异常退出要有守护重启（P5）。
-2. **飞书消息编辑频率限制**未实测：节流参数（1.5s / 300 字）需按实测调整；失败要有降级路径。
+2. **飞书消息编辑频率限制**（已实测，2026-10-21）：不是频率问题，是**单条消息编辑次数上限**——长任务（93s / 30 次请求）会撞上 `230072 The message has reached the number of times it can be edited`。已实现的应对：编辑失败就换一条新消息继续承载预览（只换一次），仍失败才降级为最终一次性发送，结果不丢。具体上限次数飞书未公开文档，未实测；必要时可加一条探测。
 3. **卡片回调链路**（仅 v2 审批模式需要）：`card.action.trigger` 的 token 只有 30 分钟、更新卡片走另一个 API——真要做时先最小验证。
 4. **owner 令牌生命周期**：`penguin auth token` 默认 1 小时过期，过期后 owner 路由 401。Bridge 要主动重铸（过期前 5 分钟），重铸失败要能在飞书里提示而不是静默失败。
 5. **Agent 蔓延**：按聊天懒建专属 Agent 会让 Agent 数量随聊天增长；命名规范 `feishu_<hash>`，`agents.json` 记 `chatId`/`keyId`/`createdAt`（v1 未记 lastUsedAt，回收脚本留待需要时再加）。

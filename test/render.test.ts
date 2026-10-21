@@ -122,7 +122,7 @@ test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一�
   assert.ok(channel.edited.some((e) => /🔧 调用 `exec_command`/.test(e.markdown)));
 });
 
-test("流式预览：编辑失败时降级为最终一次性发送，结果不丢", async () => {
+test("流式预览：编辑一直失败时先换一条新消息，仍失败才降级为最终一次性发送", async () => {
   const server = new FakeAmspServer();
   const channel = new FakeChannel();
   channel.failEditWith = new Error("too many requests");
@@ -146,9 +146,54 @@ test("流式预览：编辑失败时降级为最终一次性发送，结果不�
   server.close(run);
   await report;
 
-  assert.equal(channel.edited.length, 0, "编辑一直失败，不应重试");
-  assert.equal(channel.sent.length, 2, "占位 + 降级后的总结");
+  assert.equal(channel.edited.length, 0, "编辑一直失败，不应重试同一条消息");
+  // 占位 + 换的新预览消息 + 最终总结
+  assert.equal(channel.sent.length, 3);
   assert.match(channel.lastSent(), /最终答案/);
+});
+
+test("流式预览：单条消息编辑次数用尽后换新消息继续，定稿落在新消息上", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  channel.editLimitPerMessage = 3;
+  const client = new AmspClient({
+    baseUrl: server.baseUrl,
+    agent: { projectId: "default_project", agentId: "default_agent" },
+    apiKey: "penguin_test",
+    fetch: server.fetch,
+  });
+  const report = executeRun({ channel, logger: silent }, {
+    chatId: "oc_1",
+    input: "长任务",
+    client,
+    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+  });
+  const run = await nextRun(server);
+  server.push(run, textDelta("第一段"));
+  await tick();
+  server.push(run, textDelta("第二段"));
+  await tick();
+  server.push(run, textDelta("第三段"));
+  await tick();
+  server.push(run, textDelta("第四段"));
+  await tick();
+  server.push(run, textDone("最终答案"));
+  server.push(run, runDone());
+  server.close(run);
+  await report;
+
+  // 占位消息被编辑满 2 次，随后换一条新消息继续
+  assert.equal(channel.sent.length, 2, "占位 + 换的新预览消息");
+  const [placeholder, chained] = channel.sent;
+  assert.equal(placeholder?.markdown, PLACEHOLDER_TEXT);
+  assert.match(chained?.markdown ?? "", /第二段/, "新消息带着当前进度出现");
+  const chainedId = chained?.messageId ?? "";
+  assert.ok(channel.edited.some((e) => e.messageId === chainedId), "后续编辑应打到新消息上");
+  // 定稿编辑在新消息上，而不是再发一条
+  const finalEdit = channel.edited.at(-1);
+  assert.equal(finalEdit?.messageId, chainedId);
+  assert.match(finalEdit?.markdown ?? "", /最终答案/);
+  assert.match(finalEdit?.markdown ?? "", /用量 42 tokens/);
 });
 
 function tick(): Promise<void> {
