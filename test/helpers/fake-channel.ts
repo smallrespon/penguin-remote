@@ -16,8 +16,10 @@ export class FakeChannel implements ChannelAdapter {
   readonly edited: EditedMessage[] = [];
   private handler: ((message: IncomingMessage) => void | Promise<void>) | null = null;
   private nextId = 1;
-  /** 让 send 抛出（模拟飞书编辑/发送频率限制）。 */
+  /** 让 send 抛出（模拟飞书发送失败）。 */
   failSendWith: Error | null = null;
+  /** 让 edit 抛出（模拟飞书编辑频率限制）。 */
+  failEditWith: Error | null = null;
 
   async start(handler: (message: IncomingMessage) => void | Promise<void>): Promise<void> {
     this.handler = handler;
@@ -34,6 +36,7 @@ export class FakeChannel implements ChannelAdapter {
   }
 
   async edit(messageId: string, markdown: string): Promise<void> {
+    if (this.failEditWith !== null) throw this.failEditWith;
     this.edited.push({ messageId, markdown });
   }
 

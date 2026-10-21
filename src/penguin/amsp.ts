@@ -42,6 +42,9 @@ export class RunStreamError extends Error {
   }
 }
 
+/** AMSP 事件类型（转发官方客户端的线类型）。 */
+export type { AmspEvent };
+
 export type RunInput = string | InputItem[];
 export type ApprovalDecision = "allow" | "deny";
 

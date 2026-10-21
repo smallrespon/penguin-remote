@@ -186,6 +186,11 @@ export class Gateway {
             input,
             ...(binding.sessionId !== null ? { sessionId: binding.sessionId } : {}),
             client,
+            preview: {
+              throttleMs: this.deps.config.previewThrottleMs,
+              throttleChars: this.deps.config.previewThrottleChars,
+              maxChars: this.deps.config.previewMaxChars,
+            },
             onStart: (run) => {
               this.activeRuns.set(chatId, { abort: run.abort });
             },
