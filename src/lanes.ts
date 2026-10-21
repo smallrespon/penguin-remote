@@ -1,10 +1,7 @@
 // 按 chatId 的串行执行队列（Lane）：一个聊天同时只跑一个 Run。
 // 语义：进行中的消息不排队，直接返回「忙」，由调用方回复提示。
 
-export interface LaneAttempt<T> {
-  started: boolean;
-  value?: T;
-}
+export type LaneAttempt<T> = { started: true; value: T } | { started: false };
 
 export class LaneQueue {
   private readonly busy = new Set<string>();

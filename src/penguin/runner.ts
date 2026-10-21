@@ -2,7 +2,7 @@
 // 流式预览（占位消息 + 节流编辑）在 T6 接入；此处只发最终一条。
 
 import type { ChannelAdapter } from "../channels/types.js";
-import type { AmspClient, AmspRunOutcome } from "./amsp.js";
+import type { AmspClient, AmspRun, AmspRunOutcome } from "./amsp.js";
 import { formatFinalText, formatRunFailure } from "../render.js";
 import type { Logger } from "../logger.js";
 
@@ -12,6 +12,8 @@ export interface RunSpec {
   /** 续接的会话；省略则新建。 */
   sessionId?: string;
   client: AmspClient;
+  /** Run 一旦发起即回调（供 /stop 持有 abort）。 */
+  onStart?: (run: AmspRun) => void;
 }
 
 export interface RunReport {
@@ -35,19 +37,23 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   const logger = deps.logger.child({ chat: spec.chatId });
   logger.info(`发起 Run：${spec.input.slice(0, 80)}`);
 
+  const run = spec.client.streamRun({
+    input: spec.input,
+    ...(spec.sessionId !== undefined ? { sessionId: spec.sessionId } : {}),
+  });
+  spec.onStart?.(run);
+  const sessionId = await run.sessionId.catch(() => null);
+
   let outcome: AmspRunOutcome;
   try {
-    outcome = await spec.client.streamRun({
-      input: spec.input,
-      ...(spec.sessionId !== undefined ? { sessionId: spec.sessionId } : {}),
-    }).result();
+    outcome = await run.result();
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     logger.warn(`Run 失败：${message}`);
     await deps.channel.send(spec.chatId, formatRunFailure(error));
     return {
       chatId: spec.chatId,
-      sessionId: null,
+      sessionId,
       status: "failed",
       error: message,
       usageTotal: null,
