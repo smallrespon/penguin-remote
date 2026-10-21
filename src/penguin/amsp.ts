@@ -112,11 +112,13 @@ export class AmspClient {
   }
 
   private client(): AgentClient {
+    // 429 的 Retry-After 只在响应头里，官方客户端会丢掉，所以无论 fetch 来自注入还是全局，
+    // 都要包一层——否则重试逻辑只在测试里生效。
     return new AgentClient({
       baseUrl: this.baseUrl,
       agent: agentPath(this.agent),
       apiKey: this.apiKey,
-      ...(this.fetchImpl ? { fetch: honorRetryAfter(this.fetchImpl) } : {}),
+      fetch: honorRetryAfter(this.fetchImpl ?? globalThis.fetch),
     });
   }
 

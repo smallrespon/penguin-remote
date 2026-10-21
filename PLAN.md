@@ -199,7 +199,7 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 `/model`、`/thinking`、`/workspace` 的可选值从 Project 配置动态拉取（`GET /api/projects/:p/models`），不写死。首次在某聊天里改档位时，Bridge 自动为该聊天建专属 Agent（`feishu_<chatId 哈希>`）并铸 key，避免全局设置互相干扰（见 §4.2）。
 
-`/model` 列表取舍：模型目录实测有 515 个，全列会把飞书消息撑爆，因此**列表只展示前 30 个并注明总数**；匹配切换不受此限（`provider/modelId`、裸 `modelId`、displayName 全量匹配，唯一命中即切换）。这是对 §12「动态列全部」的有意 UX 取舍。
+`/model` 列表取舍：模型目录实测有五百多个（2026-10-21 是 524 个，还在涨），全列会把飞书消息撑爆，因此**列表只展示前 30 个并注明总数**；匹配切换不受此限（`provider/modelId`、裸 `modelId`、displayName 全量匹配，唯一命中即切换）。这是对 §12「动态列全部」的有意 UX 取舍。
 
 群聊规则：仅当 `mentions` 含机器人时响应，并剥离 @ 占位符；私聊全响应。全局 allowlist（chat_id / open_id）之外的来源一律静默忽略。
 

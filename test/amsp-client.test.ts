@@ -152,6 +152,36 @@ test("parseRetryAfter：秒转毫秒，非法值退回默认", () => {
   assert.equal(parseRetryAfter("-5"), DEFAULT_RETRY_AFTER_MS);
 });
 
+test("AMSP 客户端：没注入 fetch 时也包全局 fetch（生产路径同样按 Retry-After 退避）", async () => {
+  const server = new FakeAmspServer();
+  const original = globalThis.fetch;
+  // 只替换全局 fetch：验证包装逻辑不依赖测试注入
+  globalThis.fetch = ((url: string | URL | Request, init?: RequestInit) =>
+    server.fetch(url, init)) as typeof fetch;
+  try {
+    const client = new AmspClient({
+      baseUrl: server.baseUrl,
+      agent: { projectId: "default_project", agentId: "default_agent" },
+      apiKey: "penguin_test_key",
+    });
+    server.nextError = {
+      status: 429,
+      body: { error: { code: "too_many_runs", message: "too many" } },
+      retryAfterSeconds: 7,
+    };
+    await assert.rejects(
+      () => client.streamRun({ input: "hi" }).result(),
+      (error: unknown) => {
+        assert.ok(error instanceof TooManyRunsError);
+        assert.equal(error.retryAfterMs, 7000);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("AMSP 客户端：abort 后 Run 停止，事件流以中断态的 run.done 收尾", async () => {
   const server = new FakeAmspServer();
   const events: string[] = [];
