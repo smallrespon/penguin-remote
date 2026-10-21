@@ -151,6 +151,16 @@ export function textDelta(text: string): AmspEvent {
   return { type: "text.delta", at: new Date().toISOString(), role: "assistant", text };
 }
 
+export function textDone(text: string): AmspEvent {
+  return {
+    type: "text.done",
+    at: new Date().toISOString(),
+    role: "assistant",
+    text,
+    stop_reason: "completed",
+  };
+}
+
 export function thinkingDelta(thinking: string): AmspEvent {
   return { type: "thinking.delta", at: new Date().toISOString(), thinking };
 }
