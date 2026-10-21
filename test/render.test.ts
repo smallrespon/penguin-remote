@@ -122,6 +122,54 @@ test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一�
   assert.ok(channel.edited.some((e) => /🔧 调用 `exec_command`/.test(e.markdown)));
 });
 
+/**
+ * 编辑快慢不一的 Channel：预览编辑慢、定稿编辑快。
+ * 真实飞书里每次编辑是一次独立的 lark-cli 调用，耗时不稳——在途的预览编辑
+ * 完全可能比后发出的定稿编辑更晚落地，把定稿盖掉。
+ */
+class UnfairEditChannel extends FakeChannel {
+  override async edit(messageId: string, markdown: string): Promise<void> {
+    const delay = markdown.includes("用量") ? 0 : 60;
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    await super.edit(messageId, markdown);
+  }
+}
+
+test("流式预览：在途的预览编辑不得盖掉定稿（晚到的编辑被作废）", async () => {
+  const server = new FakeAmspServer();
+  const channel = new UnfairEditChannel();
+  const client = new AmspClient({
+    baseUrl: server.baseUrl,
+    agent: { projectId: "default_project", agentId: "default_agent" },
+    apiKey: "penguin_test",
+    fetch: server.fetch,
+  });
+  const report = executeRun({ channel, logger: silent }, {
+    chatId: "oc_1",
+    input: "长任务",
+    client,
+    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+  });
+  const run = await nextRun(server);
+  // 连续推事件：每次都排队一次（慢速）预览编辑，收尾时它们还在飞行中
+  for (const piece of ["第一段", "第二段", "第三段"]) {
+    server.push(run, textDelta(piece));
+  }
+  server.push(run, textDone("最终答案"));
+  server.push(run, runDone());
+  server.close(run);
+  await report;
+  // 故意多等一会：让任何还在飞行中的预览编辑先落地，再看谁排在最后
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  const last = channel.edited.at(-1);
+  assert.match(last?.markdown ?? "", /最终答案/, "最后一次编辑必须是定稿");
+  assert.match(last?.markdown ?? "", /用量 42 tokens/);
+  const finals = channel.edited.filter((e) => e.markdown.includes("用量 42 tokens"));
+  assert.equal(finals.length, 1, "定稿只应写一次");
+  assert.equal(finals[0]?.messageId, last?.messageId, "定稿必须是最后一次落地");
+});
+
 test("流式预览：编辑次数反复用尽时持续换新消息，定稿落在最新一条上", async () => {
   const server = new FakeAmspServer();
   const channel = new FakeChannel();
