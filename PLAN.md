@@ -143,6 +143,7 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 - **换 Project**：AMSP 路径本身带 `:projectId`，key 按 (project, agent) 发放。Bridge 用 owner 会话拉 `GET /api/projects` 列项目、`GET /api/projects/:p/agents` 列 Agent，`/project <名字>` 切项目、`/agent <名字>` 切 Agent（切 Agent = 换对话，session 按 Agent 隔离，语义正确）。
 - **换模型/思考/工作区**：`/model`、`/thinking`、`/workspace` 直接改当前绑定 Agent 的 API 设置（即时生效于下一个新会话），并回显当前值。可选档位从 Project 配置里的可用模型动态拉取（`GET /api/projects/:p/models`）。
 - **审批 allow-all 的后果**：没有任何 `approval.requested`，审批卡片链路整个变成可选（ticket T8 降为 v2）。allow-all + 群聊意味着「能被机器人接收的消息 = 全权限驱动 Agent」，访问控制只剩 allowlist 一道闸，见 §7。
+- **T8 的实际落地（2026-10-21）**：v1 不做审批卡片，`src/approvals.ts` 只保留策略接缝（`ApprovalPolicy` + 默认 `denyAll`）。若用户手动把某个 Agent 的审批模式改成 `always-ask`，Bridge 会拒绝所有审批、在流式预览里写明「已拒绝」，并在 `/agent` 切换时提前提示；`/status` 也会显示该 Agent 的审批模式。
 
 **备选（未采用，记录在案）**：Profile 池——人工预建几个配好档位的 Agent，纯 key 认证、零人类凭据，但档位组合不自由、切换粒度粗。若日后想收敛凭据，可回退此方案。
 
@@ -198,6 +199,8 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 `/model`、`/thinking`、`/workspace` 的可选值从 Project 配置动态拉取（`GET /api/projects/:p/models`），不写死。首次在某聊天里改档位时，Bridge 自动为该聊天建专属 Agent（`feishu_<chatId 哈希>`）并铸 key，避免全局设置互相干扰（见 §4.2）。
 
+`/model` 列表取舍：模型目录实测有五百多个（2026-10-21 是 524 个，还在涨），全列会把飞书消息撑爆，因此**列表只展示前 30 个并注明总数**；匹配切换不受此限（`provider/modelId`、裸 `modelId`、displayName 全量匹配，唯一命中即切换）。这是对 §12「动态列全部」的有意 UX 取舍。
+
 群聊规则：仅当 `mentions` 含机器人时响应，并剥离 @ 占位符；私聊全响应。全局 allowlist（chat_id / open_id）之外的来源一律静默忽略。
 
 ---
@@ -208,7 +211,7 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 ```
 state/
-├── bindings.json     # { "<chatId>": { projectId, agentId, sessionId, skill?, skillSticky?, history: [{sessionId, title, at}], updatedAt } }
+├── bindings.json     # { "<chatId>": { projectId, agentId, sessionId, skill?, skillSticky?, history: [{sessionId, title, at, model?, projectId?, agentId?}], updatedAt } }
 ├── runs.jsonl        # 每次 run 一行：chatId/sessionId/status/usage/耗时（审计与成本）
 └── agents.json       # Bridge 创建的专属 Agent 与 key 的登记：{ "<projectId>/<agentId>": { chatId, keyId, createdAt } }
 ```
@@ -322,6 +325,9 @@ state/
 
 ## 10. 分阶段实施计划（与技能链对应）
 
+> 实施状态（2026-10-21）：P0–P5 全部完成（ticket T1–T9），测试 92 个全绿（typecheck 干净）；
+> T8（审批卡片）按 §12 的决策降为 v2，v1 只保留接缝与明确提示，见 §4.2。
+
 每个阶段都有可观察的验收标准，做完一个再下一个。
 
 ### P0 环境与打通（约 0.5 天）
@@ -348,18 +354,18 @@ Registry 持久化 + Lane Queue + `/new` `/sessions` `/use` `/status` `/stop` `/
 - **验收**：飞书里 `/model` 列出可用模型并切换；切到深度思考后下一轮回答的思考档位变化可感知（`/status` 可见）；换 agent 后上下文按新 Agent 干净开始；同一进程内 key 与令牌不落地。
 
 ### P5 安全与部署加固（约 0.5 天）
-allowlist（为空则拒绝启动）、日志脱敏、优雅退出、systemd unit、README（含同机部署说明与 `localhost` vs `127.0.0.1` 的坑）。
-- **验收**：陌生人消息无响应；重启 Bridge 后旧会话可续；`/status` 输出符合预期。
+allowlist（配置项，留空 = 开放访问，见 §7）、日志脱敏、consume 子进程守护重启（退避 1s→30s）、`.env` 0600、优雅退出、`scripts/start.sh` + systemd user unit、README（含同机部署说明与 `localhost` vs `127.0.0.1` 的坑）。
+- **验收**：allowlist 之外的消息无响应；重启 Bridge 后旧会话可续；`/status` 输出符合预期。
 
 ---
 
 ## 11. 风险与未验证点
 
 1. **lark-cli 长驻稳定性**：consume 的 bus daemon「最后一个消费者退出 30s 后自动退出」——Bridge 必须始终持有 consume 进程；进程异常退出要有守护重启（P5）。
-2. **飞书消息编辑频率限制**未实测：节流参数（1.5s / 300 字）需按实测调整；失败要有降级路径。
+2. **飞书消息编辑次数上限**（已实测，2026-10-21）：单条消息最多编辑 **20 次**（第 21 次报 `230072 The message has reached the number of times it can be edited`；官方文档未写明，用探测脚本实测）。一个 93s / 30 次请求的长任务就会耗尽。已实现的应对：编辑失败就换一条新消息继续承载预览（持续续接，上限 10 次；若新消息一次都没编辑成功过则不再换，直接降级），定稿落在最新那条消息上；只有发送本身也失败才退化成「最终一次性发送」，结果不丢。
 3. **卡片回调链路**（仅 v2 审批模式需要）：`card.action.trigger` 的 token 只有 30 分钟、更新卡片走另一个 API——真要做时先最小验证。
 4. **owner 令牌生命周期**：`penguin auth token` 默认 1 小时过期，过期后 owner 路由 401。Bridge 要主动重铸（过期前 5 分钟），重铸失败要能在飞书里提示而不是静默失败。
-5. **Agent 蔓延**：按聊天懒建专属 Agent 会让 Agent 数量随聊天增长；要有命名规范（`feishu_<hash>`）+ 定期清理约定（`agents.json` 里记 lastUsedAt，长期不用的可回收）。
+5. **Agent 蔓延**：按聊天懒建专属 Agent 会让 Agent 数量随聊天增长；命名规范 `feishu_<hash>`，`agents.json` 记 `chatId`/`keyId`/`createdAt`（v1 未记 lastUsedAt，回收脚本留待需要时再加）。
 6. **allow-all 暴露面**：审批模式定为 allow-all，allowlist 是唯一闸门；群聊场景任何被允许的人都能全权限驱动 Agent。这是已确认的取舍，但要写进 README 的显眼处。
 7. **断流即中止**：Bridge 崩溃会杀掉在途 Run；用 Registry + `/use` 兜底。
 8. **2GB 内存**：并发 Run 数受 `maxConcurrentRuns` 与内存双重限制，建议默认池 ≤4。
@@ -377,6 +383,6 @@ allowlist（为空则拒绝启动）、日志脱敏、优雅退出、systemd uni
 | 访问范围 | 任何能与机器人对话的人 | 已确认接受全权限开放的暴露面；配套措施见 §7 |
 | Agent/Project 切换范围 | 全部 | owner 可见即可切 |
 | Issue tracker | GitHub Issues | 需先 git init + 建仓库；gh 已登录（smallrespon，repo scope） |
-| 默认档位 | 不预设 | 走 Project/Agent 现有配置；`/model` 动态列全部可用模型 |
+| 默认档位 | 不预设 | 走 Project/Agent 现有配置；`/model` 动态列可用模型（列表截断到前 30 个 + 注明总数，见 §5；匹配不限） |
 
 > 收集这类决定时用 a2ui 的 form/choice 块提问（用户偏好，2026-10-21）。
