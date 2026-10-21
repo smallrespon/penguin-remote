@@ -4,8 +4,16 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import type { ModelRef } from "./penguin/sessions.js";
+
 /** /sessions 最多列几条。 */
 export const HISTORY_LIMIT = 10;
+
+/**
+ * v1.0 按聊天懒建的专属 Agent 前缀（ADR-0002，已被 ADR-0005 废弃）。
+ * 加载时命中该前缀的绑定迁回默认 Agent。
+ */
+const LEGACY_DEDICATED_PREFIX = "feishu_";
 
 export interface SessionRecord {
   sessionId: string;
@@ -23,6 +31,13 @@ export interface Binding {
   agentId: string;
   /** 当前续接的会话；null = 下一条消息新建。 */
   sessionId: string | null;
+  /**
+   * 档位（ADR-0005）：按聊天隔离，建新会话时下发；缺省 = 跟随 Agent / Project 默认。
+   * 已存在的会话保持它创建时的设置——「下一新会话生效」是字面语义。
+   */
+  model?: ModelRef;
+  thinkingLevel?: string;
+  workspace?: string;
   /** 一次性 skill（下一条消息消费后清空）。 */
   skill: string | null;
   /** 粘滞 skill（/skill off 才清空）。 */
@@ -84,7 +99,25 @@ export class Registry {
     } catch {
       // 缺文件或损坏：从全新开始（服务端会话仍在，只是列表丢了）。
     }
-    return new Registry(filePath, data, defaults, now);
+    const registry = new Registry(filePath, data, defaults, now);
+    await registry.migrateLegacyAgents();
+    return registry;
+  }
+
+  /**
+   * v1.0 → v1.1 迁移（ADR-0005）：按聊天懒建的专属 Agent 已废弃，
+   * 它们名下的会话走会话 API 也续不了（实测 404），绑定迁回默认 Agent 并清掉会话引用
+   * （下一条消息按默认 Agent 新建）；历史记录原样留着，按归属自然过滤。
+   */
+  private async migrateLegacyAgents(): Promise<void> {
+    let migrated = false;
+    for (const binding of Object.values(this.data.bindings)) {
+      if (!binding.agentId.startsWith(LEGACY_DEDICATED_PREFIX)) continue;
+      binding.agentId = this.defaults.agentId;
+      binding.sessionId = null;
+      migrated = true;
+    }
+    if (migrated) await this.persist();
   }
 
   get(chatId: string): Binding | undefined {

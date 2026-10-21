@@ -1,175 +1,248 @@
-// runner 测试：429 退避重试、409 会话忙提示、定稿与降级、onStart 句柄。
+// runner 测试（ADR-0005 会话 API 版）：新建/续接会话、档位下发、终局文案、
+// 断流即中止、审批应答、会话自愈、定稿与降级。
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { AmspClient, AmspRun } from "../src/penguin/amsp.js";
-import { AmspClient as AmspClientClass } from "../src/penguin/amsp.js";
-import { executeRun } from "../src/penguin/runner.js";
+import { SessionClient } from "../src/penguin/sessions.js";
+import { executeRun, type RunHandle } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
-import { FakeAmspServer, runDone, textDelta, textDone } from "./helpers/fake-amsp.js";
+import { FakeSessionServer, frame } from "./helpers/fake-sessions.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
 import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
 
-const TOO_MANY = { status: 429, body: { error: { code: "too_many_runs", message: "too many runs" } } };
-const BUSY = {
-  status: 409,
-  body: { error: { code: "task_in_progress", message: "This Session already has a Task in progress." } },
-};
+const AGENT = { projectId: "default_project", agentId: "default_agent" };
 
-function client(server: FakeAmspServer): AmspClient {
-  return new AmspClientClass({
-    baseUrl: server.baseUrl,
-    agent: { projectId: "default_project", agentId: "default_agent" },
-    apiKey: "penguin_test",
-    fetch: server.fetch,
-  });
+function api(server: FakeSessionServer): SessionClient {
+  return new SessionClient({ fetchAuthed: server.fetchAuthed });
 }
 
-/** 跑一次 Run；返回 report promise、占位消息与 abort 句柄收集器。 */
-function runOnce(server: FakeAmspServer, channel: FakeChannel, onStart?: (run: AmspRun) => void) {
+/** 一轮正常 Run 的帧脚本：思考 → 工具 → 正文 → 用量 → idle。 */
+function happyScript(): Array<string | { hang: true }> {
+  return [
+    frame.taskState("idle"),
+    frame.event({ type: "request_begin" }),
+    frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: "让" }),
+    frame.omni({ type: "partial_thinking", role: "assistant", event_type: "delta", thinking: "想" }),
+    frame.taskState("running"),
+    frame.omni({ type: "tool_call", role: "assistant", name: "exec_command", arguments: '{"cmd":"date"}', tool_call_id: "tc1" }),
+    frame.omni({ type: "tool_call_output", role: "user", output: "Tue Oct 21", tool_call_id: "tc1" }),
+    frame.omni({ type: "text", role: "assistant", text: "今天 21 号", stop_reason: "completed" }),
+    frame.event({ type: "token_usage", request: { total: 42 }, session: { total: 42 } }),
+    frame.event({ type: "request_end", status: "completed" }),
+    frame.taskState("idle"),
+    frame.done(),
+  ];
+}
+
+async function runOnce(
+  server: FakeSessionServer,
+  channel: FakeChannel,
+  overrides: Partial<Parameters<typeof executeRun>[1]> = {},
+  onStart?: (handle: RunHandle) => void,
+) {
   return executeRun(
     { channel, logger: silent },
     {
       chatId: "oc_chat",
-      input: "现在几点",
-      client: client(server),
+      input: "今天几号",
+      agent: AGENT,
+      sessionId: null,
+      client: api(server),
       preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+      ...overrides,
       ...(onStart ? { onStart } : {}),
     },
   );
 }
 
-test("429 后退避重试：重开 Run 后成功，abort 句柄指向最新一次尝试", async () => {
-  const server = new FakeAmspServer();
+test("新建会话：档位下发 + thinking PATCH + 定稿含分区与用量页脚", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
   const channel = new FakeChannel();
-  const started: AmspRun[] = [];
-  server.nextError = TOO_MANY;
 
-  const reportPromise = runOnce(server, channel, (run) => started.push(run));
-  await waitFor(() => server.runRequests().length === 1);
-  await waitFor(() => server.runs.length === 1, 5000);
+  const report = await runOnce(server, channel, {
+    settings: { workspace: "/tmp/ws", model: { provider: "stepfun", modelId: "step-3" }, thinkingLevel: "high" },
+  });
 
-  const run = server.lastRun();
-  server.push(run, textDelta("现在"));
-  server.push(run, textDone("现在八点"));
-  server.push(run, runDone());
-  server.close(run);
+  // 建会话带齐档位（model 成对）；thinkingLevel 走 PATCH
+  const create = server.requests.find((r) => r.method === "POST" && r.path.endsWith("/sessions"));
+  assert.deepEqual(create?.body, {
+    client: "cli",
+    approvalMode: "allow-all",
+    workspace: "/tmp/ws",
+    modelId: "step-3",
+    provider: "stepfun",
+  });
+  const patch = server.requests.find((r) => r.method === "PATCH");
+  assert.deepEqual(patch?.body, { thinkingLevel: "high" });
 
-  const report = await reportPromise;
-  assert.equal(server.runRequests().length, 2, "429 后重开一次");
-  assert.equal(started.length, 2, "每次尝试都回调 onStart");
-  assert.equal(await started[1]?.sessionId, run.sessionId, "/stop 拿到的应是重开后的 Run");
-  assert.equal(report.status, "completed");
-  assert.equal(report.usageTotal, 42);
-  // 占位消息只发一次，最终文本编辑到它上面；没有多余失败提示
-  assert.equal(channel.sent.length, 1);
   assert.equal(channel.sent[0]?.markdown, PLACEHOLDER_TEXT);
-  assert.match(channel.edited.at(-1)?.markdown ?? "", /现在八点/);
-  assert.ok(!channel.sent.some((m) => m.markdown.includes("执行失败")));
+  const final = channel.edited.at(-1)?.markdown ?? channel.sent.at(-1)?.markdown ?? "";
+  assert.match(final, /🧠 思考 · 1 字/);
+  assert.match(final, /🔧 exec_command/);
+  assert.match(final, /今天 21 号/);
+  assert.match(final, /用量 42 tokens/);
+
+  assert.equal(report.status, "completed");
+  assert.equal(report.sessionId, "session-fake-1");
+  assert.equal(report.usageTotal, 42);
+  assert.equal(report.requests, 1);
+  assert.equal(report.modelId, "step-3");
 });
 
-test("429 重试耗尽（3 次）后把错误回复给用户", async () => {
-  const server = new FakeAmspServer();
+test("续接会话：不再建会话，直接投递", async () => {
+  const server = new FakeSessionServer();
+  const client = api(server);
+  const existing = await client.createSession("default_project", "default_agent");
+  server.defaultScript = happyScript();
   const channel = new FakeChannel();
-  server.nextError = TOO_MANY;
 
-  const reportPromise = runOnce(server, channel);
-  await waitFor(() => server.runRequests().length === 1);
-  server.nextError = TOO_MANY;
-  await waitFor(() => server.runRequests().length === 2);
-  server.nextError = TOO_MANY;
+  const report = await runOnce(server, channel, { sessionId: existing.sessionId });
 
-  const report = await reportPromise;
-  assert.equal(server.runRequests().length, 3, "首次 + 2 次重试");
-  assert.equal(report.status, "failed");
-  assert.match(report.error ?? "", /Agent 并发已达上限/);
-  assert.match(channel.edited.at(-1)?.markdown ?? "", /执行失败/);
-  assert.equal(channel.edited.length, 1, "只把结局写进占位消息");
+  assert.equal(server.requests.filter((r) => r.method === "POST" && r.path.endsWith("/sessions")).length, 1);
+  assert.equal(report.sessionId, existing.sessionId);
+  assert.equal(report.status, "completed");
 });
 
-test("409 会话忙：回复忙提示而非错误堆栈，且不重试", async () => {
-  const server = new FakeAmspServer();
+test("409 会话忙：提示 BUSY_HINT，且不中断别人的任务", async () => {
+  const server = new FakeSessionServer();
+  server.nextTaskStatus = 409;
   const channel = new FakeChannel();
-  server.nextError = BUSY;
 
   const report = await runOnce(server, channel);
-  assert.equal(server.runRequests().length, 1, "409 不重试");
+
   assert.equal(report.status, "failed");
-  assert.match(report.error ?? "", /Task in progress/);
-  // 结局写进占位消息（同一条），不再停在「思考中…」
-  assert.equal(channel.edited.at(-1)?.markdown, BUSY_HINT);
-  assert.equal(channel.sent.length, 1);
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.equal(final, BUSY_HINT);
+  assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), false);
 });
 
-test("Run 失败时占位消息被更新为失败原因，不停在「思考中…」", async () => {
-  const server = new FakeAmspServer();
+test("流中断（没看到 running 就结束）：显式中止并报失败", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = [frame.taskState("idle"), frame.done()];
   const channel = new FakeChannel();
-  server.nextError = { status: 500, body: { error: { code: "boom", message: "server exploded" } } };
 
   const report = await runOnce(server, channel);
+
   assert.equal(report.status, "failed");
-  assert.equal(channel.sent.length, 1, "只发过占位消息");
-  const failure = channel.edited.at(-1)?.markdown ?? "";
-  assert.match(failure, /^执行失败：/);
-  assert.ok(failure.includes("server exploded"), "失败原因应带给用户");
+  assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), true);
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /执行失败/);
 });
 
-test("审批策略可注入：allowAll 策略放行审批请求", async () => {
-  const server = new FakeAmspServer();
+test("fatal 终局：request_end 带错误，定稿写明未正常完成", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = [
+    frame.taskState("running"),
+    frame.event({ type: "request_end", status: "fatal", error_code: "auth", error_message: "403 quota" }),
+    frame.taskState("idle"),
+    frame.done(),
+  ];
   const channel = new FakeChannel();
-  const reportPromise = executeRun(
-    { channel, logger: silent, approvals: { decide: () => "allow" } },
-    {
-      chatId: "oc_chat",
-      input: "现在几点",
-      client: client(server),
-      preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
-    },
-  );
-  await waitFor(() => server.runs.length > 0);
-  const run = server.lastRun();
-  server.push(run, {
-    type: "approval.requested",
-    at: new Date().toISOString(),
-    tool_call: { tool_call_id: "call_9", name: "exec_command", arguments: '{"command":"ls"}' },
-  });
-  server.push(run, textDone("已允许后继续"));
-  server.push(run, runDone());
-  server.close(run);
 
-  const report = await reportPromise;
-  assert.equal(report.status, "completed");
-  assert.deepEqual(server.approvalCalls, [
-    { sessionId: run.sessionId, toolCallId: "call_9", decision: "allow" },
-  ]);
+  const report = await runOnce(server, channel);
+
+  assert.equal(report.status, "fatal");
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /未正常完成（fatal）/);
+  assert.match(final, /403 quota/);
 });
 
-test("审批请求：v1 一律拒绝，并在预览里说明（allow-all 模式下不会发生）", async () => {
-  const server = new FakeAmspServer();
+test("/stop：abort 后流补发 abort 事件与 idle，结局为 aborted", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = [
+    frame.taskState("idle"),
+    frame.taskState("running"),
+    frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: "写了一" }),
+    { hang: true },
+  ];
   const channel = new FakeChannel();
-  const reportPromise = runOnce(server, channel);
-  await waitFor(() => server.runs.length > 0);
-  const run = server.lastRun();
-  server.push(run, {
-    type: "approval.requested",
-    at: new Date().toISOString(),
-    tool_call: { tool_call_id: "call_9", name: "exec_command", arguments: '{"command":"ls"}' },
-  });
-  server.push(run, textDone("被拒绝后继续"));
-  server.push(run, runDone());
-  server.close(run);
 
-  const report = await reportPromise;
-  assert.equal(report.status, "completed");
+  let handle: RunHandle | undefined;
+  const promise = runOnce(server, channel, {}, (h) => {
+    handle = h;
+  });
+  await waitFor(() => handle !== undefined);
+  await handle?.abort();
+  const report = await promise;
+
+  assert.equal(report.status, "aborted");
+  assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), true);
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /写了一/);
+  assert.match(final, /未正常完成（aborted）/);
+});
+
+test("审批请求：按策略拒绝并把决定写进预览", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = [
+    frame.taskState("running"),
+    frame.approval("tc7", "exec_command"),
+    frame.taskState("idle"),
+    frame.done(),
+  ];
+  const channel = new FakeChannel();
+
+  const report = await runOnce(server, channel);
+
   assert.deepEqual(server.approvalCalls, [
-    { sessionId: run.sessionId, toolCallId: "call_9", decision: "deny" },
+    { sessionId: "session-fake-1", toolCallId: "tc7", decision: "deny" },
   ]);
-  // 预览里既有「等待审批」也有「已拒绝」的说明
-  const preview = channel.edited.map((e) => e.markdown).join("\n");
-  assert.match(preview, /等待审批：`exec_command`/);
-  assert.match(preview, /已拒绝 `exec_command`/);
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /🚫 已拒绝 `exec_command`/);
+  assert.equal(report.status, "completed");
+});
+
+test("会话自愈：tasks 返回新 id 后改订阅新 id，report 用新 id", async () => {
+  const server = new FakeSessionServer();
+  server.healTo = "session-healed";
+  server.scripts.set("session-healed", [
+    frame.taskState("idle"),
+    frame.taskState("running"),
+    frame.omni({ type: "text", role: "assistant", text: "自愈后完成", stop_reason: "completed" }),
+    frame.taskState("idle"),
+    frame.done(),
+  ]);
+  const channel = new FakeChannel();
+
+  const report = await runOnce(server, channel);
+
+  assert.equal(report.sessionId, "session-healed");
+  assert.equal(report.status, "completed");
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /自愈后完成/);
+});
+
+test("编辑全部失败：降级为最终一次性发送", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
+  const channel = new FakeChannel();
+  channel.failEditWith = new Error("edit rejected");
+
+  const report = await runOnce(server, channel);
+
+  assert.equal(report.status, "completed");
+  assert.equal(channel.edited.length, 0);
+  const finals = channel.sent.filter((m) => m.markdown !== PLACEHOLDER_TEXT);
+  assert.match(finals.at(-1)?.markdown ?? "", /今天 21 号/);
+});
+
+test("建会话失败：占位消息里写失败原因", async () => {
+  const server = new FakeSessionServer();
+  const client = api(server);
+  client.createSession = async () => {
+    throw new Error("model not found");
+  };
+  const channel = new FakeChannel();
+
+  const report = await runOnce(server, channel, { client });
+
+  assert.equal(report.status, "failed");
+  assert.equal(report.sessionId, null);
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /执行失败：model not found/);
 });

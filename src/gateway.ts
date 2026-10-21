@@ -1,4 +1,4 @@
-// 控制平面：把 Channel、Lane、Registry、AMSP 客户端接起来，处理每条入站消息。
+// 控制平面：把 Channel、Lane、Registry、会话 API 客户端接起来，处理每条入站消息。
 // 命令分发见 router.ts（纯解析）；这里只做状态变更与回复。
 
 import type { ChannelAdapter, IncomingMessage } from "./channels/types.js";
@@ -6,7 +6,7 @@ import type { BridgeConfig } from "./config.js";
 import type { Lanes } from "./lanes.js";
 import { redact } from "./logger.js";
 import type { Logger } from "./logger.js";
-import type { AgentRef, AmspClient } from "./penguin/amsp.js";
+import type { SessionClient } from "./penguin/sessions.js";
 import { executeRun } from "./penguin/runner.js";
 import type { Registry } from "./registry.js";
 import type { RunLog } from "./runlog.js";
@@ -34,8 +34,8 @@ export interface GatewayDeps {
   logger: Logger;
   registry: Registry;
   runLog: RunLog;
-  /** 取某个 Agent 的 AMSP 客户端（内部持有对应 key）。 */
-  clientFor: (agent: AgentRef) => Promise<AmspClient>;
+  /** 会话 API 客户端（owner 令牌当 cookie；所有聊天共用，按会话 id 隔离）。 */
+  sessions: SessionClient;
   /** owner 动态模式控制器；未注入时档位命令不可用。 */
   tiers?: TierController;
 }
@@ -186,25 +186,28 @@ export class Gateway {
     const input = skill === null ? text : formatSkillInput(skill, text);
 
     const attempt = await this.deps.lanes.run(chatId, async () => {
-      const client = await this.deps.clientFor({
-        projectId: binding.projectId,
-        agentId: binding.agentId,
-      });
       try {
         return await executeRun(
           { channel: this.deps.channel, logger: this.logger },
           {
             chatId,
             input,
-            ...(binding.sessionId !== null ? { sessionId: binding.sessionId } : {}),
-            client,
+            agent: { projectId: binding.projectId, agentId: binding.agentId },
+            sessionId: binding.sessionId,
+            // 档位只在下发新建会话时生效；续接的会话保持它创建时的设置。
+            settings: {
+              ...(binding.model !== undefined ? { model: binding.model } : {}),
+              ...(binding.thinkingLevel !== undefined ? { thinkingLevel: binding.thinkingLevel } : {}),
+              ...(binding.workspace !== undefined ? { workspace: binding.workspace } : {}),
+            },
+            client: this.deps.sessions,
             preview: {
               throttleMs: this.deps.config.previewThrottleMs,
               throttleChars: this.deps.config.previewThrottleChars,
               maxChars: this.deps.config.previewMaxChars,
             },
-            onStart: (run) => {
-              this.activeRuns.set(chatId, { abort: run.abort });
+            onStart: (handle) => {
+              this.activeRuns.set(chatId, { abort: handle.abort });
             },
           },
         );
@@ -311,12 +314,8 @@ export class Gateway {
     }
     if (binding.sessionId !== null) {
       try {
-        const client = await this.deps.clientFor({
-          projectId: binding.projectId,
-          agentId: binding.agentId,
-        });
-        const info = await client.session(binding.sessionId);
-        lines.push(`**会话状态**：${info.status}，模型 \`${info.model_id}\``);
+        const info = await this.deps.sessions.sessionInfo(binding.sessionId);
+        lines.push(`**会话状态**：${info.status}，模型 \`${info.modelId ?? "未知"}\``);
       } catch (error: unknown) {
         lines.push(`**会话状态**：查询失败（${redact(error instanceof Error ? error.message : String(error))}）`);
       }

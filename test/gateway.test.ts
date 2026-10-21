@@ -7,12 +7,12 @@ import { test } from "node:test";
 import { Gateway, type TierController } from "../src/gateway.js";
 import { Lanes } from "../src/lanes.js";
 import { createLogger } from "../src/logger.js";
-import { AmspClient } from "../src/penguin/amsp.js";
+import { SessionClient } from "../src/penguin/sessions.js";
 import { Registry } from "../src/registry.js";
 import { RunLog } from "../src/runlog.js";
 import { loadConfig } from "../src/config.js";
 import { formatSkillInput, helpText, parseCommand } from "../src/router.js";
-import { FakeAmspServer, runDone, textDelta, textDone } from "./helpers/fake-amsp.js";
+import { FakeSessionServer, frame, type FrameScript } from "./helpers/fake-sessions.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
 import { waitFor } from "./helpers/wait.js";
@@ -21,7 +21,7 @@ const silent = createLogger("error", () => {});
 
 function makeConfig(overrides: Record<string, string> = {}) {
   return loadConfig({
-    AMSP_BASE_URL: "http://localhost/api/amsp/v1",
+    OWNER_API_BASE_URL: "http://localhost/api",
     DEFAULT_PROJECT_ID: "default_project",
     DEFAULT_AGENT_ID: "default_agent",
     ...overrides,
@@ -29,7 +29,7 @@ function makeConfig(overrides: Record<string, string> = {}) {
 }
 
 async function makeGateway(
-  server: FakeAmspServer,
+  server: FakeSessionServer,
   channel = new FakeChannel(),
   stateDir?: string,
   tiers?: TierController,
@@ -48,75 +48,88 @@ async function makeGateway(
     logger: silent,
     registry,
     runLog,
-    clientFor: async (agent) =>
-      new AmspClient({
-        baseUrl: server.baseUrl,
-        agent,
-        apiKey: "penguin_test",
-        fetch: server.fetch,
-      }),
+    sessions: new SessionClient({ fetchAuthed: server.fetchAuthed }),
     ...(tiers ? { tiers } : {}),
   });
   return { gateway, channel, registry, runLog, stateDir: dir };
 }
 
-/** 记录调用的假 TierController（档位命令由 owner 动态模式实现，这里只验分发）。 */
-function fakeTiers() {
-  const calls: string[] = [];
-  const controller: TierController = {
-    listProjects: async (chatId) => (calls.push(`listProjects:${chatId}`), "PROJECTS"),
-    selectProject: async (chatId, name) => (calls.push(`selectProject:${chatId}:${name}`), "PICKED"),
-    listAgents: async (chatId) => (calls.push(`listAgents:${chatId}`), "AGENTS"),
-    selectAgent: async (chatId, name) => (calls.push(`selectAgent:${chatId}:${name}`), "PICKED"),
-    listModels: async (chatId) => (calls.push(`listModels:${chatId}`), "MODELS"),
-    selectModel: async (chatId, name) => (calls.push(`selectModel:${chatId}:${name}`), "PICKED"),
-    selectThinking: async (chatId, level) => (calls.push(`selectThinking:${chatId}:${level}`), "PICKED"),
-    selectWorkspace: async (chatId, path) => (calls.push(`selectWorkspace:${chatId}:${path}`), "PICKED"),
-    describeTiers: async (chatId) => (calls.push(`describeTiers:${chatId}`), "- 模型：`stepfun/step-3`"),
-  };
-  return { calls, controller };
+/** 一轮正常 Run 的帧脚本：running → 正文 → 用量 → idle → DONE。 */
+function happyScript(text = "好"): FrameScript {
+  return [
+    frame.taskState("idle"),
+    frame.taskState("running"),
+    frame.omni({ type: "text", role: "assistant", text, stop_reason: "completed" }),
+    frame.event({ type: "token_usage", request: { total: 42 }, session: { total: 42 } }),
+    frame.event({ type: "request_end", status: "completed" }),
+    frame.taskState("idle"),
+    frame.done(),
+  ];
 }
 
-type Events = Parameters<FakeAmspServer["push"]>[1][];
-
-/** 等下一个（新的）run 出现并返回它。 */
-async function nextRun(server: FakeAmspServer): Promise<ReturnType<FakeAmspServer["lastRun"]>> {
-  const before = server.runs.length;
-  await waitFor(() => server.runs.length > before);
-  return server.lastRun();
+/** 跑到 running 就挂住（忙状态测试用）。 */
+function hangingScript(): FrameScript {
+  return [frame.taskState("idle"), frame.taskState("running"), { hang: true }];
 }
 
-/** 给指定 run 推完事件并收尾。 */
-function finishRun(server: FakeAmspServer, run: ReturnType<FakeAmspServer["lastRun"]>, events: Events): void {
-  for (const event of events) server.push(run, event);
-  server.close(run);
+/** 等 Bridge 把任务投递出去（此刻订阅已就绪），返回会话 id。 */
+async function startedSession(server: FakeSessionServer): Promise<string> {
+  const taskPosts = (): number =>
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length;
+  const before = taskPosts();
+  await waitFor(() => taskPosts() > before);
+  return server.lastTaskSession() ?? "";
 }
 
-/** 等下一个 run 出现，推完事件后收尾。 */
-async function completeRun(server: FakeAmspServer, events: Events): Promise<void> {
-  finishRun(server, await nextRun(server), events);
+/** 建会话请求列表。 */
+function createRequests(server: FakeSessionServer) {
+  return server.requests.filter((r) => r.method === "POST" && r.path.endsWith("/sessions"));
 }
 
-/** 取第 n 次 runs 请求的 input。 */
-function inputOf(server: FakeAmspServer, index: number): string {
-  const body = server.runRequests()[index]?.body as { input?: string } | undefined;
-  return body?.input ?? "";
+/** 取第 n 次 tasks 投递的正文。 */
+function inputOf(server: FakeSessionServer, index: number): string {
+  const posts = server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
+  const body = posts[index]?.body as { input?: Array<{ type: string; text: string }> } | undefined;
+  return body?.input?.[0]?.text ?? "";
+}
+
+/** 最近一次 tasks 投递的路径。 */
+function lastTaskPath(server: FakeSessionServer): string {
+  const posts = server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
+  return posts.at(-1)?.path ?? "";
+}
+
+/** 假服务器不解析帧：测试手动把会话状态拨回 idle（模拟任务跑完）。 */
+function markIdle(server: FakeSessionServer, sessionId: string): void {
+  const session = server.sessions.get(sessionId);
+  if (session !== undefined) session.status = "idle";
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ---- T4 回归：最小闭环 ----
 
-test("最小闭环：飞书一句话 → AMSP run → 同聊天收到一条最终回复", async () => {
-  const server = new FakeAmspServer();
+test("最小闭环：飞书一句话 → 会话 API → 同聊天收到一条最终回复", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("现在是20:00");
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
 
   const received = channel.receive("现在几点");
-  await completeRun(server, [textDelta("现在是"), textDelta("20:00"), textDone("现在是20:00"), runDone()]);
   await received;
 
-  assert.equal(server.runRequests().length, 1);
-  assert.deepEqual(server.runRequests()[0]?.body, { input: "现在几点" });
+  // 走 chat 同款路径建会话：普通会话（source=user），不带任何 AMSP 痕迹
+  const creates = createRequests(server);
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0]?.path, "/projects/default_project/agents/default_agent/sessions");
+  assert.deepEqual(creates[0]?.body, { client: "cli", approvalMode: "allow-all" });
+  // 投递走 tasks，input 是分段文本
+  const task = server.requests.find((r) => r.method === "POST" && /\/tasks$/.test(r.path));
+  assert.deepEqual(task?.body, { input: [{ type: "text", text: "现在几点" }] });
+
   // T6：先发占位消息，最终文本通过编辑落到同一条消息上
   assert.equal(channel.sent.length, 1);
   assert.equal(channel.sent[0]?.markdown, PLACEHOLDER_TEXT);
@@ -126,21 +139,32 @@ test("最小闭环：飞书一句话 → AMSP run → 同聊天收到一条最�
 });
 
 test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = hangingScript();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
 
   const first = channel.receive("第一个任务");
-  const run = await nextRun(server);
+  const sessionId = await startedSession(server);
   await channel.receive("第二个任务");
   assert.equal(channel.sent.length, 2, "占位消息 + 忙提示");
   assert.equal(channel.lastSent(), BUSY_HINT);
-  assert.equal(server.runRequests().length, 1, "不应发起第二个 Run");
+  assert.equal(
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    1,
+    "不应发起第二个 Run",
+  );
 
-  finishRun(server, run, [textDelta("完成"), textDone("完成"), runDone()]);
+  // 收尾：补发正文与 idle
+  server.pushLive(sessionId, frame.omni({ type: "text", role: "assistant", text: "完成", stop_reason: "completed" }));
+  server.pushLive(sessionId, frame.taskState("idle"));
+  server.pushLive(sessionId, frame.done());
   await first;
-  assert.equal(server.runs.length, 1);
+  assert.equal(
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    1,
+  );
 });
 
 // ---- T5：Registry ----
@@ -255,52 +279,53 @@ test("Registry：会话按 (project, agent) 隔离；老登记按默认档位算
 });
 
 test("/new 后下一条消息开新会话；/sessions 与 /use 续聊", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("答 1");
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
 
   // 第一轮：新会话
   const first = channel.receive("第一问");
-  await completeRun(server, [textDone("答 1"), runDone()]);
   await first;
+  const sessionId = server.lastTaskSession() ?? "";
 
   // /sessions 列出
   await channel.receive("/sessions");
-  const sessionId = server.runs[0]?.sessionId ?? "";
-  assert.match(channel.lastSent(), new RegExp(sessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(channel.lastSent(), new RegExp(escapeRegExp(sessionId)));
 
   // /new 清绑定
   await channel.receive("/new");
   assert.match(channel.lastSent(), /已新开会话/);
 
-  // 第二轮：不带 session_id
+  // 第二轮：新建另一个会话
+  server.defaultScript = happyScript("答 2");
   const second = channel.receive("第二问");
-  await completeRun(server, [textDone("答 2"), runDone()]);
   await second;
-  const secondBody = server.runRequests().at(-1)?.body as { session_id?: string };
-  assert.equal(secondBody.session_id, undefined, "/new 后不应带 session_id");
+  const secondSession = server.lastTaskSession() ?? "";
+  assert.notEqual(secondSession, sessionId, "/new 后应新建会话");
+  assert.equal(createRequests(server).length, 2);
 
   // /use 2 切回第一个会话（列表新的在前）
   await channel.receive("/use 2");
   assert.match(channel.lastSent(), /已切回会话/);
+  server.defaultScript = happyScript("答 3");
   const third = channel.receive("第三问");
-  await completeRun(server, [textDone("答 3"), runDone()]);
   await third;
-  const thirdBody = server.runRequests().at(-1)?.body as { session_id?: string };
-  assert.equal(thirdBody.session_id, sessionId);
+  assert.equal(lastTaskPath(server), `/sessions/${sessionId}/tasks`, "续接打到旧会话上");
+  assert.equal(createRequests(server).length, 2, "续接不建新会话");
 });
 
 test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("答 1");
   const channel = new FakeChannel();
   const { gateway, registry } = await makeGateway(server, channel);
   await gateway.start();
 
   const first = channel.receive("第一问");
-  await completeRun(server, [textDone("答 1"), runDone()]);
   await first;
-  const sessionId = server.runs[0]?.sessionId ?? "";
+  const sessionId = server.lastTaskSession() ?? "";
 
   // /agent coder（TierCommands 的行为：改绑定并重置会话）
   await registry.update("oc_chat", (b) => {
@@ -321,14 +346,15 @@ test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () =
     b.agentId = "default_agent";
   });
   await channel.receive("/sessions");
-  assert.match(channel.lastSent(), new RegExp(sessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(channel.lastSent(), new RegExp(escapeRegExp(sessionId)));
   await channel.receive("/use 1");
   assert.match(channel.lastSent(), /已切回会话/);
   assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
 });
 
 test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = hangingScript();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
@@ -342,15 +368,24 @@ test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () =>
   assert.match(channel.lastSent(), /没有正在执行/);
 
   const running = channel.receive("长任务");
-  await nextRun(server);
+  const sessionId = await startedSession(server);
   await channel.receive("/stop");
   assert.match(channel.lastSent(), /已中断/);
   await running;
-  assert.match(channel.lastSent(), /未正常完成（aborted）|已中断/);
+  // 定稿落在占位消息上，写明未正常完成
+  const final = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(final, /未正常完成（aborted）/);
+  assert.ok(server.requests.some((r) => r.path.endsWith("/abort")), "断流/中断要显式 abort");
+
+  // 中断后会话状态可查
+  markIdle(server, sessionId);
+  await channel.receive("/status");
+  assert.match(channel.lastSent(), /会话状态.*idle/s);
 });
 
 test("/skill 一次性注入，用后即清；on 粘滞；off 关闭", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
@@ -358,31 +393,27 @@ test("/skill 一次性注入，用后即清；on 粘滞；off 关闭", async () 
   await channel.receive("/skill lark-im");
   assert.match(channel.lastSent(), /下一条消息将使用 skill/);
   const first = channel.receive("把纪要发出来");
-  await completeRun(server, [textDone("好"), runDone()]);
   await first;
   assert.equal(inputOf(server, 0), formatSkillInput("lark-im", "把纪要发出来"));
 
   // 一次性已清：下一条不再注入（仍续接同一会话）
   const second = channel.receive("普通消息");
-  await completeRun(server, [textDone("好"), runDone()]);
   await second;
   assert.equal(inputOf(server, 1), "普通消息");
 
   // 粘滞
   await channel.receive("/skill lark-doc on");
   const third = channel.receive("第一条");
-  await completeRun(server, [textDone("好"), runDone()]);
   await third;
   assert.equal(inputOf(server, 2), formatSkillInput("lark-doc", "第一条"));
   await channel.receive("/skill off");
   const fourth = channel.receive("第二条");
-  await completeRun(server, [textDone("好"), runDone()]);
   await fourth;
   assert.equal(inputOf(server, 3), "第二条");
 });
 
 test("/help 含全部命令与风险提示；未知命令与非法参数有明确回复", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
@@ -403,37 +434,46 @@ test("/help 含全部命令与风险提示；未知命令与非法参数有明�
 });
 
 test("Run 进行中再来消息：不排队、也不消耗这个聊天的一次性 skill", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = hangingScript();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
 
   // 先让一个任务在跑
   const first = channel.receive("任务一");
-  const run = await nextRun(server);
+  const sessionId = await startedSession(server);
 
   // 忙时设一次性 skill，再插一条普通消息：只提示，skill 不被消耗
   await channel.receive("/skill lark-im");
   await channel.receive("插嘴");
   assert.equal(channel.lastSent(), BUSY_HINT);
 
-  finishRun(server, run, [textDone("好"), runDone()]);
+  server.pushLive(sessionId, frame.omni({ type: "text", role: "assistant", text: "好", stop_reason: "completed" }));
+  server.pushLive(sessionId, frame.taskState("idle"));
+  server.pushLive(sessionId, frame.done());
   await first;
 
+  // 第二个任务续接同一会话：脚本换成能正常收尾的
+  server.defaultScript = happyScript();
   const second = channel.receive("继续用 skill");
-  await completeRun(server, [textDone("好"), runDone()]);
   await second;
   assert.equal(inputOf(server, 1), formatSkillInput("lark-im", "继续用 skill"));
 });
 
 test("/status 显示上次 Run 用量；/sessions 列出模型列", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("答 1");
   const channel = new FakeChannel();
-  const { gateway } = await makeGateway(server, channel);
+  const { gateway, registry } = await makeGateway(server, channel);
   await gateway.start();
 
+  // 本聊天设了模型档位：建会话时下发，sessionInfo 回得来
+  await registry.update("oc_chat", (b) => {
+    b.model = { provider: "stepfun", modelId: "step-3" };
+  });
+
   const first = channel.receive("第一个任务");
-  await completeRun(server, [textDone("答 1"), runDone()]);
   await first;
 
   await channel.receive("/status");
@@ -445,10 +485,50 @@ test("/status 显示上次 Run 用量；/sessions 列出模型列", async () => 
   assert.match(channel.lastSent(), /step-3/);
 });
 
+// ---- 档位下发（ADR-0005）----
+
+test("档位下发：binding 里的 model/thinking/workspace 随新建会话下发，续接不带", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("答 1");
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await registry.update("oc_chat", (b) => {
+    b.model = { provider: "stepfun", modelId: "step-3" };
+    b.thinkingLevel = "high";
+    b.workspace = "/tmp/demo";
+  });
+
+  const first = channel.receive("第一问");
+  const sessionId = await startedSession(server);
+  await first;
+
+  // 建会话带齐档位（model 以 provider+modelId 成对下发）；thinkingLevel 建后 PATCH
+  const create = createRequests(server)[0];
+  assert.deepEqual(create?.body, {
+    client: "cli",
+    approvalMode: "allow-all",
+    workspace: "/tmp/demo",
+    modelId: "step-3",
+    provider: "stepfun",
+  });
+  const patch = server.requests.find((r) => r.method === "PATCH");
+  assert.equal(patch?.path, `/sessions/${sessionId}`);
+  assert.deepEqual(patch?.body, { thinkingLevel: "high" });
+
+  // 续接同一会话：不再建会话、不再 PATCH，档位原样
+  const second = channel.receive("第二问");
+  await second;
+  assert.equal(createRequests(server).length, 1, "续接不建新会话");
+  assert.equal(server.requests.filter((r) => r.method === "PATCH").length, 1, "续接不改档位");
+  assert.equal(lastTaskPath(server), `/sessions/${sessionId}/tasks`);
+});
+
 // ---- T7：档位命令分发 ----
 
 test("档位命令：/project /agent /model /thinking /workspace 都带上 chatId 转发", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   const { calls, controller } = fakeTiers();
   const { gateway } = await makeGateway(server, channel, undefined, controller);
@@ -481,7 +561,7 @@ test("档位命令：/project /agent /model /thinking /workspace 都带上 chatI
 });
 
 test("档位命令：控制器缺失时明确提示，不静默失败", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
@@ -493,7 +573,7 @@ test("档位命令：控制器缺失时明确提示，不静默失败", async ()
 });
 
 test("/status 注入档位回显（describeTiers）", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   const { calls, controller } = fakeTiers();
   const { gateway } = await makeGateway(server, channel, undefined, controller);
@@ -504,10 +584,28 @@ test("/status 注入档位回显（describeTiers）", async () => {
   assert.deepEqual(calls, ["describeTiers:oc_chat"]);
 });
 
+/** 记录调用的假 TierController（档位命令由 owner 动态模式实现，这里只验分发）。 */
+function fakeTiers() {
+  const calls: string[] = [];
+  const controller: TierController = {
+    listProjects: async (chatId) => (calls.push(`listProjects:${chatId}`), "PROJECTS"),
+    selectProject: async (chatId, name) => (calls.push(`selectProject:${chatId}:${name}`), "PICKED"),
+    listAgents: async (chatId) => (calls.push(`listAgents:${chatId}`), "AGENTS"),
+    selectAgent: async (chatId, name) => (calls.push(`selectAgent:${chatId}:${name}`), "PICKED"),
+    listModels: async (chatId) => (calls.push(`listModels:${chatId}`), "MODELS"),
+    selectModel: async (chatId, name) => (calls.push(`selectModel:${chatId}:${name}`), "PICKED"),
+    selectThinking: async (chatId, level) => (calls.push(`selectThinking:${chatId}:${level}`), "PICKED"),
+    selectWorkspace: async (chatId, path) => (calls.push(`selectWorkspace:${chatId}:${path}`), "PICKED"),
+    describeTiers: async (chatId) => (calls.push(`describeTiers:${chatId}`), "- 模型：`stepfun/step-3`"),
+  };
+  return { calls, controller };
+}
+
 // ---- T9：访问控制 ----
 
 test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("在");
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel, undefined, undefined, {
     ALLOWLIST: "oc_chat,ou_friend",
@@ -516,33 +614,44 @@ test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", as
 
   // 命中的聊天：正常跑
   const ok = channel.receive("在吗");
-  await completeRun(server, [textDone("在"), runDone()]);
   await ok;
-  assert.equal(server.runRequests().length, 1);
+  assert.equal(
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    1,
+  );
   assert.match(channel.edited.at(-1)?.markdown ?? "", /在/);
 
   // 未命中的聊天：不回复、不发起 Run
   const before = channel.sent.length;
   await channel.receive("悄悄话", { chatId: "oc_stranger", senderId: "ou_stranger" });
   assert.equal(channel.sent.length, before, "不该有任何回复");
-  assert.equal(server.runRequests().length, 1, "不该发起 Run");
+  assert.equal(
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    1,
+    "不该发起 Run",
+  );
 
   // 命中 sender_id（私聊陌生人）也算数
   const allowed = channel.receive("我也在名单里", { chatId: "oc_stranger", senderId: "ou_friend" });
-  await completeRun(server, [textDone("好"), runDone()]);
   await allowed;
-  assert.equal(server.runRequests().length, 2);
+  assert.equal(
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    2,
+  );
 });
 
 test("allowlist 为空时开放访问（默认）", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
   const received = channel.receive("任意来源");
-  await completeRun(server, [textDone("好"), runDone()]);
   await received;
-  assert.equal(server.runRequests().length, 1);
+  assert.equal(
+    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    1,
+  );
 });
 
 // ---- router 纯函数 ----

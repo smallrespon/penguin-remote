@@ -147,16 +147,19 @@ export class OwnerSession {
     return token;
   }
 
-  /** 带 cookie 调一条 owner 路由；401 时重铸一次再试。 */
-  private async request<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+  /**
+   * 带 cookie 调一条 owner 路由；401 时重铸一次再试。
+   * 会话 API 客户端（sessions.ts）复用它走 /api/sessions 等路由。
+   */
+  async fetchAuthed(path: string, init: RequestInit = {}): Promise<Response> {
     const send = async (token: string): Promise<Response> =>
       this.fetchImpl(`${this.baseUrl}${path}`, {
-        method: init.method ?? "GET",
+        ...init,
         headers: {
           "Content-Type": "application/json",
+          ...(init.headers ?? {}),
           Cookie: `penguin_session=${token}`,
         },
-        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
       });
 
     let response = await send(await this.token());
@@ -164,6 +167,14 @@ export class OwnerSession {
       this.invalidate();
       response = await send(await this.token());
     }
+    return response;
+  }
+
+  private async request<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+    const response = await this.fetchAuthed(path, {
+      method: init.method ?? "GET",
+      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+    });
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       throw new OwnerError(

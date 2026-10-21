@@ -12,7 +12,7 @@ if [[ ! -f dist/src/index.js ]]; then
 fi
 
 if [[ -f .env ]]; then
-  # .env 里可能有 AMSP_API_KEY，收紧到仅本人可读
+  # .env 里可能有敏感配置，收紧到仅本人可读
   chmod 600 .env
   set -a
   # shellcheck disable=SC1091

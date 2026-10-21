@@ -3,9 +3,7 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface BridgeConfig {
-  /** AMSP 基址，如 http://localhost/api/amsp/v1（同机必须用 localhost，127.0.0.1 会 401）。 */
-  amspBaseUrl: string;
-  /** owner 级路由基址，由 amspBaseUrl 推导，如 http://localhost/api。 */
+  /** owner 级路由基址，如 http://localhost/api（会话 API 与档位清单都走它）。 */
   ownerApiBaseUrl: string;
   penguinBin: string;
   larkBin: string;
@@ -21,8 +19,6 @@ export interface BridgeConfig {
   previewThrottleMs: number;
   previewThrottleChars: number;
   previewMaxChars: number;
-  /** 默认 Agent 的 AMSP key 兜底（env 注入，不落盘）；缺省时由 Bridge 按需自铸。 */
-  amspApiKey: string | null;
 }
 
 /** 配置缺失或非法：消息列出全部问题，启动即失败。 */
@@ -37,7 +33,6 @@ export class ConfigError extends Error {
 
 const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const AMSP_PATH_SUFFIX = "/api/amsp/v1";
 
 function intField(
   env: Record<string, string | undefined>,
@@ -59,26 +54,17 @@ function intField(
 export function loadConfig(env: Record<string, string | undefined> = process.env): BridgeConfig {
   const problems: string[] = [];
 
-  const amspBaseUrlRaw = env.AMSP_BASE_URL?.trim() ?? "";
-  if (amspBaseUrlRaw === "") {
-    problems.push("缺少 AMSP_BASE_URL（PenguinHarness AMSP 基址，如 http://localhost/api/amsp/v1）");
+  const ownerApiBaseUrlRaw = env.OWNER_API_BASE_URL?.trim() ?? "";
+  if (ownerApiBaseUrlRaw === "") {
+    problems.push("缺少 OWNER_API_BASE_URL（PenguinHarness owner 路由基址，如 http://localhost/api）");
   }
-  let amspBaseUrl = "";
   let ownerApiBaseUrl = "";
-  if (amspBaseUrlRaw !== "") {
-    let parsed: URL | null = null;
+  if (ownerApiBaseUrlRaw !== "") {
     try {
-      parsed = new URL(amspBaseUrlRaw);
+      const parsed = new URL(ownerApiBaseUrlRaw);
+      ownerApiBaseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
     } catch {
-      problems.push(`AMSP_BASE_URL 不是合法 URL："${amspBaseUrlRaw}"`);
-    }
-    if (parsed !== null) {
-      const path = parsed.pathname.replace(/\/+$/, "");
-      if (path !== AMSP_PATH_SUFFIX) {
-        problems.push(`AMSP_BASE_URL 路径须以 ${AMSP_PATH_SUFFIX} 结尾（收到 "${path}"）`);
-      }
-      amspBaseUrl = `${parsed.origin}${path}`;
-      ownerApiBaseUrl = `${parsed.origin}/api`;
+      problems.push(`OWNER_API_BASE_URL 不是合法 URL："${ownerApiBaseUrlRaw}"`);
     }
   }
 
@@ -121,7 +107,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
-    amspBaseUrl,
     ownerApiBaseUrl,
     penguinBin: env.PENGUIN_BIN?.trim() || "penguin",
     larkBin: env.LARK_CLI_BIN?.trim() || "lark-cli",
@@ -135,6 +120,5 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     previewThrottleMs: throttleMs,
     previewThrottleChars: throttleChars,
     previewMaxChars: maxChars,
-    amspApiKey: env.AMSP_API_KEY?.trim() || null,
   };
 }

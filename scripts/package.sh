@@ -33,7 +33,7 @@ cp package.json pnpm-lock.yaml pnpm-workspace.yaml README.md LICENSE CHANGELOG.m
 cp -r scripts deploy "$STAGE/"
 
 echo "==> 安装生产依赖（hoisted 布局，随包分发；--prod 不含 devDependencies）"
-# @prismshadow/amsp 无安装脚本，--ignore-scripts 安全；部署机无需 pnpm 也能跑
+# v1.1 起运行时零依赖（@prismshadow/amsp 已移除）；--ignore-scripts 安全，部署机无需 pnpm 也能跑
 (cd "$STAGE" && pnpm install --prod --frozen-lockfile --node-linker=hoisted --ignore-scripts)
 
 echo "==> 打包 $TARBALL"

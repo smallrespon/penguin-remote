@@ -1,5 +1,5 @@
-// TierCommands 测试：/project /agent /model /thinking /workspace 的列出与切换，
-// 以及首次改档位时懒建专属 Agent、把绑定切过去并重置会话。
+// TierCommands 测试（ADR-0005）：/project /agent /model /thinking /workspace 的列出与切换。
+// 档位只写各聊天自己的 binding，不建 Agent、不发任何 owner 写请求。
 
 import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
@@ -9,7 +9,6 @@ import { test } from "node:test";
 
 import { TierCommands, matchModels } from "../src/tiers.js";
 import { Registry } from "../src/registry.js";
-import { AgentSupply } from "../src/penguin/agents.js";
 import { createLogger } from "../src/logger.js";
 import { FakeOwnerSession } from "./helpers/fake-owner.js";
 
@@ -55,11 +54,6 @@ class FakeOwner extends FakeOwnerSession {
   }
 }
 
-/** 从 owner 调用记录里取出被操作的 agentId（path 形如 `<projectId>/<agentId>`）。 */
-function agentIdsOf(owner: FakeOwner, method: string): string[] {
-  return owner.of(method).map((call) => call.path.split("/")[1] ?? "");
-}
-
 async function makeTiers() {
   const dir = await mkdtemp(join(tmpdir(), "pr-tiers-"));
   const registry = await Registry.load(dir, {
@@ -67,15 +61,8 @@ async function makeTiers() {
     agentId: "default_agent",
   });
   const owner = new FakeOwner();
-  const supply = new AgentSupply({
-    owner: owner.asOwnerSession,
-    baseUrl: "http://localhost/api/amsp/v1",
-    stateDir: dir,
-    logger: silent,
-  });
   const tiers = new TierCommands({
     owner: owner.asOwnerSession,
-    supply,
     registry,
     logger: silent,
     defaultAgentId: "default_agent",
@@ -101,12 +88,13 @@ test("/project 列出项目并标注当前；/agent 列出 Agent 并标注 API �
   assert.match(demoAgents, /`demo_agent`（API 未开启）/);
 });
 
-test("/model 列表：isDefault 或 Project 默认模型标 →；超过 30 个只展示前 30 个", async () => {
+test("/model 列表：isDefault 或 Project 默认模型标 →；超过 30 个只展示前 30 个；带上当前档位", async () => {
   const { tiers, registry } = await makeTiers();
   // MODELS[0] 带 isDefault
   let text = await tiers.listModels("oc_1");
   assert.match(text, /→ `stepfun\/step-3`/);
   assert.doesNotMatch(text, /→ `openai\/gpt-5`/);
+  assert.doesNotMatch(text, /当前：/, "没设过模型时不显示当前档位");
 
   // isDefault 全 false 时，defaultModel 顶上
   const { tiers: t2, owner: o2 } = await makeTiers();
@@ -132,6 +120,11 @@ test("/model 列表：isDefault 或 Project 默认模型标 →；超过 30 个�
   const bad = await tiers.selectProject("oc_1", "nope");
   assert.match(bad, /没有 Project/);
   assert.equal(registry.bindingFor("oc_1").projectId, "default_project");
+
+  // 设过模型后，列表带上当前档位
+  await tiers.selectModel("oc_1", "gpt-5");
+  text = await tiers.listModels("oc_1");
+  assert.match(text, /当前：`openai\/gpt-5`/);
 });
 
 // ---- 切换 ----
@@ -160,105 +153,97 @@ test("/project 与 /agent 切换后重置会话（换对话）", async () => {
   assert.equal(binding.sessionId, null);
 });
 
-test("/model 唯一匹配：改 API 设置并把绑定切到懒建的专属 Agent", async () => {
+test("/project 切换重置 model/thinking、保留 workspace", async () => {
+  const { tiers, registry } = await makeTiers();
+  await tiers.selectModel("oc_1", "gpt-5");
+  await tiers.selectThinking("oc_1", "high");
+  await tiers.selectWorkspace("oc_1", "/tmp/demo");
+
+  await tiers.selectProject("oc_1", "demo");
+  const binding = registry.bindingFor("oc_1");
+  assert.equal(binding.model, undefined, "模型目录是项目级的，切项目要重置");
+  assert.equal(binding.thinkingLevel, undefined);
+  assert.equal(binding.workspace, "/tmp/demo", "workspace 与项目无关，保留");
+});
+
+test("/model 唯一匹配：只写本聊天 binding，不建 Agent、不发 owner 写请求", async () => {
   const { tiers, registry, owner } = await makeTiers();
   await registry.noteSession("oc_1", { sessionId: "s1", title: "旧对话" });
 
   const reply = await tiers.selectModel("oc_1", "gpt-5");
   assert.match(reply, /已切换模型 `openai\/gpt-5`/);
+  assert.match(reply, /下一新会话生效/);
 
-  const created = agentIdsOf(owner, "POST /agents");
-  assert.equal(created.length, 1, "首次改档位应懒建一个专属 Agent");
-  assert.match(created[0] ?? "", /^feishu_[0-9a-f]{12}$/);
-
-  const put = owner.of("PUT /api").at(-1);
-  assert.equal(put?.path, `default_project/${created[0]}`, "档位改在专属 Agent 上");
-  assert.deepEqual(put?.body, { model: { provider: "openai", modelId: "gpt-5" } });
+  assert.deepEqual(owner.of("POST /agents"), [], "不建任何 Agent");
+  assert.deepEqual(owner.of("PUT /api"), [], "不动任何 Agent 的设置");
+  assert.deepEqual(owner.of("POST /keys"), [], "不铸 key");
 
   const binding = registry.bindingFor("oc_1");
-  assert.equal(binding.agentId, created[0]);
-  assert.equal(binding.sessionId, null, "换 Agent = 换对话");
+  assert.deepEqual(binding.model, { provider: "openai", modelId: "gpt-5" });
+  // 「下一新会话生效」是字面语义：当前会话原样续着
+  assert.equal(binding.sessionId, "s1");
+  assert.equal(binding.agentId, "default_agent");
   assert.equal(binding.projectId, "default_project");
 });
 
-test("/model 多个匹配或没有匹配：不改任何设置", async () => {
+test("/model 多个匹配或没有匹配：不改任何档位", async () => {
   const { tiers, registry, owner } = await makeTiers();
 
   const ambiguous = await tiers.selectModel("oc_1", "step-3");
   assert.match(ambiguous, /匹配到多个模型/);
   assert.match(ambiguous, /`stepfun\/step-3`/);
   assert.match(ambiguous, /`other\/step-3`/);
-  assert.deepEqual(owner.of("PUT /api"), []);
-  assert.deepEqual(owner.of("POST /agents"), []);
-  assert.equal(registry.bindingFor("oc_1").agentId, "default_agent");
+  assert.equal(registry.bindingFor("oc_1").model, undefined);
 
   const missing = await tiers.selectModel("oc_1", "llama-9");
   assert.match(missing, /没有匹配/);
+  assert.equal(registry.bindingFor("oc_1").model, undefined);
   assert.deepEqual(owner.of("PUT /api"), []);
 });
 
-test("/thinking 与 /workspace：改专属 Agent 的 API 设置", async () => {
-  const { tiers, registry, owner } = await makeTiers();
+test("/thinking 与 /workspace：写本聊天 binding，重启后仍在", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pr-tiers-"));
+  const registry = await Registry.load(dir, {
+    projectId: "default_project",
+    agentId: "default_agent",
+  });
+  const owner = new FakeOwner();
+  const tiers = new TierCommands({
+    owner: owner.asOwnerSession,
+    registry,
+    logger: silent,
+    defaultAgentId: "default_agent",
+  });
 
   assert.match(await tiers.selectThinking("oc_1", "high"), /思考档位已设为 `high`/);
-  assert.deepEqual(owner.of("PUT /api").at(-1)?.body, { thinkingLevel: "high" });
-
   assert.match(await tiers.selectWorkspace("oc_1", "/tmp/demo"), /工作区已设为/);
-  assert.deepEqual(owner.of("PUT /api").at(-1)?.body, { workspace: "/tmp/demo" });
 
-  const binding = registry.bindingFor("oc_1");
-  assert.match(binding.agentId, /^feishu_/);
-  // 只懒建一次：开 API + 两次档位切换，共三次 PUT，都落在同一个专属 Agent 上
-  assert.deepEqual(agentIdsOf(owner, "POST /agents").length, 1);
-  const puts = owner.of("PUT /api");
-  assert.equal(puts.length, 3);
-  assert.deepEqual(puts[0]?.body, { enabled: true, approvalMode: "allow-all" });
-  assert.deepEqual(puts[1]?.body, { thinkingLevel: "high" });
-  assert.deepEqual(puts[2]?.body, { workspace: "/tmp/demo" });
-  assert.equal(puts[0]?.path, puts[2]?.path);
+  assert.deepEqual(owner.of("PUT /api"), [], "档位不进 Agent 设置");
+  const reloaded = await Registry.load(dir, {
+    projectId: "default_project",
+    agentId: "default_agent",
+  });
+  const binding = reloaded.bindingFor("oc_1");
+  assert.equal(binding.thinkingLevel, "high");
+  assert.equal(binding.workspace, "/tmp/demo");
 });
 
-test("/status 档位回显：读得到时列模型/思考/工作区/审批，读不到时明确说失败", async () => {
-  const { tiers, owner } = await makeTiers();
-  owner.api = {
-    model: { provider: "stepfun", modelId: "step-3" },
-    thinkingLevel: "medium",
-    workspace: "/tmp/x",
-  };
-  const text = await tiers.describeTiers("oc_1");
-  assert.match(text, /`stepfun\/step-3`/);
+test("/status 档位回显：来自本聊天 binding，缺省时显示「跟随默认」", async () => {
+  const { tiers } = await makeTiers();
+  let text = await tiers.describeTiers("oc_1");
+  assert.match(text, /模型：跟随默认/);
+  assert.match(text, /思考：跟随默认/);
+  assert.match(text, /工作区：`临时工作区`/);
+
+  await tiers.selectModel("oc_1", "stepfun/step-3-mini");
+  await tiers.selectThinking("oc_1", "medium");
+  await tiers.selectWorkspace("oc_1", "/tmp/x");
+  text = await tiers.describeTiers("oc_1");
+  assert.match(text, /`stepfun\/step-3-mini`/);
   assert.match(text, /medium/);
   assert.match(text, /`\/tmp\/x`/);
-  assert.match(text, /审批：`allow-all`/);
-  assert.doesNotMatch(text, /API 未开启/);
-
-  owner.failGet = true;
-  assert.match(await tiers.describeTiers("oc_1"), /读取失败/);
-});
-
-test("/agent 切到非 allow-all 的 Agent 时提示审批后果", async () => {
-  const { tiers, owner } = await makeTiers();
-  owner.approvalModes.coder = "always-ask";
-
-  const strict = await tiers.selectAgent("oc_1", "coder");
-  assert.match(strict, /已切换 Agent `coder`/);
-  assert.match(strict, /审批模式是 `always-ask`/);
-  assert.match(strict, /会拒绝所有审批/);
-
-  owner.approvalModes.coder = "allow-all";
-  const relaxed = await tiers.selectAgent("oc_1", "coder");
-  assert.doesNotMatch(relaxed, /审批模式/);
-
-  // 读不到 API 设置（API 未开启）时不提示，也不报错
-  owner.approvalModes.coder = "always-ask";
-  owner.failGet = true;
-  assert.doesNotMatch(await tiers.selectAgent("oc_1", "coder"), /审批模式/);
-});
-
-test("/status 档位回显：Agent 的 API 未开启时给出警告", async () => {
-  const { tiers, owner } = await makeTiers();
-  owner.apiEnabled = false;
-  assert.match(await tiers.describeTiers("oc_1"), /API 未开启/);
+  // 另一个聊天不受影响
+  assert.match(await tiers.describeTiers("oc_2"), /模型：跟随默认/);
 });
 
 // ---- 纯函数 ----

@@ -27,40 +27,40 @@ _Avoid_: 队列（queue）、锁
 _Avoid_: 缓存、session store、数据库
 
 **绑定（Binding）**:
-某个飞书聊天当前生效的 (project, agent, session, skill) 组合，记录在 Registry 中。
+某个飞书聊天当前生效的 (project, agent, session, skill) 组合与档位（模型 / 思考 / 工作区），记录在 Registry 中；档位只在这个聊天内生效，互不污染。
 _Avoid_: 配置、profile（见 ADR-0002，Profile 是被否决的备选方案）
 
 ### PenguinHarness 侧
 
 **Run**:
-PenguinHarness 中一次 Agent 执行：由 AMSP runs 路由发起，以 SSE 事件流推进，直到 `run.done`。
+PenguinHarness 中一次 Agent 执行：由会话 API 的 tasks 路由发起（`POST /api/sessions/:id/tasks`），以该会话的 SSE 事件流推进，直到会话回到 idle。
 _Avoid_: 任务（task）、job
 
 **会话（Session）**:
-PenguinHarness 侧的对话上下文容器，多个 Run 可续接同一 Session；同一 Session 同时只跑一个 Run。
+PenguinHarness 侧的对话上下文容器，多个 Run 可续接同一 Session；同一 Session 同时只跑一个 Run。按来源分 `user`（普通会话，`penguin chat` 与人聊出来的）与 `api` / `cli` 等程序会话——后者被服务端按规则归档，不出现在侧栏（见 ADR-0005）。
 _Avoid_: chat、conversation（那些指飞书侧的聊天）
 
+**会话 API**:
+PenguinHarness 以人类登录态（cookie）驱动的 HTTP 面：`/api/projects/:p/agents/:a/sessions` 建会话、`/api/sessions/:id/*` 做投递 / 中止 / 审批 / 查询。Bridge 自 ADR-0005 起只走这一面，建出来的都是普通会话，不归档。
+_Avoid_: 用户 API、web API
+
 **AMSP**:
-PenguinHarness 的 Agent API（`/api/amsp/v1`），位于 cookie 认证网关之前，用 per-agent key 认证，提供 runs / 会话查询 / abort / approvals。
+PenguinHarness 的 Agent API（`/api/amsp/v1`），位于 cookie 认证网关之前，用 per-agent key 认证。ADR-0005 之前 Bridge 的传输层；现在不再使用（它建的会话按规则归档，且拒绝续接非自建会话）。
 _Avoid_: API、REST API（太泛）
 
 **Owner 会话**:
-Bridge 用 `penguin auth token` 自铸的临时人类登录态，用于调用 owner 级路由（改 Agent API 设置、建 Agent、铸 key）；只驻内存，过期前重铸。
+Bridge 用 `penguin auth token` 自铸的临时人类登录态：owner 级路由（列 Project / Agent / 模型）与会话 API 都用它，只驻内存，过期前重铸。
 _Avoid_: 登录态、admin token、管理员令牌
 
-**专属 Agent**:
-Bridge 为某个聊天懒建的 PenguinHarness Agent（命名 `feishu_<chatId 哈希>`），让该聊天的档位切换只影响自己，隔离 Agent 级设置的全局副作用。
-_Avoid_: 私有 Agent、per-chat Agent、临时 Agent
-
 **档位**:
-模型 / 思考程度 / 工作区三项 Agent 级设置的合称；只对之后新建的会话生效。
+模型 / 思考程度 / 工作区三项设置的合称，按聊天存放在 binding 里，只对该聊天之后新建的会话生效（见 ADR-0005）。
 _Avoid_: 配置项、参数、设置
 
 ### 飞书侧
 
 **流式预览**:
 用一条占位消息加节流 `messages-edit` 实现的渐进显示效果。
-_Avoid_: streaming（那个指 AMSP 事件流）、打字机效果
+_Avoid_: streaming（那个指会话 SSE 事件流）、打字机效果
 
 **回复分区**:
 一条飞书回复消息内按内容类型划分的结构块：思考、工具调用、正文等，各带一行标签以示区分；分区按 Run 的真实时序排列，工具调用可夹在两段正文之间。

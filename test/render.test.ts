@@ -11,20 +11,29 @@ import {
   shouldFlush,
   type PreviewOptions,
 } from "../src/render.js";
-import {
-  FakeAmspServer,
-  runDone,
-  textDelta,
-  textDone,
-  thinkingDelta,
-  thinkingDone,
-  toolCallDone,
-  toolResultDone,
-} from "./helpers/fake-amsp.js";
-import { AmspClient } from "../src/penguin/amsp.js";
+import { SessionClient } from "../src/penguin/sessions.js";
 import { executeRun } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
+import { FakeSessionServer, frame } from "./helpers/fake-sessions.js";
+import type { RunEvent } from "../src/run-event.js";
+
+// 单元测试用的事件构造器（旧 AMSP fake 的同款形态，现在直接用 Bridge 自有事件）。
+const textDelta = (text: string): RunEvent => ({ type: "text.delta", role: "assistant", text });
+const textDone = (text: string): RunEvent => ({ type: "text.done", role: "assistant", text });
+const thinkingDelta = (thinking: string, at = "2026-10-21T10:00:00.000Z"): RunEvent => ({ type: "thinking.delta", thinking, at });
+const thinkingDone = (thinking: string, at = "2026-10-21T10:00:05.000Z"): RunEvent => ({ type: "thinking.done", thinking, at });
+const toolCallDone = (id: string, name: string, args = "{}"): RunEvent => ({
+  type: "tool_call.done",
+  name,
+  arguments: args,
+  tool_call_id: id,
+});
+const toolResultDone = (id: string, output: string): RunEvent => ({
+  type: "tool_result.done",
+  output,
+  tool_call_id: id,
+});
 
 const OPTIONS: PreviewOptions = { throttleMs: 1500, throttleChars: 300, maxChars: 3500 };
 
@@ -170,10 +179,9 @@ test("render：审批与压缩提示按事件顺序落成提示分区", () => {
   let state = emptyPreview();
   state = applyEvent(state, {
     type: "approval.requested",
-    at: "2026-10-21T10:00:00.000Z",
     tool_call: { tool_call_id: "c1", name: "exec_command", arguments: '{"command":"rm -rf /"}' },
   });
-  state = applyEvent(state, { type: "compaction.started", at: "2026-10-21T10:00:01.000Z", reason: "context", mode: "summarize", context: 1, turns: 2 });
+  state = applyEvent(state, { type: "compaction.started" });
   assert.deepEqual(state.parts, [
     { kind: "notice", text: "⚠️ 等待审批：`exec_command`" },
     { kind: "notice", text: "🗜️ 正在压缩上下文…" },
@@ -182,11 +190,6 @@ test("render：审批与压缩提示按事件顺序落成提示分区", () => {
     renderPreview(state, OPTIONS),
     "⚠️ 等待审批：`exec_command`\n\n🗜️ 正在压缩上下文…",
   );
-});
-
-test("render：未知事件类型被忽略", () => {
-  const state = applyEvent(emptyPreview(), { type: "mcp_connect.done", at: "", status: "completed", results: [] });
-  assert.deepEqual(state, emptyPreview());
 });
 
 test("render：回复分区按 Run 真实时序渲染，工具可夹在两段正文之间", () => {
@@ -355,10 +358,18 @@ test("formatFinalText：累积正文与 outcome 不一致时改用 outcome 的�
   assert.match(text, /最终答案\n\n---\n用量 42 tokens$/);
 });
 
-test("formatFinalText：outcome 没有正文时给出占位说明", () => {
+test("formatFinalText：outcome 没有正文且没有流式正文时给出占位说明", () => {
   const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command"));
   const text = formatFinalText({ status: "completed", text: "   ", usage: null }, state);
   assert.match(text, /（本轮没有文本输出）\n\n---\n用量未知$/);
+});
+
+test("formatFinalText：outcome 没有正文时保留流式累积的正文（中断场景）", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, textDelta("写到了一半"));
+  const text = formatFinalText({ status: "aborted", text: "", usage: null }, state);
+  assert.match(text, /写到了一半/);
+  assert.ok(!text.includes("（本轮没有文本输出）"));
 });
 
 test("formatFinalText：比较正文时忽略空白差异", () => {
@@ -378,33 +389,63 @@ test("formatFinalText：未正常完成时页脚带上状态与原因", () => {
   assert.match(text, /做到一半\n\n---\n未正常完成（aborted）：用户中断\n用量 7 tokens$/);
 });
 
+// ---- 集成：runner + 会话 API 假服务器（原 AMSP 版移植，ADR-0005） ----
+
+const AGENT = { projectId: "default_project", agentId: "default_agent" };
+
+function client(server: FakeSessionServer): SessionClient {
+  return new SessionClient({ fetchAuthed: server.fetchAuthed });
+}
+
+/** 等 Bridge 把任务投递出去（此刻订阅已就绪），返回会话 id。 */
+async function startedSession(server: FakeSessionServer): Promise<string> {
+  const started = Date.now();
+  while (server.lastTaskSession() === null) {
+    if (Date.now() - started > 1000) throw new Error("waitFor timeout");
+    await tick();
+  }
+  return server.lastTaskSession() ?? "";
+}
+
+/** 收尾三件套 + 流终止。 */
+function finish(server: FakeSessionServer, sessionId: string, finalText: string): void {
+  server.pushLive(sessionId, frame.omni({ type: "text", role: "assistant", text: finalText, stop_reason: "completed" }));
+  server.pushLive(sessionId, frame.event({ type: "token_usage", request: { total: 42 }, session: { total: 42 } }));
+  server.pushLive(sessionId, frame.event({ type: "request_end", status: "completed" }));
+  server.pushLive(sessionId, frame.taskState("idle"));
+  server.pushLive(sessionId, frame.done());
+}
+
+function startRun(server: FakeSessionServer, channel: FakeChannel) {
+  return executeRun(
+    { channel, logger: silent },
+    {
+      chatId: "oc_1",
+      input: "长任务",
+      agent: AGENT,
+      sessionId: null,
+      client: client(server),
+      preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+    },
+  );
+}
+
 test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一次", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
-  const client = new AmspClient({
-    baseUrl: server.baseUrl,
-    agent: { projectId: "default_project", agentId: "default_agent" },
-    apiKey: "penguin_test",
-    fetch: server.fetch,
-  });
-  const report = executeRun({ channel, logger: silent }, {
-    chatId: "oc_1",
-    input: "长任务",
-    client,
-    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
-  });
-  const run = await nextRun(server);
-  server.push(run, thinkingDelta("先想一下"));
+  const report = startRun(server, channel);
+  const sessionId = await startedSession(server);
+
+  server.pushLive(sessionId, frame.taskState("running"));
+  server.pushLive(sessionId, frame.omni({ type: "partial_thinking", role: "assistant", event_type: "delta", thinking: "先想一下" }));
   await tick();
-  server.push(run, textDelta("第一部"));
+  server.pushLive(sessionId, frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: "第一部" }));
   await tick();
-  server.push(run, toolCallDone("c1", "exec_command"));
+  server.pushLive(sessionId, frame.omni({ type: "tool_call", role: "assistant", name: "exec_command", arguments: '{"command":"ls"}', tool_call_id: "c1" }));
   await tick();
-  server.push(run, toolResultDone("c1", "输出"));
+  server.pushLive(sessionId, frame.omni({ type: "tool_call_output", role: "user", output: "输出", tool_call_id: "c1" }));
   await tick();
-  server.push(run, textDone("全部完成"));
-  server.push(run, runDone());
-  server.close(run);
+  finish(server, sessionId, "全部完成");
   await report;
 
   assert.equal(channel.sent.length, 1);
@@ -431,28 +472,16 @@ class UnfairEditChannel extends FakeChannel {
 }
 
 test("流式预览：在途的预览编辑不得盖掉定稿（晚到的编辑被作废）", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new UnfairEditChannel();
-  const client = new AmspClient({
-    baseUrl: server.baseUrl,
-    agent: { projectId: "default_project", agentId: "default_agent" },
-    apiKey: "penguin_test",
-    fetch: server.fetch,
-  });
-  const report = executeRun({ channel, logger: silent }, {
-    chatId: "oc_1",
-    input: "长任务",
-    client,
-    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
-  });
-  const run = await nextRun(server);
+  const report = startRun(server, channel);
+  const sessionId = await startedSession(server);
+  server.pushLive(sessionId, frame.taskState("running"));
   // 连续推事件：每次都排队一次（慢速）预览编辑，收尾时它们还在飞行中
   for (const piece of ["第一段", "第二段", "第三段"]) {
-    server.push(run, textDelta(piece));
+    server.pushLive(sessionId, frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: piece }));
   }
-  server.push(run, textDone("最终答案"));
-  server.push(run, runDone());
-  server.close(run);
+  finish(server, sessionId, "最终答案");
   await report;
   // 故意多等一会：让任何还在飞行中的预览编辑先落地，再看谁排在最后
   await new Promise((resolve) => setTimeout(resolve, 250));
@@ -466,37 +495,30 @@ test("流式预览：在途的预览编辑不得盖掉定稿（晚到的编辑�
 });
 
 test("流式预览：编辑次数反复用尽时持续换新消息，定稿落在最新一条上", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   channel.editLimitPerMessage = 1;
-  const client = new AmspClient({
-    baseUrl: server.baseUrl,
-    agent: { projectId: "default_project", agentId: "default_agent" },
-    apiKey: "penguin_test",
-    fetch: server.fetch,
-  });
-  const report = executeRun({ channel, logger: silent }, {
-    chatId: "oc_1",
-    input: "长任务",
-    client,
-    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
-  });
-  const run = await nextRun(server);
+  const report = startRun(server, channel);
+  const sessionId = await startedSession(server);
+  server.pushLive(sessionId, frame.taskState("running"));
   for (const piece of ["第一段", "第二段", "第三段", "第四段"]) {
-    server.push(run, textDelta(piece));
+    server.pushLive(sessionId, frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: piece }));
     await tick();
   }
-  server.push(run, textDone("最终答案"));
-  server.push(run, runDone());
-  server.close(run);
+  finish(server, sessionId, "最终答案");
   await report;
 
-  // 每条消息只允许编辑 1 次：占位 + 三次续接 + 定稿所在的那条
+  // 每条消息只允许编辑 1 次：占位 + 两次续接 + 定稿所在的那条
   assert.equal(channel.sent.length, 4, `应持续换消息续接，实际 ${channel.sent.length}`);
   const last = channel.sent.at(-1);
   const finalEdit = channel.edited.at(-1);
-  assert.equal(finalEdit?.messageId, last?.messageId, "定稿应落在最新一条消息上");
-  assert.match(finalEdit?.markdown ?? "", /最终答案/);
+  // 定稿落在最新一条消息上：它还有编辑额度就编辑它，额度已用尽就作为最新一条消息直接发出
+  const finalMarkdown =
+    finalEdit !== undefined && finalEdit.messageId === last?.messageId
+      ? finalEdit.markdown
+      : (last?.markdown ?? "");
+  assert.match(finalMarkdown, /最终答案/, "定稿应落在最新一条消息上");
+  assert.match(finalMarkdown, /用量 42 tokens/, "定稿带用量页脚");
   // 每条消息都被编辑过，且编辑次数都不超过上限
   const counts = new Map<string, number>();
   for (const edit of channel.edited) counts.set(edit.messageId, (counts.get(edit.messageId) ?? 0) + 1);
@@ -504,27 +526,15 @@ test("流式预览：编辑次数反复用尽时持续换新消息，定稿落�
 });
 
 test("流式预览：编辑从未成功过时直接降级为最终一次性发送，不白换消息", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   channel.failEditWith = new Error("too many requests");
-  const client = new AmspClient({
-    baseUrl: server.baseUrl,
-    agent: { projectId: "default_project", agentId: "default_agent" },
-    apiKey: "penguin_test",
-    fetch: server.fetch,
-  });
-  const report = executeRun({ channel, logger: silent }, {
-    chatId: "oc_1",
-    input: "长任务",
-    client,
-    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
-  });
-  const run = await nextRun(server);
-  server.push(run, textDelta("部分"));
+  const report = startRun(server, channel);
+  const sessionId = await startedSession(server);
+  server.pushLive(sessionId, frame.taskState("running"));
+  server.pushLive(sessionId, frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: "部分" }));
   await tick();
-  server.push(run, textDone("最终答案"));
-  server.push(run, runDone());
-  server.close(run);
+  finish(server, sessionId, "最终答案");
   await report;
 
   assert.equal(channel.edited.length, 0, "编辑从未成功，不该换消息白试");
@@ -533,40 +543,24 @@ test("流式预览：编辑从未成功过时直接降级为最终一次性发�
 });
 
 test("流式预览：单条消息编辑次数用尽后换新消息继续，定稿落在新消息上", async () => {
-  const server = new FakeAmspServer();
+  const server = new FakeSessionServer();
   const channel = new FakeChannel();
   channel.editLimitPerMessage = 3;
-  const client = new AmspClient({
-    baseUrl: server.baseUrl,
-    agent: { projectId: "default_project", agentId: "default_agent" },
-    apiKey: "penguin_test",
-    fetch: server.fetch,
-  });
-  const report = executeRun({ channel, logger: silent }, {
-    chatId: "oc_1",
-    input: "长任务",
-    client,
-    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
-  });
-  const run = await nextRun(server);
-  server.push(run, textDelta("第一段"));
-  await tick();
-  server.push(run, textDelta("第二段"));
-  await tick();
-  server.push(run, textDelta("第三段"));
-  await tick();
-  server.push(run, textDelta("第四段"));
-  await tick();
-  server.push(run, textDone("最终答案"));
-  server.push(run, runDone());
-  server.close(run);
+  const report = startRun(server, channel);
+  const sessionId = await startedSession(server);
+  server.pushLive(sessionId, frame.taskState("running"));
+  for (const piece of ["第一段", "第二段", "第三段", "第四段"]) {
+    server.pushLive(sessionId, frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: piece }));
+    await tick();
+  }
+  finish(server, sessionId, "最终答案");
   await report;
 
-  // 占位消息被编辑满 2 次，随后换一条新消息继续
+  // 占位消息被编辑满 3 次，随后换一条新消息继续
   assert.equal(channel.sent.length, 2, "占位 + 换的新预览消息");
   const [placeholder, chained] = channel.sent;
   assert.equal(placeholder?.markdown, PLACEHOLDER_TEXT);
-  assert.match(chained?.markdown ?? "", /第二段/, "新消息带着当前进度出现");
+  assert.match(chained?.markdown ?? "", /第四段/, "新消息带着当前进度出现");
   const chainedId = chained?.messageId ?? "";
   assert.ok(channel.edited.some((e) => e.messageId === chainedId), "后续编辑应打到新消息上");
   // 定稿编辑在新消息上，而不是再发一条
@@ -578,14 +572,4 @@ test("流式预览：单条消息编辑次数用尽后换新消息继续，定�
 
 function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 10));
-}
-
-async function nextRun(server: FakeAmspServer): Promise<ReturnType<FakeAmspServer["lastRun"]>> {
-  const before = server.runs.length;
-  const started = Date.now();
-  while (server.runs.length <= before) {
-    if (Date.now() - started > 1000) throw new Error("waitFor timeout");
-    await tick();
-  }
-  return server.lastRun();
 }

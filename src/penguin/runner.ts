@@ -1,12 +1,14 @@
-// 单次 Run 的生命周期：占位消息 → 节流编辑的流式预览 → 定稿。
-// 编辑失败（频率限制）时降级为最后一次性发送，结果不丢。
-// 429（并发超限）按 Retry-After 退避重试；409（会话忙）转化为「进行中」提示。
+// 单次 Run 的生命周期（ADR-0005 会话 API 版）：
+// 占位消息 → （续接或新建会话）→ 订阅 SSE → 投递任务 → 流式预览 → 定稿。
+// 订阅先于投递（服务端订阅后立刻发 task_state 快照，保证不丢事件）；
+// 流中断不会让服务端停止任务，所以断流时显式 abort，避免僵尸任务占住会话。
 
 import type { ChannelAdapter } from "../channels/types.js";
 import type { ApprovalPolicy } from "../approvals.js";
 import { denyAll } from "../approvals.js";
-import { SessionBusyError, TooManyRunsError } from "./amsp.js";
-import type { AmspClient, AmspEvent, AmspRun, AmspRunOutcome } from "./amsp.js";
+import { redact } from "../logger.js";
+import type { Logger } from "../logger.js";
+import type { RunEvent } from "../run-event.js";
 import {
   BUSY_HINT,
   PLACEHOLDER_TEXT,
@@ -15,24 +17,37 @@ import {
   formatRunFailure,
   type PreviewOptions,
 } from "../render.js";
-import type { Logger } from "../logger.js";
+import type { AgentRef, ModelRef, SessionClient } from "./sessions.js";
+import { SessionBusyError } from "./sessions.js";
+import { RunTracker, isApprovalRequest, isTaskState } from "./omni.js";
 
-/** 429 退避重试次数（另有首次尝试，共 1 + MAX_RETRIES 次）。 */
-const MAX_RETRIES = 2;
-
-/** 预览消息最多续接几条新消息（飞书单条消息编辑次数有限，长任务要换消息续）。 */
-const MAX_CHAINS = 10;
+/** 新建会话时下发的档位（来自聊天的 binding）。 */
+export interface SessionSettings {
+  workspace?: string;
+  model?: ModelRef;
+  thinkingLevel?: string;
+}
 
 export interface RunSpec {
   chatId: string;
   input: string;
-  /** 续接的会话；省略则新建。 */
-  sessionId?: string;
-  client: AmspClient;
+  /** 目标 Agent（Project + Agent）。 */
+  agent: AgentRef;
+  /** 续接的会话；null = 用 settings 新建。 */
+  sessionId: string | null;
+  /** 新建会话时下发的档位。 */
+  settings?: SessionSettings;
+  client: SessionClient;
   /** 流式预览节流参数。 */
   preview: PreviewOptions;
-  /** Run 一旦发起即回调（供 /stop 持有 abort）。 */
-  onStart?: (run: AmspRun) => void;
+  /** 会话就绪即回调（供 /stop 持有 abort）。 */
+  onStart?: (handle: RunHandle) => void;
+}
+
+/** 一次在途 Run 的句柄：/stop 用它中断。 */
+export interface RunHandle {
+  sessionId: string;
+  abort: () => Promise<void>;
 }
 
 export interface RunReport {
@@ -75,7 +90,6 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   let flushChain: Promise<void> = Promise.resolve();
   /** Run 已结束：之后的预览 flush 一律作废，避免晚到的编辑盖掉定稿。 */
   let finished = false;
-  // 每次尝试（含 429 后重开）都用新的预览状态，避免上一次的增量文本残留。
   let preview = new RunPreview(spec.preview);
 
   /** 等未落地的预览编辑做完，并此后再不让预览覆盖定稿。 */
@@ -96,7 +110,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
       logger.warn(`预览编辑失败：${error instanceof Error ? error.message : String(error)}`);
     }
     // 这条消息一次都没编辑成功过：换新的也白搭，直接放弃预览（发送本身出问题时走这条）。
-    if (editsOnCurrent === 0 || chains >= MAX_CHAINS) {
+    if (editsOnCurrent === 0 || chains >= 10) {
       degraded = true;
       logger.warn("放弃流式预览，改为最终一次性发送");
       return;
@@ -116,80 +130,157 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     }
   };
 
-  const startRun = (): AmspRun => {
-    preview = new RunPreview(spec.preview);
-    const run = spec.client.streamRun({
-      input: spec.input,
-      ...(spec.sessionId !== undefined ? { sessionId: spec.sessionId } : {}),
-      onEvent: (event: AmspEvent) => {
-        preview.update(event);
-        if (degraded) return;
-        const now = Date.now();
-        if (!preview.due(now)) return;
-        preview.noteFlushed(now);
-        flushChain = flushChain.then(() => flushOnce());
-      },
-      // 审批：allow-all 模式下不会来；来了就按策略决定，并让用户在预览里看到结果。
-      onApproval: (request, ctx) => {
-        const decision = policy.decide({
-          sessionId: ctx.sessionId,
-          toolCallId: request.tool_call.tool_call_id,
-          name: request.tool_call.name,
-          arguments: request.tool_call.arguments,
-        });
-        preview.addNotice(
-          decision === "allow"
-            ? `✅ 已允许 \`${request.tool_call.name}\``
-            : `🚫 已拒绝 \`${request.tool_call.name}\`（v1 不做审批卡片）`,
-        );
-        logger.warn(`审批请求 \`${request.tool_call.name}\` → ${decision}`);
-        return decision;
-      },
-    });
-    // 每次重开 Run 都更新 abort 句柄，/stop 中断的永远是当前这次尝试。
-    spec.onStart?.(run);
-    return run;
+  /** 事件 → 预览（节流）；approval 由调用方单独处理，不在这里渲染。 */
+  const applyEvents = (events: readonly RunEvent[], now: number): void => {
+    for (const event of events) {
+      preview.update(event);
+      if (degraded) continue;
+      if (!preview.due(now)) continue;
+      preview.noteFlushed(now);
+      flushChain = flushChain.then(() => flushOnce());
+    }
   };
 
-  const run = startRun();
-  const sessionId = await run.sessionId.catch(() => null);
+  /** 审批应答：allow-all 模式下不会来；来了按策略决定，并让用户在预览里看到结果。 */
+  const answerApproval = async (
+    sessionId: string,
+    call: { name: string; tool_call_id: string },
+  ): Promise<void> => {
+    const decision = await policy.decide({
+      sessionId,
+      toolCallId: call.tool_call_id,
+      name: call.name,
+      arguments: "",
+    });
+    preview.addNotice(
+      decision === "allow"
+        ? `✅ 已允许 \`${call.name}\``
+        : `🚫 已拒绝 \`${call.name}\`（v1 不做审批卡片）`,
+    );
+    logger.warn(`审批请求 \`${call.name}\` → ${decision}`);
+    try {
+      await spec.client.decideApproval(sessionId, call.tool_call_id, decision);
+    } catch (error: unknown) {
+      logger.warn(`应答审批失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
-  let outcome: AmspRunOutcome;
+  // ---- 会话就绪：续接或新建 ----
+
+  let sessionId: string;
   try {
-    outcome = await withRetry(startRun, run, logger);
+    if (spec.sessionId !== null) {
+      sessionId = spec.sessionId;
+    } else {
+      const settings = spec.settings ?? {};
+      const info = await spec.client.createSession(spec.agent.projectId, spec.agent.agentId, {
+        ...(settings.workspace !== undefined ? { workspace: settings.workspace } : {}),
+        ...(settings.model !== undefined ? { model: settings.model } : {}),
+      });
+      sessionId = info.sessionId;
+      logger.info(`已新建会话 ${sessionId}`);
+      if (settings.thinkingLevel !== undefined) {
+        // 建会话不接受 thinkingLevel（服务端只认 PATCH）；钉失败不致命——会话按默认档位跑。
+        try {
+          await spec.client.patchThinkingLevel(sessionId, settings.thinkingLevel);
+        } catch (error: unknown) {
+          logger.warn(`钉思考档位失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    logger.warn(`Run 失败：${message}`);
-    // 409 会话忙：转化为「进行中」提示，和其他入口一致。
-    const failureText = error instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(error);
-    // 预览消息还挂在聊天里，别让它停在「思考中…」：把结局写进同一条消息。
+    logger.warn(`会话准备失败：${message}`);
     await settlePreview();
-    await deliverFinal(deps, spec.chatId, liveMessageId, failureText, degraded);
-    return {
-      chatId: spec.chatId,
-      sessionId,
-      status: "failed",
-      error: message,
-      usageTotal: null,
-      requests: 0,
-      durationMs: Date.now() - startedAt,
-      modelId: null,
-    };
+    await deliverFinal(deps, spec.chatId, liveMessageId, formatRunFailure(error), degraded);
+    return failedReport(spec.chatId, null, message, startedAt);
   }
 
-  logger.info(`Run 完成：${outcome.status}，session=${outcome.sessionId}`);
+  let aborted = false;
+  const handle: RunHandle = {
+    sessionId,
+    abort: async () => {
+      aborted = true;
+      try {
+        await spec.client.abort(sessionId);
+      } catch (error: unknown) {
+        logger.warn(`中断失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+  };
+  spec.onStart?.(handle);
+
+  // ---- 订阅 → 投递 → 守到 idle ----
+
+  const tracker = new RunTracker();
+  let sawActive = false;
+  let streamFailure: unknown = null;
+
+  try {
+    let stream = await spec.client.stream(sessionId);
+    await stream.ready();
+
+    const started = await spec.client.startTask(sessionId, spec.input);
+    if (started.sessionId !== sessionId) {
+      // 服务端把会话自愈成了新 id：旧订阅作废，改订阅新 id 再继续。
+      logger.info(`会话自愈：${sessionId} → ${started.sessionId}`);
+      await stream.close();
+      sessionId = started.sessionId;
+      stream = await spec.client.stream(sessionId);
+      await stream.ready();
+    }
+
+    for await (const item of stream) {
+      if (item.kind === "server") {
+        if (isApprovalRequest(item.event)) {
+          await answerApproval(sessionId, item.event.toolCall);
+          continue;
+        }
+        if (isTaskState(item.event)) {
+          // running/compacting 会在 Run 中途重复发布；只有「活跃过再回 idle」才是结局。
+          if (item.event.state !== "idle") sawActive = true;
+          else if (sawActive) break;
+        }
+        continue;
+      }
+      applyEvents(tracker.feed(item), Date.now());
+    }
+    if (!sawActive) {
+      // 没看到 running 就结束了：流断了或任务没起来，按断流处置。
+      streamFailure = new Error("事件流在 Run 结束前中断");
+    }
+    await stream.close();
+  } catch (error: unknown) {
+    streamFailure = error;
+  }
+
+  if (streamFailure !== null) {
+    const message = redact(streamFailure instanceof Error ? streamFailure.message : String(streamFailure));
+    logger.warn(`Run 失败：${message}`);
+    // 断流不会让服务端停止任务：显式中止，避免僵尸任务占住会话。
+    // 会话忙（409）除外——那个在跑的任务不是我们起的，不能替别人中断。
+    if (!aborted && !(streamFailure instanceof SessionBusyError)) await handle.abort();
+    await settlePreview();
+    const text =
+      streamFailure instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(streamFailure);
+    await deliverFinal(deps, spec.chatId, liveMessageId, text, degraded);
+    return failedReport(spec.chatId, sessionId, message, startedAt);
+  }
+
+  const outcome = tracker.outcome;
+  logger.info(`Run 完成：${outcome.status}，session=${sessionId}`);
   await settlePreview();
   await deliverFinal(deps, spec.chatId, liveMessageId, formatFinalText(outcome, preview.snapshot()), degraded);
 
   const modelId = await spec.client
-    .session(outcome.sessionId)
-    .then((info) => info.model_id)
+    .sessionInfo(sessionId)
+    .then((info) => info.modelId)
     .catch(() => null);
   return {
     chatId: spec.chatId,
-    sessionId: outcome.sessionId,
+    sessionId,
     status: outcome.status,
-    ...(outcome.error ? { error: outcome.error.message } : {}),
+    ...(outcome.error !== undefined ? { error: outcome.error.message } : {}),
     usageTotal: outcome.usage?.total ?? null,
     requests: outcome.requests,
     durationMs: Date.now() - startedAt,
@@ -197,30 +288,17 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   };
 }
 
-/** 429 时按 Retry-After 退避后重开一次 Run；其余错误直接抛出。 */
-async function withRetry(
-  startRun: () => AmspRun,
-  first: AmspRun,
-  logger: Logger,
-): Promise<AmspRunOutcome> {
-  let run = first;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await run.result();
-    } catch (error: unknown) {
-      if (error instanceof TooManyRunsError && attempt < MAX_RETRIES) {
-        logger.warn(`Agent 并发已达上限，${error.retryAfterMs}ms 后重试（第 ${attempt + 1} 次）`);
-        await sleep(error.retryAfterMs);
-        run = startRun();
-        continue;
-      }
-      throw error;
-    }
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function failedReport(chatId: string, sessionId: string | null, message: string, startedAt: number): RunReport {
+  return {
+    chatId,
+    sessionId,
+    status: "failed",
+    error: message,
+    usageTotal: null,
+    requests: 0,
+    durationMs: Date.now() - startedAt,
+    modelId: null,
+  };
 }
 
 /** 定稿：优先编辑占位消息；编辑失败（或已降级）就新发一条，保证结果不丢。 */
