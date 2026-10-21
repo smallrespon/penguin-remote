@@ -21,6 +21,9 @@ import type { AgentRef, ModelRef, SessionClient } from "./sessions.js";
 import { SessionBusyError } from "./sessions.js";
 import { RunTracker, isApprovalRequest, isTaskState } from "./omni.js";
 
+/** 预览消息最多续接几条新消息（飞书单条消息编辑次数有限，长任务要换消息续）。 */
+const MAX_CHAINS = 10;
+
 /** 新建会话时下发的档位（来自聊天的 binding）。 */
 export interface SessionSettings {
   workspace?: string;
@@ -46,7 +49,6 @@ export interface RunSpec {
 
 /** 一次在途 Run 的句柄：/stop 用它中断。 */
 export interface RunHandle {
-  sessionId: string;
   abort: () => Promise<void>;
 }
 
@@ -110,7 +112,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
       logger.warn(`预览编辑失败：${error instanceof Error ? error.message : String(error)}`);
     }
     // 这条消息一次都没编辑成功过：换新的也白搭，直接放弃预览（发送本身出问题时走这条）。
-    if (editsOnCurrent === 0 || chains >= 10) {
+    if (editsOnCurrent === 0 || chains >= MAX_CHAINS) {
       degraded = true;
       logger.warn("放弃流式预览，改为最终一次性发送");
       return;
@@ -144,13 +146,13 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   /** 审批应答：allow-all 模式下不会来；来了按策略决定，并让用户在预览里看到结果。 */
   const answerApproval = async (
     sessionId: string,
-    call: { name: string; tool_call_id: string },
+    call: { name: string; arguments: string; tool_call_id: string },
   ): Promise<void> => {
     const decision = await policy.decide({
       sessionId,
       toolCallId: call.tool_call_id,
       name: call.name,
-      arguments: "",
+      arguments: call.arguments,
     });
     preview.addNotice(
       decision === "allow"
@@ -198,7 +200,6 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
 
   let aborted = false;
   const handle: RunHandle = {
-    sessionId,
     abort: async () => {
       aborted = true;
       try {
@@ -232,7 +233,9 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
 
     for await (const item of stream) {
       if (item.kind === "server") {
+        // 审批先进预览（「⚠️ 等待审批」），应答结果再由 answerApproval 追加一条提示。
         if (isApprovalRequest(item.event)) {
+          applyEvents(tracker.feed(item), Date.now());
           await answerApproval(sessionId, item.event.toolCall);
           continue;
         }

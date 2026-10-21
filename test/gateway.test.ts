@@ -7,15 +7,13 @@ import { test } from "node:test";
 import { Gateway, type TierController } from "../src/gateway.js";
 import { Lanes } from "../src/lanes.js";
 import { createLogger } from "../src/logger.js";
-import { SessionClient } from "../src/penguin/sessions.js";
 import { Registry } from "../src/registry.js";
 import { RunLog } from "../src/runlog.js";
 import { loadConfig } from "../src/config.js";
 import { formatSkillInput, helpText, parseCommand } from "../src/router.js";
-import { FakeSessionServer, frame, type FrameScript } from "./helpers/fake-sessions.js";
+import { FakeSessionServer, frame, sessionClient, waitForTask, type FrameScript } from "./helpers/fake-sessions.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
-import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
 
@@ -48,7 +46,7 @@ async function makeGateway(
     logger: silent,
     registry,
     runLog,
-    sessions: new SessionClient({ fetchAuthed: server.fetchAuthed }),
+    sessions: sessionClient(server),
     ...(tiers ? { tiers } : {}),
   });
   return { gateway, channel, registry, runLog, stateDir: dir };
@@ -74,11 +72,7 @@ function hangingScript(): FrameScript {
 
 /** 等 Bridge 把任务投递出去（此刻订阅已就绪），返回会话 id。 */
 async function startedSession(server: FakeSessionServer): Promise<string> {
-  const taskPosts = (): number =>
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length;
-  const before = taskPosts();
-  await waitFor(() => taskPosts() > before);
-  return server.lastTaskSession() ?? "";
+  return waitForTask(server);
 }
 
 /** 建会话请求列表。 */
@@ -88,15 +82,13 @@ function createRequests(server: FakeSessionServer) {
 
 /** 取第 n 次 tasks 投递的正文。 */
 function inputOf(server: FakeSessionServer, index: number): string {
-  const posts = server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
-  const body = posts[index]?.body as { input?: Array<{ type: string; text: string }> } | undefined;
+  const body = server.taskPosts()[index]?.body as { input?: Array<{ type: string; text: string }> } | undefined;
   return body?.input?.[0]?.text ?? "";
 }
 
 /** 最近一次 tasks 投递的路径。 */
 function lastTaskPath(server: FakeSessionServer): string {
-  const posts = server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
-  return posts.at(-1)?.path ?? "";
+  return server.taskPosts().at(-1)?.path ?? "";
 }
 
 /** 假服务器不解析帧：测试手动把会话状态拨回 idle（模拟任务跑完）。 */
@@ -127,7 +119,7 @@ test("最小闭环：飞书一句话 → 会话 API → 同聊天收到一条最
   assert.equal(creates[0]?.path, "/projects/default_project/agents/default_agent/sessions");
   assert.deepEqual(creates[0]?.body, { client: "cli", approvalMode: "allow-all" });
   // 投递走 tasks，input 是分段文本
-  const task = server.requests.find((r) => r.method === "POST" && /\/tasks$/.test(r.path));
+  const task = server.taskPosts()[0];
   assert.deepEqual(task?.body, { input: [{ type: "text", text: "现在几点" }] });
 
   // T6：先发占位消息，最终文本通过编辑落到同一条消息上
@@ -151,7 +143,7 @@ test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队",
   assert.equal(channel.sent.length, 2, "占位消息 + 忙提示");
   assert.equal(channel.lastSent(), BUSY_HINT);
   assert.equal(
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    server.taskPosts().length,
     1,
     "不应发起第二个 Run",
   );
@@ -162,7 +154,7 @@ test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队",
   server.pushLive(sessionId, frame.done());
   await first;
   assert.equal(
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    server.taskPosts().length,
     1,
   );
 });
@@ -616,7 +608,7 @@ test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", as
   const ok = channel.receive("在吗");
   await ok;
   assert.equal(
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    server.taskPosts().length,
     1,
   );
   assert.match(channel.edited.at(-1)?.markdown ?? "", /在/);
@@ -626,7 +618,7 @@ test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", as
   await channel.receive("悄悄话", { chatId: "oc_stranger", senderId: "ou_stranger" });
   assert.equal(channel.sent.length, before, "不该有任何回复");
   assert.equal(
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    server.taskPosts().length,
     1,
     "不该发起 Run",
   );
@@ -635,7 +627,7 @@ test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", as
   const allowed = channel.receive("我也在名单里", { chatId: "oc_stranger", senderId: "ou_friend" });
   await allowed;
   assert.equal(
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    server.taskPosts().length,
     2,
   );
 });
@@ -649,7 +641,7 @@ test("allowlist 为空时开放访问（默认）", async () => {
   const received = channel.receive("任意来源");
   await received;
   assert.equal(
-    server.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path)).length,
+    server.taskPosts().length,
     1,
   );
 });
