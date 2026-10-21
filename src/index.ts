@@ -5,7 +5,6 @@ import { createLogger } from "./logger.js";
 import { FeishuChannel } from "./channels/feishu.js";
 import { Lanes } from "./lanes.js";
 import { Gateway } from "./gateway.js";
-import { AmspClient } from "./penguin/amsp.js";
 import { AgentSupply } from "./penguin/agents.js";
 import { OwnerSession } from "./penguin/owner.js";
 import { Registry } from "./registry.js";
@@ -36,8 +35,21 @@ async function main(): Promise<void> {
     baseUrl: config.amspBaseUrl,
     stateDir: config.stateDir,
     logger,
+    // env 里的兜底 key 只对默认 Agent 生效；其他 Agent（含懒建的专属 Agent）一律自铸 key。
+    ...(config.amspApiKey !== null
+      ? {
+          staticKey: config.amspApiKey,
+          staticAgent: { projectId: config.defaultProjectId, agentId: config.defaultAgentId },
+        }
+      : {}),
   });
-  const tiers = new TierCommands({ owner, supply, registry, logger });
+  const tiers = new TierCommands({
+    owner,
+    supply,
+    registry,
+    logger,
+    defaultAgentId: config.defaultAgentId,
+  });
 
   const gateway = new Gateway({
     config,
@@ -47,13 +59,7 @@ async function main(): Promise<void> {
     registry,
     runLog,
     tiers,
-    clientFor: async (agent) => {
-      // AMSP_API_KEY 是显式覆盖：设了就不自动铸 key（运维/调试用）。
-      if (config.amspApiKey !== null) {
-        return new AmspClient({ baseUrl: config.amspBaseUrl, agent, apiKey: config.amspApiKey });
-      }
-      return supply.clientFor(agent);
-    },
+    clientFor: (agent) => supply.clientFor(agent),
   });
 
   const shutdown = async (signal: string): Promise<void> => {

@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { OwnerError, OwnerSession, parseToken } from "../src/penguin/owner.js";
 import { createLogger } from "../src/logger.js";
 import type { RunResult } from "../src/proc.js";
+import { FakeOwnerServer } from "./helpers/fake-owner-server.js";
 
 const silent = createLogger("error", () => {});
 
@@ -19,72 +20,9 @@ function fakeRun(stdout: string, status = 0, stderr = "") {
   return { run, calls };
 }
 
-interface Recorded {
-  method: string;
-  path: string;
-  cookie: string | null;
-  body: unknown;
-}
-
-/** 假 owner 服务器：按 method+path 返回脚本化响应（路径含 /api 前缀）。 */
-class FakeOwner {
-  readonly requests: Recorded[] = [];
-  private nextStatus = 200;
-  private alwaysStatus: number | null = null;
-  private readonly routes: Record<string, unknown>;
-
-  constructor(routes: Record<string, unknown> = {}) {
-    this.routes = routes;
-  }
-
-  /** 下一次请求强制返回的状态码（用后清除）。 */
-  failNextWith(status: number): void {
-    this.nextStatus = status;
-  }
-
-  /** 之后所有请求都返回该状态码（模拟服务端持续故障）。 */
-  failAllWith(status: number): void {
-    this.alwaysStatus = status;
-  }
-
-  get fetch(): typeof fetch {
-    return ((url: string, init?: RequestInit) => {
-      const parsed = new URL(url);
-      const method = init?.method ?? "GET";
-      const body =
-        typeof init?.body === "string" && init.body !== "" ? JSON.parse(init.body) : undefined;
-      const headers = new Headers(init?.headers);
-      this.requests.push({
-        method,
-        path: parsed.pathname,
-        cookie: headers.get("cookie"),
-        body,
-      });
-      const status = this.nextStatus;
-      this.nextStatus = 200;
-      if (status !== 200 || this.alwaysStatus !== null) {
-        return Promise.resolve(
-          new Response(JSON.stringify({ error: { code: "boom", message: "boom" } }), {
-            status: this.alwaysStatus ?? status,
-            headers: { "content-type": "application/json" },
-          }),
-        );
-      }
-      const key = `${method} ${parsed.pathname}`;
-      const payload = this.routes[key] ?? {};
-      return Promise.resolve(
-        new Response(JSON.stringify(payload), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      );
-    }) as typeof fetch;
-  }
-}
-
 function makeSession(
   fake: { run: typeof import("../src/proc.js").runCommand },
-  owner: FakeOwner,
+  owner: FakeOwnerServer,
   now: () => number = () => 0,
 ): OwnerSession {
   return new OwnerSession({
@@ -107,7 +45,7 @@ test("parseToken：取标记行下一行；无标记时退回最后一行非空�
 
 test("owner 令牌：按 TTL 铸造一次，过期前重铸，全程只走 cookie", async () => {
   const fake = fakeRun("---penguin-auth-token---\ntok_1");
-  const owner = new FakeOwner({ "GET /api/projects": { projects: [{ projectId: "p1" }] } });
+  const owner = new FakeOwnerServer({ "GET /api/projects": { projects: [{ projectId: "p1" }] } });
   let clock = 1_000_000;
   const session = makeSession(fake, owner, () => clock);
 
@@ -129,7 +67,7 @@ test("owner 令牌：按 TTL 铸造一次，过期前重铸，全程只走 cooki
 
 test("owner 令牌：铸造失败抛 OwnerError", async () => {
   const fake = fakeRun("", 1, "not logged in");
-  const owner = new FakeOwner();
+  const owner = new FakeOwnerServer();
   await assert.rejects(
     () => makeSession(fake, owner).listProjects(),
     (error: unknown) => {
@@ -142,7 +80,7 @@ test("owner 令牌：铸造失败抛 OwnerError", async () => {
 
 test("owner 令牌：401 时重铸一次再试，仍失败则抛错", async () => {
   const fake = fakeRun("---penguin-auth-token---\ntok_1");
-  const owner = new FakeOwner({ "GET /api/projects": { projects: [] } });
+  const owner = new FakeOwnerServer({ "GET /api/projects": { projects: [] } });
 
   // 第一次 401，第二次成功
   owner.failNextWith(401);
@@ -152,7 +90,7 @@ test("owner 令牌：401 时重铸一次再试，仍失败则抛错", async () =
   assert.equal(owner.requests.length, 2);
 
   // 一直 401：两次请求后抛出（不无限重试）
-  const failing = new FakeOwner({ "GET /api/projects": { projects: [] } });
+  const failing = new FakeOwnerServer({ "GET /api/projects": { projects: [] } });
   failing.failAllWith(401);
   const second = makeSession(fakeRun("---penguin-auth-token---\ntok_2"), failing);
   await assert.rejects(() => second.listProjects(), (error: unknown) => error instanceof OwnerError);
@@ -161,7 +99,7 @@ test("owner 令牌：401 时重铸一次再试，仍失败则抛错", async () =
 
 test("owner 路由：projects / agents / models / api 读写 / 建 Agent / 铸 key", async () => {
   const fake = fakeRun("---penguin-auth-token---\ntok");
-  const owner = new FakeOwner({
+  const owner = new FakeOwnerServer({
     "GET /api/projects": { projects: [{ projectId: "p1", name: "默认" }] },
     "GET /api/projects/p1/agents": { agents: [{ agentId: "a1", apiEnabled: true }] },
     "GET /api/projects/p1/models": {
@@ -205,7 +143,7 @@ test("owner 路由：projects / agents / models / api 读写 / 建 Agent / 铸 k
 });
 
 test("owner 路由：非 2xx 抛出 OwnerError 且带状态码", async () => {
-  const owner = new FakeOwner();
+  const owner = new FakeOwnerServer();
   owner.failNextWith(500);
   await assert.rejects(
     () => makeSession(fakeRun("---penguin-auth-token---\ntok"), owner).listProjects(),

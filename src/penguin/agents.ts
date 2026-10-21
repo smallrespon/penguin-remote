@@ -13,7 +13,8 @@ import { OwnerError, type OwnerSession } from "./owner.js";
 export const DEDICATED_PREFIX = "feishu_";
 
 interface AgentRecord {
-  chatId: string;
+  /** 归属的聊天；只为 Bridge 懒建的专属 Agent 记录。 */
+  chatId?: string;
   keyId: string;
   createdAt: string;
 }
@@ -40,8 +41,13 @@ export class AgentSupply {
   private readonly stateDir: string;
   /** 测试注入的传输层（与 AmspClient 一致）。 */
   private readonly fetchImpl: typeof fetch | undefined;
+  /** 兜底 key（env AMSP_API_KEY）及其所属 Agent；只在该 Agent 上生效。 */
+  private readonly staticKey: string | null;
+  private readonly staticAgent: AgentRef | null;
   /** `<projectId>/<agentId>` → key，只驻内存。 */
   private readonly keys = new Map<string, string>();
+  /** 正在铸的 key：并发请求复用同一次铸造。 */
+  private readonly minting = new Map<string, Promise<string>>();
   private records: AgentsFile = { version: 1, agents: {} };
   private loaded = false;
   private writeChain: Promise<void> = Promise.resolve();
@@ -52,12 +58,16 @@ export class AgentSupply {
     stateDir: string;
     logger: Logger;
     fetch?: typeof fetch;
+    staticKey?: string;
+    staticAgent?: AgentRef;
   }) {
     this.owner = options.owner;
     this.baseUrl = options.baseUrl;
     this.stateDir = options.stateDir;
     this.logger = options.logger;
     this.fetchImpl = options.fetch;
+    this.staticKey = options.staticKey ?? null;
+    this.staticAgent = options.staticAgent ?? null;
   }
 
   private filePath(): string {
@@ -103,19 +113,41 @@ export class AgentSupply {
     const mapKey = `${ref.projectId}/${ref.agentId}`;
     const cached = this.keys.get(mapKey);
     if (cached !== undefined) return cached;
-    const created = await this.owner.createKey(ref.projectId, ref.agentId, "penguin-remote-bridge");
-    this.keys.set(mapKey, created.secret);
-    await this.ensureLoaded();
-    this.records.agents[mapKey] = {
-      // 保留既有归属信息（专属 Agent 的 chatId）；只补/换 keyId。
-      ...this.records.agents[mapKey],
-      chatId: this.records.agents[mapKey]?.chatId ?? "",
-      keyId: created.keyId,
-      createdAt: new Date().toISOString(),
-    };
-    await this.persist();
-    this.logger.info(`已为 ${mapKey} 铸造 AMSP key（只驻内存）`);
-    return created.secret;
+    // env 里的兜底 key 只属于它为之准备的那个 Agent
+    if (this.staticKey !== null && this.isStaticAgent(ref)) return this.staticKey;
+
+    const inFlight = this.minting.get(mapKey);
+    if (inFlight !== undefined) return inFlight;
+
+    const minting = (async () => {
+      const created = await this.owner.createKey(ref.projectId, ref.agentId, "penguin-remote-bridge");
+      this.keys.set(mapKey, created.secret);
+      await this.ensureLoaded();
+      const existing = this.records.agents[mapKey];
+      this.records.agents[mapKey] = {
+        ...(existing?.chatId !== undefined ? { chatId: existing.chatId } : {}),
+        keyId: created.keyId,
+        // 重铸 key 不重置 Agent 的创建时间（回收登记要用）
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+      };
+      await this.persist();
+      this.logger.info(`已为 ${mapKey} 铸造 AMSP key（只驻内存）`);
+      return created.secret;
+    })();
+    this.minting.set(mapKey, minting);
+    try {
+      return await minting;
+    } finally {
+      this.minting.delete(mapKey);
+    }
+  }
+
+  private isStaticAgent(ref: AgentRef): boolean {
+    return (
+      this.staticAgent !== null &&
+      this.staticAgent.projectId === ref.projectId &&
+      this.staticAgent.agentId === ref.agentId
+    );
   }
 
   /**

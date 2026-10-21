@@ -3,6 +3,7 @@
 // 429（并发超限）按 Retry-After 退避重试；409（会话忙）转化为「进行中」提示。
 
 import type { ChannelAdapter } from "../channels/types.js";
+import type { ApprovalPolicy } from "../approvals.js";
 import { denyAll } from "../approvals.js";
 import { SessionBusyError, TooManyRunsError } from "./amsp.js";
 import type { AmspClient, AmspEvent, AmspRun, AmspRunOutcome } from "./amsp.js";
@@ -46,21 +47,26 @@ export interface RunReport {
 export interface RunDeps {
   channel: ChannelAdapter;
   logger: Logger;
+  /** 审批策略；缺省为「一律拒绝」（allow-all 模式下不会用到）。 */
+  approvals?: ApprovalPolicy;
 }
 
 /** 执行一次 Run 并把结果发回聊天；返回供 Registry / 审计记录的 report。 */
 export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunReport> {
   const startedAt = Date.now();
   const logger = deps.logger.child({ chat: spec.chatId });
+  const policy = deps.approvals ?? denyAll;
   logger.info(`发起 Run：${spec.input.slice(0, 80)}`);
 
   // 先发占位消息，拿到 message_id 后再开跑：事件到达时已有可编辑的消息。
   const placeholderId = await deps.channel.send(spec.chatId, PLACEHOLDER_TEXT);
 
-  const preview = new RunPreview(spec.preview);
   let degraded = false;
+  // 每次尝试（含 429 后重开）都用新的预览状态，避免上一次的增量文本残留。
+  let preview = new RunPreview(spec.preview);
 
   const startRun = (): AmspRun => {
+    preview = new RunPreview(spec.preview);
     const run = spec.client.streamRun({
       input: spec.input,
       ...(spec.sessionId !== undefined ? { sessionId: spec.sessionId } : {}),
@@ -78,9 +84,9 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
           );
         });
       },
-      // 审批：allow-all 模式下不会来；来了就按策略拒绝并让用户在预览里看到。
+      // 审批：allow-all 模式下不会来；来了就按策略决定，并让用户在预览里看到结果。
       onApproval: (request, ctx) => {
-        const decision = denyAll.decide({
+        const decision = policy.decide({
           sessionId: ctx.sessionId,
           toolCallId: request.tool_call.tool_call_id,
           name: request.tool_call.name,
@@ -110,10 +116,9 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     const message = error instanceof Error ? error.message : String(error);
     logger.warn(`Run 失败：${message}`);
     // 409 会话忙：转化为「进行中」提示，和其他入口一致。
-    await deps.channel.send(
-      spec.chatId,
-      error instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(error),
-    );
+    const failureText = error instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(error);
+    // 占位消息还挂在聊天里，别让它停在「思考中…」：把结局写进同一条消息。
+    await deliverFinal(deps, spec.chatId, placeholderId, failureText, degraded);
     return {
       chatId: spec.chatId,
       sessionId,

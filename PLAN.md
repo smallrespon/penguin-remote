@@ -199,6 +199,8 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 `/model`、`/thinking`、`/workspace` 的可选值从 Project 配置动态拉取（`GET /api/projects/:p/models`），不写死。首次在某聊天里改档位时，Bridge 自动为该聊天建专属 Agent（`feishu_<chatId 哈希>`）并铸 key，避免全局设置互相干扰（见 §4.2）。
 
+`/model` 列表取舍：模型目录实测有 515 个，全列会把飞书消息撑爆，因此**列表只展示前 30 个并注明总数**；匹配切换不受此限（`provider/modelId`、裸 `modelId`、displayName 全量匹配，唯一命中即切换）。这是对 §12「动态列全部」的有意 UX 取舍。
+
 群聊规则：仅当 `mentions` 含机器人时响应，并剥离 @ 占位符；私聊全响应。全局 allowlist（chat_id / open_id）之外的来源一律静默忽略。
 
 ---
@@ -209,7 +211,7 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 ```
 state/
-├── bindings.json     # { "<chatId>": { projectId, agentId, sessionId, skill?, skillSticky?, history: [{sessionId, title, at}], updatedAt } }
+├── bindings.json     # { "<chatId>": { projectId, agentId, sessionId, skill?, skillSticky?, history: [{sessionId, title, at, model?, projectId?, agentId?}], updatedAt } }
 ├── runs.jsonl        # 每次 run 一行：chatId/sessionId/status/usage/耗时（审计与成本）
 └── agents.json       # Bridge 创建的专属 Agent 与 key 的登记：{ "<projectId>/<agentId>": { chatId, keyId, createdAt } }
 ```
@@ -323,7 +325,7 @@ state/
 
 ## 10. 分阶段实施计划（与技能链对应）
 
-> 实施状态（2026-10-21）：P0–P5 全部完成（ticket T1–T9），测试 85 个全绿；
+> 实施状态（2026-10-21）：P0–P5 全部完成（ticket T1–T9），测试 92 个全绿（typecheck 干净）；
 > T8（审批卡片）按 §12 的决策降为 v2，v1 只保留接缝与明确提示，见 §4.2。
 
 每个阶段都有可观察的验收标准，做完一个再下一个。
@@ -381,6 +383,6 @@ allowlist（配置项，留空 = 开放访问，见 §7）、日志脱敏、cons
 | 访问范围 | 任何能与机器人对话的人 | 已确认接受全权限开放的暴露面；配套措施见 §7 |
 | Agent/Project 切换范围 | 全部 | owner 可见即可切 |
 | Issue tracker | GitHub Issues | 需先 git init + 建仓库；gh 已登录（smallrespon，repo scope） |
-| 默认档位 | 不预设 | 走 Project/Agent 现有配置；`/model` 动态列全部可用模型 |
+| 默认档位 | 不预设 | 走 Project/Agent 现有配置；`/model` 动态列可用模型（列表截断到前 30 个 + 注明总数，见 §5；匹配不限） |
 
 > 收集这类决定时用 a2ui 的 form/choice 块提问（用户偏好，2026-10-21）。

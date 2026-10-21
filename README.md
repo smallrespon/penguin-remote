@@ -15,11 +15,11 @@
 |---|---|
 | （无命令） | 普通文本直接作为一次 Run 的输入 |
 | `/new` | 新开会话（上下文干净） |
-| `/sessions` | 列出本聊天最近用过的 10 个会话 |
+| `/sessions` | 列出本聊天在当前 Project/Agent 下最近用过的 10 个会话 |
 | `/use <序号>` | 切回某个旧会话续聊 |
-| `/project` / `/project <名字>` | 列出 / 切换 Project（换 Project = 换对话） |
+| `/project` / `/project <名字>` | 列出 / 切换 Project（换 Project = 换 Agent = 换对话） |
 | `/agent` / `/agent <名字>` | 列出 / 切换 Agent（换 Agent = 换对话） |
-| `/model <名字>` | 切换模型（`/model` 列出可用模型，下一新会话生效） |
+| `/model <名字>` | 切换模型（`/model` 列出前 30 个可用模型并注明总数；匹配 `provider/modelId`、裸 `modelId` 或显示名，不受截断影响；下一新会话生效） |
 | `/thinking low\|medium\|high\|xhigh\|max` | 切换思考档位（下一新会话生效） |
 | `/workspace <路径>` | 切换工作区（下一新会话生效） |
 | `/skill <名字>` | 一次性使用 Skill；`/skill <名字> on` 粘滞；`/skill off` 关闭 |

@@ -25,7 +25,7 @@ export class FakeAmspServer {
   readonly runs: FakeRun[] = [];
   readonly approvalCalls: Array<{ sessionId: string; toolCallId: string; decision: string }> = [];
   /** 下一次 runs 请求强制返回的 HTTP 错误（status + envelope body），用后清除。 */
-  nextError: { status: number; body: unknown } | null = null;
+  nextError: { status: number; body: unknown; retryAfterSeconds?: number } | null = null;
   breakNextStream = false;
 
   get baseUrl(): string {
@@ -48,9 +48,9 @@ export class FakeAmspServer {
     const runsMatch = /^\/agents\/[^/]+\/[^/]+\/runs$/.exec(path);
     if (runsMatch && method === "POST") {
       if (this.nextError !== null) {
-        const { status, body: errorBody } = this.nextError;
+        const { status, body: errorBody, retryAfterSeconds } = this.nextError;
         this.nextError = null;
-        return jsonResponse(status, errorBody);
+        return jsonResponse(status, errorBody, retryAfterSeconds);
       }
       return this.openStream(body as { session_id?: string });
     }
@@ -142,10 +142,13 @@ export class FakeAmspServer {
   }
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(status: number, body: unknown, retryAfterSeconds?: number): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(retryAfterSeconds !== undefined ? { "retry-after": String(retryAfterSeconds) } : {}),
+    },
   });
 }
 

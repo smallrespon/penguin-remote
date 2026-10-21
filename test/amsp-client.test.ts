@@ -3,9 +3,11 @@ import { test } from "node:test";
 
 import {
   AmspClient,
+  DEFAULT_RETRY_AFTER_MS,
   RunStreamError,
   SessionBusyError,
   TooManyRunsError,
+  parseRetryAfter,
 } from "../src/penguin/amsp.js";
 import {
   FakeAmspServer,
@@ -15,6 +17,8 @@ import {
   toolResultDone,
   type FakeRun,
 } from "./helpers/fake-amsp.js";
+
+import { waitFor } from "./helpers/wait.js";
 
 function makeClient(server: FakeAmspServer): AmspClient {
   return new AmspClient({
@@ -44,18 +48,6 @@ async function drive(
   script(fakeRun);
   const outcome = await outcomePromise;
   return { outcome, events, run };
-}
-
-function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const started = Date.now();
-    const tick = (): void => {
-      if (predicate()) resolve();
-      else if (Date.now() - started > timeoutMs) reject(new Error("waitFor timeout"));
-      else setTimeout(tick, 5);
-    };
-    tick();
-  });
 }
 
 test("AMSP 客户端：完整事件序列 run.started … run.done，并回调每个事件", async () => {
@@ -109,7 +101,7 @@ test("AMSP 客户端：不带 session_id 时从 run.started 拿到新会话；�
   assert.deepEqual(server.requests[1]?.body, { input: "现在几点", session_id: newSessionId });
 });
 
-test("AMSP 客户端：409 映射为 SessionBusyError，429 映射为 TooManyRunsError（带退避）", async () => {
+test("AMSP 客户端：409 映射为 SessionBusyError；429 按 Retry-After 退避", async () => {
   const busy = new FakeAmspServer();
   busy.nextError = { status: 409, body: { error: { code: "task_in_progress", message: "This Session already has a Task in progress." } } };
   await assert.rejects(
@@ -121,16 +113,43 @@ test("AMSP 客户端：409 映射为 SessionBusyError，429 映射为 TooManyRun
     },
   );
 
+  // 服务器回的 Retry-After 被采纳
   const limited = new FakeAmspServer();
-  limited.nextError = { status: 429, body: { error: { code: "too_many_runs", message: "too many" } } };
+  limited.nextError = {
+    status: 429,
+    body: { error: { code: "too_many_runs", message: "too many" } },
+    retryAfterSeconds: 3,
+  };
   await assert.rejects(
     () => makeClient(limited).streamRun({ input: "hi" }).result(),
     (error: unknown) => {
       assert.ok(error instanceof TooManyRunsError);
-      assert.equal(error.retryAfterMs, 2000);
+      assert.equal(error.retryAfterMs, 3000);
       return true;
     },
   );
+
+  // 没有（或非法的）Retry-After 时退回文档规定的 2s
+  const noHeader = new FakeAmspServer();
+  noHeader.nextError = { status: 429, body: { error: { code: "too_many_runs", message: "too many" } } };
+  await assert.rejects(
+    () => makeClient(noHeader).streamRun({ input: "hi" }).result(),
+    (error: unknown) => {
+      assert.ok(error instanceof TooManyRunsError);
+      assert.equal(error.retryAfterMs, DEFAULT_RETRY_AFTER_MS);
+      return true;
+    },
+  );
+});
+
+test("parseRetryAfter：秒转毫秒，非法值退回默认", () => {
+  assert.equal(parseRetryAfter("2"), 2000);
+  assert.equal(parseRetryAfter("0"), 0);
+  assert.equal(parseRetryAfter("1.5"), 1500);
+  assert.equal(parseRetryAfter(null), DEFAULT_RETRY_AFTER_MS);
+  assert.equal(parseRetryAfter(""), DEFAULT_RETRY_AFTER_MS);
+  assert.equal(parseRetryAfter("soon"), DEFAULT_RETRY_AFTER_MS);
+  assert.equal(parseRetryAfter("-5"), DEFAULT_RETRY_AFTER_MS);
 });
 
 test("AMSP 客户端：abort 后 Run 停止，事件流以中断态的 run.done 收尾", async () => {

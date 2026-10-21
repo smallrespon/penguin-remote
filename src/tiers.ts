@@ -17,6 +17,8 @@ export class TierCommands implements TierController {
     supply: AgentSupply;
     registry: Registry;
     logger: Logger;
+    /** 切 Project 时 Agent 归位到哪个（配置里的默认 Agent）。 */
+    defaultAgentId: string;
   };
 
   constructor(deps: {
@@ -24,6 +26,7 @@ export class TierCommands implements TierController {
     supply: AgentSupply;
     registry: Registry;
     logger: Logger;
+    defaultAgentId: string;
   }) {
     this.deps = deps;
   }
@@ -44,11 +47,13 @@ export class TierCommands implements TierController {
     if (!projects.some((p) => p.projectId === name)) {
       return `⚠️ 没有 Project \`${name}\`，\`/project\` 查看列表。`;
     }
+    // 换 Project = 换 Agent = 换对话：Agent 归位到默认，否则旧 agentId 在新项目里不存在。
     await this.deps.registry.update(chatId, (b) => {
       b.projectId = name;
+      b.agentId = this.deps.defaultAgentId;
       b.sessionId = null;
     });
-    return `✅ 已切换 Project \`${name}\`，会话已重置；用 \`/agent\` 选该项目的 Agent。`;
+    return `✅ 已切换 Project \`${name}\`（Agent 归位为 \`${this.deps.defaultAgentId}\`，会话已重置）；用 \`/agent\` 选该项目的 Agent。`;
   }
 
   async listAgents(chatId: string): Promise<string> {
@@ -127,28 +132,33 @@ export class TierCommands implements TierController {
     }
     const model = matches[0];
     if (model === undefined) return "⚠️ 没有匹配的模型。";
-    const ref = await this.deps.supply.ensureDedicatedAgent(binding.projectId, binding.agentId, chatId);
-    await this.deps.owner.putAgentApi(ref.projectId, ref.agentId, {
-      model: { provider: model.provider, modelId: model.modelId },
-    });
-    await this.noteDedicated(chatId, binding.agentId, ref);
+    await this.applyTier(chatId, { model: { provider: model.provider, modelId: model.modelId } });
     return `✅ 已切换模型 \`${model.provider}/${model.modelId}\`，下一新会话生效。`;
   }
 
   async selectThinking(chatId: string, level: string): Promise<string> {
-    const binding = this.deps.registry.bindingFor(chatId);
-    const ref = await this.deps.supply.ensureDedicatedAgent(binding.projectId, binding.agentId, chatId);
-    await this.deps.owner.putAgentApi(ref.projectId, ref.agentId, { thinkingLevel: level });
-    await this.noteDedicated(chatId, binding.agentId, ref);
+    await this.applyTier(chatId, { thinkingLevel: level });
     return `✅ 思考档位已设为 \`${level}\`，下一新会话生效。`;
   }
 
   async selectWorkspace(chatId: string, path: string): Promise<string> {
+    await this.applyTier(chatId, { workspace: path });
+    return `✅ 工作区已设为 \`${path}\`，下一新会话生效。`;
+  }
+
+  /**
+   * 改一档 Agent 级设置：先确保这个聊天有专属 Agent（懒建），
+   * 把设置写到它上面，再把绑定切过去并重置会话。
+   */
+  private async applyTier(chatId: string, patch: Record<string, unknown>): Promise<void> {
     const binding = this.deps.registry.bindingFor(chatId);
     const ref = await this.deps.supply.ensureDedicatedAgent(binding.projectId, binding.agentId, chatId);
-    await this.deps.owner.putAgentApi(ref.projectId, ref.agentId, { workspace: path });
-    await this.noteDedicated(chatId, binding.agentId, ref);
-    return `✅ 工作区已设为 \`${path}\`，下一新会话生效。`;
+    await this.deps.owner.putAgentApi(ref.projectId, ref.agentId, patch);
+    if (ref.agentId === binding.agentId) return;
+    await this.deps.registry.update(chatId, (b) => {
+      b.agentId = ref.agentId;
+      b.sessionId = null;
+    });
   }
 
   async describeTiers(chatId: string): Promise<string> {
@@ -167,19 +177,6 @@ export class TierCommands implements TierController {
       this.deps.logger.warn(`读取档位失败：${error instanceof Error ? error.message : String(error)}`);
       return "- 档位：读取失败";
     }
-  }
-
-  /** 档位切换可能刚懒建了专属 Agent：把绑定切过去并重置会话。 */
-  private async noteDedicated(
-    chatId: string,
-    previousAgentId: string,
-    ref: { projectId: string; agentId: string },
-  ): Promise<void> {
-    if (ref.agentId === previousAgentId) return;
-    await this.deps.registry.update(chatId, (b) => {
-      b.agentId = ref.agentId;
-      b.sessionId = null;
-    });
   }
 }
 
