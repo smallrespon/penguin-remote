@@ -1,15 +1,53 @@
 // Bridge 入口：加载配置（fail-fast）→ 装配各层 → 常驻 → 优雅退出。
-// 各层的装配随 ticket 推进逐步补全。
 
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
+import { FeishuChannel } from "./channels/feishu.js";
+import { LaneQueue } from "./lanes.js";
+import { Gateway } from "./gateway.js";
+import { AmspClient } from "./penguin/amsp.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.logLevel);
-  logger.info(
-    `配置就绪：AMSP ${config.amspBaseUrl}，默认 Agent ${config.defaultProjectId}/${config.defaultAgentId}`,
-  );
+
+  const channel = new FeishuChannel({ bin: config.larkBin, logger });
+  const lanes = new LaneQueue();
+  // T4：key 来自环境变量；T7 起改为按需懒建专属 Agent 并铸 key（只驻内存）。
+  const envKey = process.env.AMSP_API_KEY?.trim() ?? "";
+
+  const gateway = new Gateway({
+    config,
+    channel,
+    lanes,
+    logger,
+    bindingFor: () => ({
+      projectId: config.defaultProjectId,
+      agentId: config.defaultAgentId,
+      sessionId: null,
+    }),
+    clientFor: async ({ projectId, agentId }) => {
+      if (envKey === "") {
+        throw new Error("未配置 AMSP_API_KEY：无法调用 AMSP（T7 起支持自动铸 key）");
+      }
+      return new AmspClient({
+        baseUrl: config.amspBaseUrl,
+        agent: `${projectId}/${agentId}`,
+        apiKey: envKey,
+      });
+    },
+  });
+
+  await gateway.start();
+  logger.info("Bridge 已启动，等待飞书消息");
+
+  const shutdown = async (signal: string): Promise<void> => {
+    logger.info(`收到 ${signal}，正在退出`);
+    await gateway.stop();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 main().catch((error: unknown) => {
