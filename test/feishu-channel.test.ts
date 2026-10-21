@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { decodeMessageEvent, FeishuChannel, stripMentions } from "../src/channels/feishu.js";
 import { createLogger } from "../src/logger.js";
 import { FakeChild, makeFakeRun, makeFakeSpawn } from "./helpers/fake-child.js";
+import { waitFor } from "./helpers/wait.js";
 
 const BOT = "ou_bot";
 const silentLogger = createLogger("error", () => {});
@@ -193,18 +194,6 @@ test("FeishuChannel 拿不到机器人身份时 start 失败（fail-fast）", as
 });
 
 // ---- T9：事件流子进程守护 ----
-
-function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const started = Date.now();
-    const tick = (): void => {
-      if (predicate()) resolve();
-      else if (Date.now() - started > timeoutMs) reject(new Error("waitFor timeout"));
-      else setTimeout(tick, 10);
-    };
-    tick();
-  });
-}
 
 test("事件流子进程崩溃后自动重启，消息继续进 handler", async () => {
   const fake = makeFakeSpawn();

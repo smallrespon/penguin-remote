@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Gateway, BUSY_HINT, type TierController } from "../src/gateway.js";
+import { Gateway, type TierController } from "../src/gateway.js";
 import { Lanes } from "../src/lanes.js";
 import { createLogger } from "../src/logger.js";
 import { AmspClient } from "../src/penguin/amsp.js";
@@ -13,8 +13,9 @@ import { RunLog } from "../src/runlog.js";
 import { loadConfig } from "../src/config.js";
 import { formatSkillInput, helpText, parseCommand } from "../src/router.js";
 import { FakeAmspServer, runDone, textDelta, textDone } from "./helpers/fake-amsp.js";
-import { PLACEHOLDER_TEXT } from "../src/render.js";
+import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
+import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
 
@@ -100,18 +101,6 @@ async function completeRun(server: FakeAmspServer, events: Events): Promise<void
 function inputOf(server: FakeAmspServer, index: number): string {
   const body = server.runRequests()[index]?.body as { input?: string } | undefined;
   return body?.input ?? "";
-}
-
-function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const started = Date.now();
-    const tick = (): void => {
-      if (predicate()) resolve();
-      else if (Date.now() - started > timeoutMs) reject(new Error("waitFor timeout"));
-      else setTimeout(tick, 5);
-    };
-    tick();
-  });
 }
 
 // ---- T4 回归：最小闭环 ----
@@ -218,6 +207,53 @@ test("Registry：并发 update 串行落盘，最终文件是最后一次写入"
 
 // ---- T5：控制命令 ----
 
+test("Registry：会话按 (project, agent) 隔离；老登记按默认档位算", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pr-state-"));
+  const registry = await Registry.load(dir, { projectId: "p", agentId: "a" });
+  await registry.noteSession("oc_1", {
+    sessionId: "s_a",
+    title: "默认 Agent 的会话",
+    projectId: "p",
+    agentId: "a",
+  });
+  await registry.noteSession("oc_1", {
+    sessionId: "s_b",
+    title: "别的 Agent 的会话",
+    projectId: "p",
+    agentId: "coder",
+  });
+
+  const onA = registry.bindingFor("oc_1");
+  assert.deepEqual(
+    registry.sessionsFor(onA).map((s) => s.sessionId),
+    ["s_a"],
+  );
+  // 切到 coder：只看得到 coder 的会话
+  await registry.update("oc_1", (b) => {
+    b.agentId = "coder";
+    b.sessionId = null;
+  });
+  assert.deepEqual(
+    registry.sessionsFor(registry.bindingFor("oc_1")).map((s) => s.sessionId),
+    ["s_b"],
+  );
+
+  // 老登记（没有归属字段，来自只支持默认档位的版本）仍算默认档位，升级不丢历史
+  const legacyDir = await mkdtemp(join(tmpdir(), "pr-state-"));
+  const legacy = await Registry.load(legacyDir, { projectId: "p", agentId: "a" });
+  await legacy.update("oc_1", (b) => {
+    b.history = [{ sessionId: "s_old", title: "老会话", at: "2026-01-01T00:00:00.000Z" }];
+  });
+  assert.deepEqual(
+    legacy.sessionsFor(legacy.bindingFor("oc_1")).map((s) => s.sessionId),
+    ["s_old"],
+  );
+  await legacy.update("oc_1", (b) => {
+    b.agentId = "coder";
+  });
+  assert.deepEqual(legacy.sessionsFor(legacy.bindingFor("oc_1")), []);
+});
+
 test("/new 后下一条消息开新会话；/sessions 与 /use 续聊", async () => {
   const server = new FakeAmspServer();
   const channel = new FakeChannel();
@@ -253,6 +289,42 @@ test("/new 后下一条消息开新会话；/sessions 与 /use 续聊", async ()
   await third;
   const thirdBody = server.runRequests().at(-1)?.body as { session_id?: string };
   assert.equal(thirdBody.session_id, sessionId);
+});
+
+test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  const first = channel.receive("第一问");
+  await completeRun(server, [textDone("答 1"), runDone()]);
+  await first;
+  const sessionId = server.runs[0]?.sessionId ?? "";
+
+  // /agent coder（TierCommands 的行为：改绑定并重置会话）
+  await registry.update("oc_chat", (b) => {
+    b.agentId = "coder";
+    b.sessionId = null;
+  });
+
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /还没有历史会话/);
+
+  // 别人的会话即使用 /use 1 也切不过去
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /没有第 1 个会话/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, null);
+
+  // 换回默认 Agent：历史回来，可以续聊
+  await registry.update("oc_chat", (b) => {
+    b.agentId = "default_agent";
+  });
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), new RegExp(sessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /已切回会话/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
 });
 
 test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () => {

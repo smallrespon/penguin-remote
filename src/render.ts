@@ -3,6 +3,8 @@
 
 import type { AmspEvent } from "@prismshadow/amsp";
 
+import { redact } from "./logger.js";
+
 export interface PreviewOptions {
   /** 距上次编辑 ≥ 该毫秒才允许再编辑。 */
   throttleMs: number;
@@ -156,8 +158,8 @@ export function formatFinalText(outcome: {
   return `${body}\n\n---\n未正常完成（${outcome.status}）：${reason}\n${formatUsage(outcome.usage)}`;
 }
 
-/** 面向用户的错误提示。 */
+/** 面向用户的错误提示（密钥打码后）。 */
 export function formatRunFailure(error: unknown): string {
-  if (error instanceof Error && error.message !== "") return `执行失败：${error.message}`;
-  return `执行失败：${String(error)}`;
+  const message = error instanceof Error ? error.message : String(error);
+  return `执行失败：${redact(message === "" ? String(error) : message)}`;
 }

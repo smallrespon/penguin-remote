@@ -10,8 +10,8 @@ import { test } from "node:test";
 import { TierCommands, matchModels } from "../src/tiers.js";
 import { Registry } from "../src/registry.js";
 import { AgentSupply } from "../src/penguin/agents.js";
-import type { OwnerSession } from "../src/penguin/owner.js";
 import { createLogger } from "../src/logger.js";
+import { FakeOwnerSession } from "./helpers/fake-owner.js";
 
 const silent = createLogger("error", () => {});
 
@@ -35,21 +35,8 @@ const MODELS = [
   { provider: "other", modelId: "step-3", displayName: "Step 3 (other)" },
 ];
 
-/** 假 owner：脚本化的项目/Agent/模型清单与 API 设置。 */
-class FakeOwner {
-  api: Record<string, unknown> = {
-    model: null,
-    thinkingLevel: null,
-    workspace: null,
-  };
-  readonly puts: Array<{ path: string; patch: Record<string, unknown> }> = [];
-  readonly created: Array<{ projectId: string; agentId: string; name: string }> = [];
-  /** 让 getAgentApi 失败（模拟 server 侧读取失败）。 */
-  failGet = false;
-  /** 按 agentId 覆盖审批模式（默认 allow-all）。 */
-  approvalModes: Record<string, string> = {};
-  /** 覆盖 API 开关（默认开启）。 */
-  apiEnabled = true;
+/** 假 owner：在共用假 owner 之上脚本化项目/Agent/模型清单。 */
+class FakeOwner extends FakeOwnerSession {
   /** 覆盖模型清单（测试列表截断用）。 */
   models: typeof MODELS | null = null;
   /** 覆盖 Project 默认模型。 */
@@ -66,32 +53,11 @@ class FakeOwner {
   async listModels(): Promise<{ models: typeof MODELS; defaultModel: { provider: string; modelId: string } | null }> {
     return { models: this.models ?? MODELS, defaultModel: this.defaultModel };
   }
+}
 
-  async getAgentApi(projectId: string, agentId: string) {
-    if (this.failGet) throw new Error("boom");
-    return {
-      api: {
-        ...this.api,
-        approvalMode: this.approvalModes[agentId] ?? "allow-all",
-        enabled: this.apiEnabled,
-      },
-      serverEnabled: true,
-    };
-  }
-
-  async putAgentApi(projectId: string, agentId: string, patch: Record<string, unknown>) {
-    this.puts.push({ path: `${projectId}/${agentId}`, patch });
-    Object.assign(this.api, patch);
-    return { api: this.api, serverEnabled: true };
-  }
-
-  async createAgent(projectId: string, agentId: string, name: string): Promise<void> {
-    this.created.push({ projectId, agentId, name });
-  }
-
-  async createKey(projectId: string, agentId: string) {
-    return { keyId: "key_1", secret: "penguin_fake_secret" };
-  }
+/** 从 owner 调用记录里取出被操作的 agentId（path 形如 `<projectId>/<agentId>`）。 */
+function agentIdsOf(owner: FakeOwner, method: string): string[] {
+  return owner.of(method).map((call) => call.path.split("/")[1] ?? "");
 }
 
 async function makeTiers() {
@@ -102,16 +68,17 @@ async function makeTiers() {
   });
   const owner = new FakeOwner();
   const supply = new AgentSupply({
-    owner: owner as unknown as OwnerSession,
+    owner: owner.asOwnerSession,
     baseUrl: "http://localhost/api/amsp/v1",
     stateDir: dir,
     logger: silent,
   });
   const tiers = new TierCommands({
-    owner: owner as unknown as OwnerSession,
+    owner: owner.asOwnerSession,
     supply,
     registry,
     logger: silent,
+    defaultAgentId: "default_agent",
   });
   return { tiers, registry, owner };
 }
@@ -178,10 +145,18 @@ test("/project 与 /agent 切换后重置会话（换对话）", async () => {
   let binding = registry.bindingFor("oc_1");
   assert.equal(binding.projectId, "demo");
   assert.equal(binding.sessionId, null);
+  // 换 Project 时 Agent 归位到默认：否则旧 agentId 在新项目里不存在
+  assert.equal(binding.agentId, "default_agent");
 
   await tiers.selectAgent("oc_1", "demo_agent");
   binding = registry.bindingFor("oc_1");
   assert.equal(binding.agentId, "demo_agent");
+  assert.equal(binding.sessionId, null);
+
+  // 再换回默认项目：Agent 再次归位，不会带着 demo_agent 过去
+  await tiers.selectProject("oc_1", "default_project");
+  binding = registry.bindingFor("oc_1");
+  assert.equal(binding.agentId, "default_agent");
   assert.equal(binding.sessionId, null);
 });
 
@@ -192,15 +167,16 @@ test("/model 唯一匹配：改 API 设置并把绑定切到懒建的专属 Agen
   const reply = await tiers.selectModel("oc_1", "gpt-5");
   assert.match(reply, /已切换模型 `openai\/gpt-5`/);
 
-  assert.equal(owner.created.length, 1, "首次改档位应懒建一个专属 Agent");
-  assert.match(owner.created[0]?.agentId ?? "", /^feishu_[0-9a-f]{12}$/);
+  const created = agentIdsOf(owner, "POST /agents");
+  assert.equal(created.length, 1, "首次改档位应懒建一个专属 Agent");
+  assert.match(created[0] ?? "", /^feishu_[0-9a-f]{12}$/);
 
-  const put = owner.puts.at(-1);
-  assert.equal(put?.path, `default_project/${owner.created[0]?.agentId}`, "档位改在专属 Agent 上");
-  assert.deepEqual(put?.patch, { model: { provider: "openai", modelId: "gpt-5" } });
+  const put = owner.of("PUT /api").at(-1);
+  assert.equal(put?.path, `default_project/${created[0]}`, "档位改在专属 Agent 上");
+  assert.deepEqual(put?.body, { model: { provider: "openai", modelId: "gpt-5" } });
 
   const binding = registry.bindingFor("oc_1");
-  assert.equal(binding.agentId, owner.created[0]?.agentId);
+  assert.equal(binding.agentId, created[0]);
   assert.equal(binding.sessionId, null, "换 Agent = 换对话");
   assert.equal(binding.projectId, "default_project");
 });
@@ -212,33 +188,34 @@ test("/model 多个匹配或没有匹配：不改任何设置", async () => {
   assert.match(ambiguous, /匹配到多个模型/);
   assert.match(ambiguous, /`stepfun\/step-3`/);
   assert.match(ambiguous, /`other\/step-3`/);
-  assert.deepEqual(owner.puts, []);
-  assert.deepEqual(owner.created, []);
+  assert.deepEqual(owner.of("PUT /api"), []);
+  assert.deepEqual(owner.of("POST /agents"), []);
   assert.equal(registry.bindingFor("oc_1").agentId, "default_agent");
 
   const missing = await tiers.selectModel("oc_1", "llama-9");
   assert.match(missing, /没有匹配/);
-  assert.deepEqual(owner.puts, []);
+  assert.deepEqual(owner.of("PUT /api"), []);
 });
 
 test("/thinking 与 /workspace：改专属 Agent 的 API 设置", async () => {
   const { tiers, registry, owner } = await makeTiers();
 
   assert.match(await tiers.selectThinking("oc_1", "high"), /思考档位已设为 `high`/);
-  assert.deepEqual(owner.puts.at(-1)?.patch, { thinkingLevel: "high" });
+  assert.deepEqual(owner.of("PUT /api").at(-1)?.body, { thinkingLevel: "high" });
 
   assert.match(await tiers.selectWorkspace("oc_1", "/tmp/demo"), /工作区已设为/);
-  assert.deepEqual(owner.puts.at(-1)?.patch, { workspace: "/tmp/demo" });
+  assert.deepEqual(owner.of("PUT /api").at(-1)?.body, { workspace: "/tmp/demo" });
 
   const binding = registry.bindingFor("oc_1");
   assert.match(binding.agentId, /^feishu_/);
   // 只懒建一次：开 API + 两次档位切换，共三次 PUT，都落在同一个专属 Agent 上
-  assert.equal(owner.created.length, 1);
-  assert.equal(owner.puts.length, 3);
-  assert.deepEqual(owner.puts[0]?.patch, { enabled: true, approvalMode: "allow-all" });
-  assert.deepEqual(owner.puts[1]?.patch, { thinkingLevel: "high" });
-  assert.deepEqual(owner.puts[2]?.patch, { workspace: "/tmp/demo" });
-  assert.equal(owner.puts[0]?.path, owner.puts[2]?.path);
+  assert.deepEqual(agentIdsOf(owner, "POST /agents").length, 1);
+  const puts = owner.of("PUT /api");
+  assert.equal(puts.length, 3);
+  assert.deepEqual(puts[0]?.body, { enabled: true, approvalMode: "allow-all" });
+  assert.deepEqual(puts[1]?.body, { thinkingLevel: "high" });
+  assert.deepEqual(puts[2]?.body, { workspace: "/tmp/demo" });
+  assert.equal(puts[0]?.path, puts[2]?.path);
 });
 
 test("/status 档位回显：读得到时列模型/思考/工作区/审批，读不到时明确说失败", async () => {

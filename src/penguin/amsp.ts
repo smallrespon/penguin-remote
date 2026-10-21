@@ -13,7 +13,7 @@ import {
   type TokenCounts,
 } from "@prismshadow/amsp";
 
-/** 文档规定的 429 退避：服务器回 `Retry-After: 2`。 */
+/** 文档规定的 429 退避：服务器回 `Retry-After: 2`。读不到头部时用它。 */
 export const DEFAULT_RETRY_AFTER_MS = 2000;
 
 /** 会话正在执行中（409 task_in_progress / compacting）。 */
@@ -33,7 +33,6 @@ export class TooManyRunsError extends Error {
     this.retryAfterMs = retryAfterMs;
   }
 }
-
 /** 事件流在 run.done 之前断裂；Run 的最终结局未知（断流即中止）。 */
 export class RunStreamError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -117,7 +116,7 @@ export class AmspClient {
       baseUrl: this.baseUrl,
       agent: agentPath(this.agent),
       apiKey: this.apiKey,
-      ...(this.fetchImpl ? { fetch: this.fetchImpl } : {}),
+      ...(this.fetchImpl ? { fetch: honorRetryAfter(this.fetchImpl) } : {}),
     });
   }
 
@@ -167,12 +166,32 @@ function mapRunError(error: unknown): unknown {
     if (error.status === 409) {
       return new SessionBusyError(error.message || "会话正在执行中");
     }
-    if (error.status === 429) {
-      return new TooManyRunsError(error.message || "Agent 并发已达上限");
-    }
   }
   if (error instanceof AmspStreamError) {
     return new RunStreamError(error.message, { cause: error });
   }
   return error;
+}
+
+/** `Retry-After` 头（秒）转毫秒；不是非负整数就退回默认值。 */
+export function parseRetryAfter(header: string | null): number {
+  const seconds = Number(header);
+  if (header === null || header.trim() === "" || !Number.isFinite(seconds) || seconds < 0) {
+    return DEFAULT_RETRY_AFTER_MS;
+  }
+  return Math.round(seconds * 1000);
+}
+
+/**
+ * 官方客户端只把 429 包成 `AmspHttpError`，丢掉响应头——而退避值就在 `Retry-After` 里。
+ * 这里包一层 fetch：429 直接抛 {@link TooManyRunsError}（带上真实退避），
+ * 客户端 `#drive` 会把传输层异常原样抛给调用方，因此能一路透传到 runner 的重试逻辑。
+ */
+function honorRetryAfter(base: typeof fetch): typeof fetch {
+  return (async (url: string | URL | Request, init?: RequestInit) => {
+    const response = await base(url, init);
+    if (response.status !== 429) return response;
+    const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"));
+    throw new TooManyRunsError(`Agent 并发已达上限（${retryAfterMs}ms 后重试）`, retryAfterMs);
+  }) as typeof fetch;
 }

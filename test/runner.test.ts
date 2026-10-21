@@ -10,6 +10,7 @@ import { createLogger } from "../src/logger.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeAmspServer, runDone, textDelta, textDone } from "./helpers/fake-amsp.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
+import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
 
@@ -40,18 +41,6 @@ function runOnce(server: FakeAmspServer, channel: FakeChannel, onStart?: (run: A
       ...(onStart ? { onStart } : {}),
     },
   );
-}
-
-function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const started = Date.now();
-    const tick = (): void => {
-      if (predicate()) resolve();
-      else if (Date.now() - started > timeoutMs) reject(new Error("waitFor timeout"));
-      else setTimeout(tick, 5);
-    };
-    tick();
-  });
 }
 
 test("429 后退避重试：重开 Run 后成功，abort 句柄指向最新一次尝试", async () => {
@@ -97,9 +86,9 @@ test("429 重试耗尽（3 次）后把错误回复给用户", async () => {
   const report = await reportPromise;
   assert.equal(server.runRequests().length, 3, "首次 + 2 次重试");
   assert.equal(report.status, "failed");
-  assert.match(report.error ?? "", /too many runs/);
-  assert.match(channel.lastSent(), /执行失败/);
-  assert.equal(channel.edited.length, 0, "没有任何事件可预览");
+  assert.match(report.error ?? "", /Agent 并发已达上限/);
+  assert.match(channel.edited.at(-1)?.markdown ?? "", /执行失败/);
+  assert.equal(channel.edited.length, 1, "只把结局写进占位消息");
 });
 
 test("409 会话忙：回复忙提示而非错误堆栈，且不重试", async () => {
@@ -111,7 +100,52 @@ test("409 会话忙：回复忙提示而非错误堆栈，且不重试", async (
   assert.equal(server.runRequests().length, 1, "409 不重试");
   assert.equal(report.status, "failed");
   assert.match(report.error ?? "", /Task in progress/);
-  assert.equal(channel.sent.at(-1)?.markdown, BUSY_HINT);
+  // 结局写进占位消息（同一条），不再停在「思考中…」
+  assert.equal(channel.edited.at(-1)?.markdown, BUSY_HINT);
+  assert.equal(channel.sent.length, 1);
+});
+
+test("Run 失败时占位消息被更新为失败原因，不停在「思考中…」", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  server.nextError = { status: 500, body: { error: { code: "boom", message: "server exploded" } } };
+
+  const report = await runOnce(server, channel);
+  assert.equal(report.status, "failed");
+  assert.equal(channel.sent.length, 1, "只发过占位消息");
+  const failure = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(failure, /^执行失败：/);
+  assert.ok(failure.includes("server exploded"), "失败原因应带给用户");
+});
+
+test("审批策略可注入：allowAll 策略放行审批请求", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const reportPromise = executeRun(
+    { channel, logger: silent, approvals: { decide: () => "allow" } },
+    {
+      chatId: "oc_chat",
+      input: "现在几点",
+      client: client(server),
+      preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+    },
+  );
+  await waitFor(() => server.runs.length > 0);
+  const run = server.lastRun();
+  server.push(run, {
+    type: "approval.requested",
+    at: new Date().toISOString(),
+    tool_call: { tool_call_id: "call_9", name: "exec_command", arguments: '{"command":"ls"}' },
+  });
+  server.push(run, textDone("已允许后继续"));
+  server.push(run, runDone());
+  server.close(run);
+
+  const report = await reportPromise;
+  assert.equal(report.status, "completed");
+  assert.deepEqual(server.approvalCalls, [
+    { sessionId: run.sessionId, toolCallId: "call_9", decision: "allow" },
+  ]);
 });
 
 test("审批请求：v1 一律拒绝，并在预览里说明（allow-all 模式下不会发生）", async () => {

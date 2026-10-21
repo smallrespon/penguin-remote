@@ -4,6 +4,7 @@
 import type { ChannelAdapter, IncomingMessage } from "./channels/types.js";
 import type { BridgeConfig } from "./config.js";
 import type { Lanes } from "./lanes.js";
+import { redact } from "./logger.js";
 import type { Logger } from "./logger.js";
 import type { AgentRef, AmspClient } from "./penguin/amsp.js";
 import { executeRun } from "./penguin/runner.js";
@@ -11,8 +12,6 @@ import type { Registry } from "./registry.js";
 import type { RunLog } from "./runlog.js";
 import { BUSY_HINT } from "./render.js";
 import { formatSkillInput, helpText, parseCommand, type Command } from "./router.js";
-
-export { BUSY_HINT };
 
 /** 档位切换（owner 动态模式）入口；T7 注入实现，缺省时命令不可用。 */
 export interface TierController {
@@ -77,7 +76,7 @@ export class Gateway {
     try {
       await this.dispatch(message, parsed);
     } catch (error: unknown) {
-      const text = error instanceof Error ? error.message : String(error);
+      const text = redact(error instanceof Error ? error.message : String(error));
       this.logger.error(`处理消息失败：${text}`);
       await this.safeReply(message.chatId, `出错了：${text}`);
     }
@@ -225,6 +224,8 @@ export class Gateway {
         sessionId: report.sessionId,
         title: text.slice(0, 40),
         ...(report.modelId !== null ? { model: report.modelId } : {}),
+        projectId: binding.projectId,
+        agentId: binding.agentId,
       });
     }
     await this.deps.runLog.append(report);
@@ -242,11 +243,13 @@ export class Gateway {
 
   private async handleSessions(chatId: string): Promise<void> {
     const binding = this.deps.registry.bindingFor(chatId);
-    if (binding.history.length === 0) {
-      await this.reply(chatId, "这个聊天还没有历史会话，发一条消息就开始新的对话。");
+    // 会话按 (project, agent) 隔离：只列当前绑定下能续聊的
+    const sessions = this.deps.registry.sessionsFor(binding);
+    if (sessions.length === 0) {
+      await this.reply(chatId, "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。");
       return;
     }
-    const lines = binding.history.map(
+    const lines = sessions.map(
       (item, index) =>
         `${index + 1}. ${item.title || "（无标题）"} — ${item.at.slice(0, 16).replace("T", " ")}` +
         `${item.model !== undefined ? ` — \`${item.model}\`` : ""} — \`${item.sessionId}\``,
@@ -260,7 +263,7 @@ export class Gateway {
 
   private async handleUse(chatId: string, index: number): Promise<void> {
     const binding = this.deps.registry.bindingFor(chatId);
-    const record = binding.history[index - 1];
+    const record = this.deps.registry.sessionsFor(binding)[index - 1];
     if (record === undefined) {
       await this.reply(chatId, `⚠️ 没有第 ${index} 个会话，\`/sessions\` 查看列表。`);
       return;
@@ -315,7 +318,7 @@ export class Gateway {
         const info = await client.session(binding.sessionId);
         lines.push(`**会话状态**：${info.status}，模型 \`${info.model_id}\``);
       } catch (error: unknown) {
-        lines.push(`**会话状态**：查询失败（${error instanceof Error ? error.message : String(error)}）`);
+        lines.push(`**会话状态**：查询失败（${redact(error instanceof Error ? error.message : String(error))}）`);
       }
     } else {
       lines.push("**会话状态**：尚未开始");
