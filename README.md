@@ -66,6 +66,23 @@ line 12 of output
 
 ## 部署（同机）
 
+### 方式一：Release 压缩包（解压即用，推荐）
+
+从 [Releases](https://github.com/smallrespon/penguin-remote/releases) 下载 `penguin-remote-<版本>.tar.gz`：
+
+```bash
+tar -xzf penguin-remote-1.0.0.tar.gz
+cd penguin-remote-1.0.0
+cp .env.example .env
+chmod 600 .env
+# 编辑 .env 填入配置（至少 AMSP_BASE_URL / DEFAULT_PROJECT_ID / DEFAULT_AGENT_ID）
+bash scripts/start.sh   # 前台跑；Ctrl-C 退出
+```
+
+压缩包内已含构建产物 `dist/src/` 与生产依赖 `node_modules/`，**部署机只需 Node 24**，无需 pnpm、无需联网装包。
+
+### 方式二：源码安装
+
 ```bash
 pnpm install
 cp .env.example .env

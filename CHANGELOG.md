@@ -21,6 +21,11 @@
 - `pnpm-workspace.yaml` 显式批准 esbuild 的构建脚本：全新克隆后 `pnpm install` 直接通过，不再报 `ERR_PNPM_IGNORED_BUILDS`（pnpm ≥ 10.26 起 `onlyBuiltDependencies` 更名为 `allowBuilds`）。
 - CI：push/PR 到 main 跑 `pnpm typecheck` + `pnpm test`。
 
+### 发布产物
+
+- Release 附带 `penguin-remote-1.0.0.tar.gz`：构建产物 `dist/src/` + 生产依赖（hoisted `node_modules/`）+ 部署文件，解压即用（Node 24 + `.env` 即可启动，部署机无需 pnpm）。重新打包：`bash scripts/package.sh`。
+- 不发布 npm 包；源码安装方式见 README「部署」。
+
 ### 已知限制
 
 - 审批卡片闭环未做（v2 可选，见 PLAN.md §4.2）；allow-all 模式下服务端不发起审批。

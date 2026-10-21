@@ -416,7 +416,7 @@ v1.0.0 发布清单与唯一剩余步骤。
 - 全量验证：`pnpm typecheck`、`pnpm test`（123 个全绿）、`pnpm build` 通过；push 后 CI 绿。
 - 移除 `HANDOFF.md`（实现期的内部交接文档，内容已过期且对公众读者有误导）。
 
-**发布形态**：源码发布——tag `v1.0.0` + GitHub Release 说明；不发布 npm 包、不附构建产物（dist/ 由用户自行 `pnpm build` 产出）。`package.json` 保留 `private: true` 防止误发 npm。
+**发布形态**：源码发布——tag `v1.0.0` + GitHub Release；**不发 npm 包**（`package.json` 保留 `private: true`），但 Release 附带打包产物 `penguin-remote-1.0.0.tar.gz`（`scripts/package.sh` 生成：`dist/src/` 构建产物 + hoisted 生产依赖 `node_modules/` + 部署文件，解压即用，部署机无需 pnpm）。
 
 **唯一剩余步骤（人类操作）**：GitHub 仓库设置页把 `smallrespon/penguin-remote` 从 Private 改为 Public。除此之外无未决项。
 
