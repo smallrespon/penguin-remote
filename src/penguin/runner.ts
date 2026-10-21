@@ -20,6 +20,9 @@ import type { Logger } from "../logger.js";
 /** 429 退避重试次数（另有首次尝试，共 1 + MAX_RETRIES 次）。 */
 const MAX_RETRIES = 2;
 
+/** 预览消息最多续接几条新消息（飞书单条消息编辑次数有限，长任务要换消息续）。 */
+const MAX_CHAINS = 10;
+
 export interface RunSpec {
   chatId: string;
   input: string;
@@ -62,8 +65,10 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   const placeholderId = await deps.channel.send(spec.chatId, PLACEHOLDER_TEXT);
 
   let degraded = false;
-  /** 已经换过一条新消息继续预览（飞书对单条消息的编辑次数有上限，见 flushOnce）。 */
-  let chained = false;
+  /** 已换过几条新消息继续预览（飞书单条消息最多编辑 20 次，实测）。 */
+  let chains = 0;
+  /** 当前这条预览消息上成功编辑过的次数；0 = 它根本编辑不了，换新的也没用。 */
+  let editsOnCurrent = 0;
   /** 当前承载预览的消息 id（换消息后指向新消息，定稿也编辑它）。 */
   let liveMessageId = placeholderId;
   /** 预览编辑串行化：避免上一次 flush 还没落地就改指向。 */
@@ -71,26 +76,29 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   // 每次尝试（含 429 后重开）都用新的预览状态，避免上一次的增量文本残留。
   let preview = new RunPreview(spec.preview);
 
-  /** 把当前预览写进聊天里的消息；编辑不成就换一条新消息，再失败才彻底放弃预览。 */
+  /** 把当前预览写进聊天里的消息；编辑不成就换一条新消息，再也发不出去才彻底放弃预览。 */
   const flushOnce = async (): Promise<void> => {
     const markdown = preview.markdown();
     try {
       await deps.channel.edit(liveMessageId, markdown);
+      editsOnCurrent += 1;
       return;
     } catch (error: unknown) {
       logger.warn(`预览编辑失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    if (chained) {
+    // 这条消息一次都没编辑成功过：换新的也白搭，直接放弃预览（发送本身出问题时走这条）。
+    if (editsOnCurrent === 0 || chains >= MAX_CHAINS) {
       degraded = true;
-      logger.warn("换消息后仍编辑失败，放弃流式预览，改为最终一次性发送");
+      logger.warn("放弃流式预览，改为最终一次性发送");
       return;
     }
-    // 飞书对单条消息的编辑次数有上限（实测 230072 "reached the number of times it can be edited"）。
+    // 飞书对单条消息的编辑次数有上限（实测 20 次，错误码 230072）。
     // 长任务的后半程不能因此没有进度可见：换一条新消息继续承载预览。
     try {
       liveMessageId = await deps.channel.send(spec.chatId, markdown);
-      chained = true;
-      logger.info("预览消息编辑次数已用尽，换用新消息继续");
+      chains += 1;
+      editsOnCurrent = 0;
+      logger.info(`预览消息编辑次数已用尽，换用新消息继续（第 ${chains} 次续接）`);
     } catch (error: unknown) {
       degraded = true;
       logger.warn(
