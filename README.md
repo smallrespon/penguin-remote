@@ -1,5 +1,9 @@
 # penguin-remote
 
+[![CI](https://github.com/smallrespon/penguin-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/smallrespon/penguin-remote/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen.svg)](https://nodejs.org)
+
 飞书机器人 ⇄ PenguinHarness 的桥接程序（Bridge）：在飞书里给机器人发一句话，它就把这句话派给同机的 PenguinHarness Agent 执行，并把流式过程与最终结果回到同一条飞书消息里。
 
 > ## ⚠️ 风险提示（先读这段）
@@ -44,7 +48,7 @@ line 12 of output
 ```
 （已截断，共 12 行，显示末尾 8 行）
 
-测试全部通过，120 个用例全绿。
+测试全部通过，123 个用例全绿。
 
 ---
 用量 4213 tokens
@@ -119,5 +123,10 @@ pnpm build       # 产出 dist/
 ## 已知限制
 
 - **没有审批卡片**（v2 可选）：allow-all 模式下服务端不会发 `approval.requested`。若手动把某个 Agent 的审批模式改成 `always-ask`，Bridge 会拒绝所有审批并在回复里说明，不会挂起等待。
-- **端到端已用真人消息验证**（2026-10-21，群聊 @ 机器人）：收消息 → 跑 Run → 同一条消息渐进编辑出结果，`state/runs.jsonl` 有审计行。仍未覆盖：私聊（p2p）路径、跨多聊天的并发、以及 429 退避（未真实触发）。
+- **端到端已用真人消息验证**（2026-10-21，私聊 + 群聊 @ 机器人）：收消息 → 跑 Run → 同一条消息渐进编辑出结果，重启后旧会话可续，`state/runs.jsonl` 有审计行。仍未覆盖：跨多聊天的并发、429 退避（未真实触发）。
 - **预览编辑有次数上限**：飞书对单条消息的编辑次数有限制（实测 **20 次**，第 21 次报 `230072`），长任务会撞上。撞上后 Bridge 会**换一条新消息继续承载预览**（可续接多次），定稿仍落在最新那条消息上；只有发送本身也失败，才退化成「最后一次性发总结」，结果不丢。
+
+## 许可
+
+[MIT](LICENSE)
+
