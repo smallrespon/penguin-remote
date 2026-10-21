@@ -3,6 +3,7 @@
 // 429（并发超限）按 Retry-After 退避重试；409（会话忙）转化为「进行中」提示。
 
 import type { ChannelAdapter } from "../channels/types.js";
+import { denyAll } from "../approvals.js";
 import { SessionBusyError, TooManyRunsError } from "./amsp.js";
 import type { AmspClient, AmspEvent, AmspRun, AmspRunOutcome } from "./amsp.js";
 import {
@@ -76,6 +77,22 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
             `预览编辑失败，降级为最终一次性发送：${error instanceof Error ? error.message : String(error)}`,
           );
         });
+      },
+      // 审批：allow-all 模式下不会来；来了就按策略拒绝并让用户在预览里看到。
+      onApproval: (request, ctx) => {
+        const decision = denyAll.decide({
+          sessionId: ctx.sessionId,
+          toolCallId: request.tool_call.tool_call_id,
+          name: request.tool_call.name,
+          arguments: request.tool_call.arguments,
+        });
+        preview.addNotice(
+          decision === "allow"
+            ? `✅ 已允许 \`${request.tool_call.name}\``
+            : `🚫 已拒绝 \`${request.tool_call.name}\`（v1 不做审批卡片）`,
+        );
+        logger.warn(`审批请求 \`${request.tool_call.name}\` → ${decision}`);
+        return decision;
       },
     });
     // 每次重开 Run 都更新 abort 句柄，/stop 中断的永远是当前这次尝试。

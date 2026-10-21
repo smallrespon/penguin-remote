@@ -1,0 +1,22 @@
+[Unit]
+Description=penguin-remote（飞书 ⇄ PenguinHarness 桥接）
+Documentation=file:///root/penguin_remote/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+# 仓库不在 ~/penguin_remote 时改这两行
+WorkingDirectory=/root/penguin_remote
+ExecStart=/root/penguin_remote/scripts/start.sh
+# 配置错误（fail-fast 退出码 1）重试也没用：连续失败 5 次就停下，状态可用
+# systemctl --user status penguin-remote 看到，不会无限重启刷屏。
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# 日志直接落到项目 logs/ 下（systemd ≥ 240）；老系统改成 journal（删掉下面两行）
+StandardOutput=append:/root/penguin_remote/logs/bridge.log
+StandardError=append:/root/penguin_remote/logs/bridge.log
+
+[Install]
+WantedBy=default.target

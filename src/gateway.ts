@@ -69,6 +69,10 @@ export class Gateway {
   }
 
   async handleMessage(message: IncomingMessage): Promise<void> {
+    if (!this.allowed(message)) {
+      this.logger.debug(`忽略 allowlist 之外的消息：chat=${message.chatId} sender=${message.senderId}`);
+      return;
+    }
     const parsed = parseCommand(message.text);
     try {
       await this.dispatch(message, parsed);
@@ -77,6 +81,13 @@ export class Gateway {
       this.logger.error(`处理消息失败：${text}`);
       await this.safeReply(message.chatId, `出错了：${text}`);
     }
+  }
+
+  /** 访问控制：allowlist 为空 = 开放；否则 chatId 或 senderId 命中才放行。 */
+  private allowed(message: IncomingMessage): boolean {
+    const list = this.deps.config.allowlist;
+    if (list.length === 0) return true;
+    return list.includes(message.chatId) || list.includes(message.senderId);
   }
 
   private async dispatch(message: IncomingMessage, parsed: Command): Promise<void> {

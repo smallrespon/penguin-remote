@@ -129,6 +129,12 @@ function parseEnvelope(stdout: string): LarkEnvelope | null {
 }
 
 export class FeishuChannel implements ChannelAdapter {
+  /** 子进程退出后重启的初始退避；每次连续退出翻倍，封顶 MAX_BACKOFF_MS。 */
+  private static readonly INITIAL_BACKOFF_MS = 1000;
+  private static readonly MAX_BACKOFF_MS = 30_000;
+  /** 存活超过这么久就算「稳了」，下次重启退避回到初始值。 */
+  private static readonly STABLE_MS = 10_000;
+
   private readonly bin: string;
   private readonly logger: Logger;
   private readonly spawn: SpawnFn;
@@ -139,6 +145,9 @@ export class FeishuChannel implements ChannelAdapter {
   private botOpenId: string | null = null;
   private consume: ManagedChild | null = null;
   private stopping = false;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private stableTimer: NodeJS.Timeout | null = null;
+  private backoffMs = FeishuChannel.INITIAL_BACKOFF_MS;
 
   constructor(options: FeishuChannelOptions) {
     this.bin = options.bin;
@@ -166,11 +175,34 @@ export class FeishuChannel implements ChannelAdapter {
       readLines(child.stderr, (line) => this.logger.debug(`lark-cli[stderr] ${redact(line)}`));
     }
     // 保持 stdin 不 EOF：lark-cli 的 consume 在 stdin EOF 时优雅退出。
+    // 存活够久就算稳定：把退避重置，避免一次偶发崩溃后长时间慢重启。
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = null;
+      this.backoffMs = FeishuChannel.INITIAL_BACKOFF_MS;
+    }, FeishuChannel.STABLE_MS);
     void child.exited.then(({ code, signal }) => {
+      if (this.stableTimer !== null) {
+        clearTimeout(this.stableTimer);
+        this.stableTimer = null;
+      }
       if (this.stopping) return;
-      this.logger.warn(`事件流子进程退出（code=${code} signal=${signal}），等待守护重启`);
+      this.logger.warn(`事件流子进程退出（code=${code} signal=${signal}），稍后重启`);
       this.consume = null;
+      this.scheduleRestart();
     });
+  }
+
+  /** 退避重启：连续崩溃时越等越久（封顶 30s），直到进程稳定运行。 */
+  private scheduleRestart(): void {
+    if (this.stopping) return;
+    const delay = this.backoffMs;
+    this.backoffMs = Math.min(this.backoffMs * 2, FeishuChannel.MAX_BACKOFF_MS);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (this.stopping || this.consume !== null) return;
+      this.logger.info(`重启事件流子进程（距上次退出 ${delay}ms）`);
+      this.spawnConsume();
+    }, delay);
   }
 
   private onLine(line: string): void {
@@ -233,6 +265,14 @@ export class FeishuChannel implements ChannelAdapter {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    if (this.restartTimer !== null) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    if (this.stableTimer !== null) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = null;
+    }
     const child = this.consume;
     this.consume = null;
     if (child) {

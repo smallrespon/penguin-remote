@@ -191,3 +191,49 @@ test("FeishuChannel 拿不到机器人身份时 start 失败（fail-fast）", as
   });
   await assert.rejects(() => channel.start(() => {}), /open_id/);
 });
+
+// ---- T9：事件流子进程守护 ----
+
+function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = (): void => {
+      if (predicate()) resolve();
+      else if (Date.now() - started > timeoutMs) reject(new Error("waitFor timeout"));
+      else setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
+test("事件流子进程崩溃后自动重启，消息继续进 handler", async () => {
+  const fake = makeFakeSpawn();
+  const channel = makeChannel(fake.spawn);
+  const received: string[] = [];
+  await channel.start(async (message) => {
+    received.push(message.text);
+  });
+  assert.equal(fake.children.length, 1);
+
+  // 崩溃：等守护按退避（1s 起）重新拉起
+  fake.children[0]!.exit(1);
+  await waitFor(() => fake.children.length === 2);
+
+  fake.children[1]!.emitEvent(p2pEvent("崩溃后收到的消息"));
+  await waitFor(() => received.length === 1);
+  assert.deepEqual(received, ["崩溃后收到的消息"]);
+
+  await channel.stop();
+  assert.equal(fake.children[1]?.killedWith, "SIGTERM");
+});
+
+test("stop 之后子进程退出不再重启", async () => {
+  const fake = makeFakeSpawn();
+  const channel = makeChannel(fake.spawn);
+  await channel.start(() => {});
+  await channel.stop();
+
+  fake.children[0]!.exit(1);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(fake.children.length, 1, "stop 后不应再拉起子进程");
+});

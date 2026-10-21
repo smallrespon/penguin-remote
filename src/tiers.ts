@@ -73,7 +73,21 @@ export class TierCommands implements TierController {
       b.agentId = name;
       b.sessionId = null;
     });
-    return `✅ 已切换 Agent \`${name}\`，上下文按新 Agent 干净开始。`;
+    // 非 allow-all 的 Agent 会真的发审批请求，而 v1 没有审批卡片：提前说清楚。
+    const warning = await this.approvalWarning(binding.projectId, name);
+    return `✅ 已切换 Agent \`${name}\`，上下文按新 Agent 干净开始。${warning}`;
+  }
+
+  /** 目标 Agent 的审批模式不是 allow-all 时的提示；读不到就不提示。 */
+  private async approvalWarning(projectId: string, agentId: string): Promise<string> {
+    try {
+      const { api } = await this.deps.owner.getAgentApi(projectId, agentId);
+      if (api.approvalMode === "allow-all") return "";
+      return `\n\n⚠️ 该 Agent 的审批模式是 \`${api.approvalMode}\`：Bridge 会拒绝所有审批（v1 不做审批卡片）。`;
+    } catch {
+      // API 未开启或读不到：无从判断，不提示
+      return "";
+    }
   }
 
   async listModels(chatId: string): Promise<string> {
@@ -144,7 +158,11 @@ export class TierCommands implements TierController {
       const model = api.model === null ? "跟随默认" : `\`${api.model.provider}/${api.model.modelId}\``;
       const thinking = api.thinkingLevel ?? "跟随默认";
       const workspace = api.workspace ?? "临时工作区";
-      return `- 模型：${model}\n- 思考：${thinking}\n- 工作区：\`${workspace}\``;
+      return (
+        `- 模型：${model}\n- 思考：${thinking}\n- 工作区：\`${workspace}\`` +
+        `\n- 审批：\`${api.approvalMode}\`` +
+        (api.enabled ? "" : "\n- ⚠️ 该 Agent 的 API 未开启，Run 会失败")
+      );
     } catch (error: unknown) {
       this.deps.logger.warn(`读取档位失败：${error instanceof Error ? error.message : String(error)}`);
       return "- 档位：读取失败";

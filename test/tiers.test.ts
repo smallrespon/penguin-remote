@@ -46,6 +46,10 @@ class FakeOwner {
   readonly created: Array<{ projectId: string; agentId: string; name: string }> = [];
   /** 让 getAgentApi 失败（模拟 server 侧读取失败）。 */
   failGet = false;
+  /** 按 agentId 覆盖审批模式（默认 allow-all）。 */
+  approvalModes: Record<string, string> = {};
+  /** 覆盖 API 开关（默认开启）。 */
+  apiEnabled = true;
   /** 覆盖模型清单（测试列表截断用）。 */
   models: typeof MODELS | null = null;
   /** 覆盖 Project 默认模型。 */
@@ -65,7 +69,14 @@ class FakeOwner {
 
   async getAgentApi(projectId: string, agentId: string) {
     if (this.failGet) throw new Error("boom");
-    return { api: this.api, serverEnabled: true };
+    return {
+      api: {
+        ...this.api,
+        approvalMode: this.approvalModes[agentId] ?? "allow-all",
+        enabled: this.apiEnabled,
+      },
+      serverEnabled: true,
+    };
   }
 
   async putAgentApi(projectId: string, agentId: string, patch: Record<string, unknown>) {
@@ -230,7 +241,7 @@ test("/thinking 与 /workspace：改专属 Agent 的 API 设置", async () => {
   assert.equal(owner.puts[0]?.path, owner.puts[2]?.path);
 });
 
-test("/status 档位回显：读得到时列模型/思考/工作区，读不到时明确说失败", async () => {
+test("/status 档位回显：读得到时列模型/思考/工作区/审批，读不到时明确说失败", async () => {
   const { tiers, owner } = await makeTiers();
   owner.api = {
     model: { provider: "stepfun", modelId: "step-3" },
@@ -241,9 +252,36 @@ test("/status 档位回显：读得到时列模型/思考/工作区，读不到�
   assert.match(text, /`stepfun\/step-3`/);
   assert.match(text, /medium/);
   assert.match(text, /`\/tmp\/x`/);
+  assert.match(text, /审批：`allow-all`/);
+  assert.doesNotMatch(text, /API 未开启/);
 
   owner.failGet = true;
   assert.match(await tiers.describeTiers("oc_1"), /读取失败/);
+});
+
+test("/agent 切到非 allow-all 的 Agent 时提示审批后果", async () => {
+  const { tiers, owner } = await makeTiers();
+  owner.approvalModes.coder = "always-ask";
+
+  const strict = await tiers.selectAgent("oc_1", "coder");
+  assert.match(strict, /已切换 Agent `coder`/);
+  assert.match(strict, /审批模式是 `always-ask`/);
+  assert.match(strict, /会拒绝所有审批/);
+
+  owner.approvalModes.coder = "allow-all";
+  const relaxed = await tiers.selectAgent("oc_1", "coder");
+  assert.doesNotMatch(relaxed, /审批模式/);
+
+  // 读不到 API 设置（API 未开启）时不提示，也不报错
+  owner.approvalModes.coder = "always-ask";
+  owner.failGet = true;
+  assert.doesNotMatch(await tiers.selectAgent("oc_1", "coder"), /审批模式/);
+});
+
+test("/status 档位回显：Agent 的 API 未开启时给出警告", async () => {
+  const { tiers, owner } = await makeTiers();
+  owner.apiEnabled = false;
+  assert.match(await tiers.describeTiers("oc_1"), /API 未开启/);
 });
 
 // ---- 纯函数 ----

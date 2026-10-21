@@ -18,11 +18,12 @@ import { FakeChannel } from "./helpers/fake-channel.js";
 
 const silent = createLogger("error", () => {});
 
-function makeConfig() {
+function makeConfig(overrides: Record<string, string> = {}) {
   return loadConfig({
     AMSP_BASE_URL: "http://localhost/api/amsp/v1",
     DEFAULT_PROJECT_ID: "default_project",
     DEFAULT_AGENT_ID: "default_agent",
+    ...overrides,
   });
 }
 
@@ -31,6 +32,7 @@ async function makeGateway(
   channel = new FakeChannel(),
   stateDir?: string,
   tiers?: TierController,
+  configOverrides: Record<string, string> = {},
 ) {
   const dir = stateDir ?? (await mkdtemp(join(tmpdir(), "pr-state-")));
   const registry = await Registry.load(dir, {
@@ -39,7 +41,7 @@ async function makeGateway(
   });
   const runLog = await RunLog.load(dir);
   const gateway = new Gateway({
-    config: makeConfig(),
+    config: makeConfig(configOverrides),
     channel,
     lanes: new Lanes(),
     logger: silent,
@@ -428,6 +430,47 @@ test("/status 注入档位回显（describeTiers）", async () => {
   await channel.receive("/status");
   assert.match(channel.lastSent(), /模型：`stepfun\/step-3`/);
   assert.deepEqual(calls, ["describeTiers:oc_chat"]);
+});
+
+// ---- T9：访问控制 ----
+
+test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel, undefined, undefined, {
+    ALLOWLIST: "oc_chat,ou_friend",
+  });
+  await gateway.start();
+
+  // 命中的聊天：正常跑
+  const ok = channel.receive("在吗");
+  await completeRun(server, [textDone("在"), runDone()]);
+  await ok;
+  assert.equal(server.runRequests().length, 1);
+  assert.match(channel.edited.at(-1)?.markdown ?? "", /在/);
+
+  // 未命中的聊天：不回复、不发起 Run
+  const before = channel.sent.length;
+  await channel.receive("悄悄话", { chatId: "oc_stranger", senderId: "ou_stranger" });
+  assert.equal(channel.sent.length, before, "不该有任何回复");
+  assert.equal(server.runRequests().length, 1, "不该发起 Run");
+
+  // 命中 sender_id（私聊陌生人）也算数
+  const allowed = channel.receive("我也在名单里", { chatId: "oc_stranger", senderId: "ou_friend" });
+  await completeRun(server, [textDone("好"), runDone()]);
+  await allowed;
+  assert.equal(server.runRequests().length, 2);
+});
+
+test("allowlist 为空时开放访问（默认）", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+  const received = channel.receive("任意来源");
+  await completeRun(server, [textDone("好"), runDone()]);
+  await received;
+  assert.equal(server.runRequests().length, 1);
 });
 
 // ---- router 纯函数 ----
