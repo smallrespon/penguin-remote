@@ -168,8 +168,17 @@ export function textDone(text: string): AmspEvent {
   };
 }
 
-export function thinkingDelta(thinking: string): AmspEvent {
-  return { type: "thinking.delta", at: new Date().toISOString(), thinking };
+export function thinkingDelta(thinking: string, at = new Date().toISOString()): AmspEvent {
+  return { type: "thinking.delta", at, thinking };
+}
+
+export function thinkingDone(thinking: string, at = new Date().toISOString()): AmspEvent {
+  return {
+    type: "thinking.done",
+    at,
+    thinking,
+    stop_reason: "completed",
+  };
 }
 
 export function toolCallDone(toolCallId: string, name: string, args = "{}"): AmspEvent {
