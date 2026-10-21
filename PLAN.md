@@ -1,6 +1,6 @@
 # 飞书 ⇄ PenguinHarness 桥接程序 — 实施计划
 
-> 状态：计划稿（待确认开放问题后进入 P0）
+> 状态：tickets 已发布（2026-10-21）。仓库 smallrespon/penguin-remote；spec 见 issue #1，tracer-bullet tickets 为 issue #2–#10（T1–T9，含原生 blocking 依赖边）；下一步按 frontier 逐个 `/implement`（T1/T2/T3 无阻塞可立即开工）。
 > 目标：通过飞书机器人 App 链接一台正在运行的 PenguinHarness，在聊天里驱动它干活。
 
 ---
