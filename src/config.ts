@@ -21,6 +21,8 @@ export interface BridgeConfig {
   previewThrottleMs: number;
   previewThrottleChars: number;
   previewMaxChars: number;
+  /** 默认 Agent 的 AMSP key 兜底（env 注入，不落盘）；缺省时由 Bridge 按需自铸。 */
+  amspApiKey: string | null;
 }
 
 /** 配置缺失或非法：消息列出全部问题，启动即失败。 */
@@ -64,14 +66,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   let amspBaseUrl = "";
   let ownerApiBaseUrl = "";
   if (amspBaseUrlRaw !== "") {
-    let parsed: URL;
+    let parsed: URL | null = null;
     try {
       parsed = new URL(amspBaseUrlRaw);
     } catch {
       problems.push(`AMSP_BASE_URL 不是合法 URL："${amspBaseUrlRaw}"`);
-      parsed = undefined as unknown as URL;
     }
-    if (parsed) {
+    if (parsed !== null) {
       const path = parsed.pathname.replace(/\/+$/, "");
       if (path !== AMSP_PATH_SUFFIX) {
         problems.push(`AMSP_BASE_URL 路径须以 ${AMSP_PATH_SUFFIX} 结尾（收到 "${path}"）`);
@@ -134,5 +135,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     previewThrottleMs: throttleMs,
     previewThrottleChars: throttleChars,
     previewMaxChars: maxChars,
+    amspApiKey: env.AMSP_API_KEY?.trim() || null,
   };
 }

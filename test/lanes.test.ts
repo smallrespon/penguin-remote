@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { LaneQueue } from "../src/lanes.js";
+import { Lanes } from "../src/lanes.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -12,7 +12,7 @@ function deferred<T>() {
 }
 
 test("Lane：同聊天串行——进行中的第二次调用不排队、直接返回未开工", async () => {
-  const lanes = new LaneQueue();
+  const lanes = new Lanes();
   const gate = deferred<void>();
   const first = lanes.run("oc_1", async () => {
     await gate.promise;
@@ -29,7 +29,7 @@ test("Lane：同聊天串行——进行中的第二次调用不排队、直接�
 });
 
 test("Lane：跨聊天互不阻塞", async () => {
-  const lanes = new LaneQueue();
+  const lanes = new Lanes();
   const gateA = deferred<void>();
   const order: string[] = [];
 
@@ -48,7 +48,7 @@ test("Lane：跨聊天互不阻塞", async () => {
 });
 
 test("Lane：任务抛错也会释放 Lane", async () => {
-  const lanes = new LaneQueue();
+  const lanes = new Lanes();
   await assert.rejects(() =>
     lanes.run("oc_1", async () => {
       throw new Error("boom");

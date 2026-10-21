@@ -1,7 +1,6 @@
 // 子进程执行：一次性命令（拿 stdout）与长驻子进程（可注入 mock）两类。
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
@@ -64,13 +63,9 @@ export type SpawnFn = (bin: string, args: string[]) => ManagedChild;
 /** 用 node:child_process 实现 ManagedChild。 */
 export function spawnManaged(bin: string, args: string[]): ManagedChild {
   const child: ChildProcess = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
-  const emitter = new EventEmitter();
   const exited = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
     child.on("exit", (code, signal) => resolve({ code, signal }));
-    child.on("error", (error: Error) => {
-      emitter.emit("spawn-error", error);
-      resolve({ code: null, signal: null });
-    });
+    child.on("error", () => resolve({ code: null, signal: null }));
   });
   return {
     stdout: child.stdout,

@@ -16,10 +16,13 @@ import {
   type FakeRun,
 } from "./helpers/fake-amsp.js";
 
-const AGENT = "default_project/default_agent";
-
 function makeClient(server: FakeAmspServer): AmspClient {
-  return new AmspClient({ baseUrl: server.baseUrl, agent: AGENT, apiKey: "penguin_test_key", fetch: server.fetch });
+  return new AmspClient({
+    baseUrl: server.baseUrl,
+    agent: { projectId: "default_project", agentId: "default_agent" },
+    apiKey: "penguin_test_key",
+    fetch: server.fetch,
+  });
 }
 
 /** 跑一个「推事件 → 收尾」的完整 run，返回 outcome 与收集到的事件。 */

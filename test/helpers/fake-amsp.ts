@@ -26,7 +26,6 @@ export class FakeAmspServer {
   readonly approvalCalls: Array<{ sessionId: string; toolCallId: string; decision: string }> = [];
   /** 下一次 runs 请求强制返回的 HTTP 错误（status + envelope body），用后清除。 */
   nextError: { status: number; body: unknown } | null = null;
-  /** 手动让某条流断裂（不发送 run.done 直接 close/error）。 */
   breakNextStream = false;
 
   get baseUrl(): string {
@@ -135,6 +134,11 @@ export class FakeAmspServer {
     const run = this.runs.at(-1);
     if (run === undefined) throw new Error("no run started");
     return run;
+  }
+
+  /** 只取发起 Run 的请求（排除 run 结束后的 session 查询等）。 */
+  runRequests(): FakeRequest[] {
+    return this.requests.filter((r) => r.method === "POST" && r.path.endsWith("/runs"));
   }
 }
 

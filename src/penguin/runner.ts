@@ -24,6 +24,8 @@ export interface RunReport {
   usageTotal: number | null;
   requests: number;
   durationMs: number;
+  /** 会话所用模型（run 结束后查会话得到；查不到为 null）。 */
+  modelId: string | null;
 }
 
 export interface RunDeps {
@@ -59,11 +61,16 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
       usageTotal: null,
       requests: 0,
       durationMs: Date.now() - startedAt,
+      modelId: null,
     };
   }
 
   logger.info(`Run 完成：${outcome.status}，session=${outcome.sessionId}`);
   await deps.channel.send(spec.chatId, formatFinalText(outcome));
+  const modelId = await spec.client.session(outcome.sessionId).then(
+    (info) => info.model_id,
+    () => null,
+  );
   return {
     chatId: spec.chatId,
     sessionId: outcome.sessionId,
@@ -72,5 +79,6 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     usageTotal: outcome.usage?.total ?? null,
     requests: outcome.requests,
     durationMs: Date.now() - startedAt,
+    modelId,
   };
 }

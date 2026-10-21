@@ -63,6 +63,27 @@ test("stripMentions 压缩空白", () => {
   assert.equal(stripMentions("@_user_1  @_user_2   你好"), "你好");
 });
 
+test("stripMentions 同时处理占位符与已渲染的显示名", () => {
+  assert.equal(stripMentions("penguin-remote 帮我看下", ["penguin-remote"]), "帮我看下");
+  assert.equal(stripMentions("@penguin-remote 帮我看下", ["penguin-remote"]), "帮我看下");
+  // 句中不带 @ 的同名文本不是 mention，保留
+  assert.equal(stripMentions("请把 penguin-remote 的配置改一下", ["penguin-remote"]), "请把 penguin-remote 的配置改一下");
+});
+
+test("decodeMessageEvent：content 为 JSON 原文时取出 text；群聊显示名 @ 也剥离", () => {
+  const jsonContent = decodeMessageEvent(p2pEvent(JSON.stringify({ text: "现在几点" })), BOT);
+  assert.equal(jsonContent?.text, "现在几点");
+
+  const rendered = decodeMessageEvent(
+    p2pEvent("penguin-remote 帮我看下这个", {
+      chat_type: "group",
+      mentions: [{ id: BOT, key: "@_user_1", name: "penguin-remote" }],
+    }),
+    BOT,
+  );
+  assert.equal(rendered?.text, "帮我看下这个");
+});
+
 function makeChannel(spawn = makeFakeSpawn().spawn): FeishuChannel {
   return new FeishuChannel({
     bin: "lark-cli",
