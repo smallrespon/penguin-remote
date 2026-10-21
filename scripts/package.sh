@@ -18,8 +18,11 @@ OUT="releases"
 STAGE="$OUT/penguin-remote-$VERSION"
 TARBALL="$OUT/penguin-remote-$VERSION.tar.gz"
 
-echo "==> 构建（pnpm build）"
-pnpm build
+echo "==> 构建（tsc）"
+node_modules/.bin/tsc -p tsconfig.json
+
+echo "==> 构建单文件可执行文件（Node SEA）"
+bash scripts/build-sea.sh
 
 echo "==> 组装 $STAGE"
 rm -rf "$STAGE" "$TARBALL"
@@ -37,4 +40,4 @@ echo "==> 打包 $TARBALL"
 mkdir -p "$OUT"
 (cd "$OUT" && tar -czf "penguin-remote-$VERSION.tar.gz" "penguin-remote-$VERSION")
 
-ls -lh "$TARBALL"
+ls -lh "$TARBALL" "$OUT"/penguin-remote-*-x64 2>/dev/null || true

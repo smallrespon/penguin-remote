@@ -66,7 +66,21 @@ line 12 of output
 
 ## 部署（同机）
 
-### 方式一：Release 压缩包（解压即用，推荐）
+### 方式一：单文件可执行文件（推荐，无需 Node）
+
+从 [Releases](https://github.com/smallrespon/penguin-remote/releases) 下载 `penguin-remote-linux-x64.gz`——Node SEA 单文件可执行程序，Node 运行时与全部依赖都已编进这一个文件：
+
+```bash
+gunzip penguin-remote-linux-x64.gz
+chmod +x penguin-remote-linux-x64
+cp /path/to/.env.example .env   # .env.example 取自本仓库或方式二的压缩包
+# 编辑 .env 填入配置（至少 AMSP_BASE_URL / DEFAULT_PROJECT_ID / DEFAULT_AGENT_ID）
+./penguin-remote-linux-x64      # 前台跑；Ctrl-C 退出
+```
+
+目标机只要有 Linux x86-64 就能跑，不需要 Node、pnpm 或任何安装步骤。其他平台（macOS / arm64）可在目标机上跑 `bash scripts/build-sea.sh` 自建（需要 Node 24 + pnpm 的源码检出）。
+
+### 方式二：Release 压缩包（需要 Node 24）
 
 从 [Releases](https://github.com/smallrespon/penguin-remote/releases) 下载 `penguin-remote-<版本>.tar.gz`：
 
@@ -81,7 +95,7 @@ bash scripts/start.sh   # 前台跑；Ctrl-C 退出
 
 压缩包内已含构建产物 `dist/src/` 与生产依赖 `node_modules/`，**部署机只需 Node 24**，无需 pnpm、无需联网装包。
 
-### 方式二：源码安装
+### 方式三：源码安装
 
 ```bash
 pnpm install
