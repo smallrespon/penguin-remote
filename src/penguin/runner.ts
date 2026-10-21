@@ -179,7 +179,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
 
   logger.info(`Run 完成：${outcome.status}，session=${outcome.sessionId}`);
   await settlePreview();
-  await deliverFinal(deps, spec.chatId, liveMessageId, formatFinalText(outcome), degraded);
+  await deliverFinal(deps, spec.chatId, liveMessageId, formatFinalText(outcome, preview.snapshot()), degraded);
 
   const modelId = await spec.client
     .session(outcome.sessionId)

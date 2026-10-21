@@ -6,6 +6,7 @@ import {
   RunPreview,
   applyEvent,
   emptyPreview,
+  formatFinalText,
   renderPreview,
   shouldFlush,
   type PreviewOptions,
@@ -16,6 +17,7 @@ import {
   textDelta,
   textDone,
   thinkingDelta,
+  thinkingDone,
   toolCallDone,
   toolResultDone,
 } from "./helpers/fake-amsp.js";
@@ -28,35 +30,230 @@ const OPTIONS: PreviewOptions = { throttleMs: 1500, throttleChars: 300, maxChars
 
 const silent = createLogger("error", () => {});
 
-test("render：text.delta 累积为正文，thinking 折叠为一行计数", () => {
+test("render：text.delta 追加到最后一个未收尾的正文分区", () => {
   let state = emptyPreview();
-  state = applyEvent(state, thinkingDelta("思考"));
-  state = applyEvent(state, thinkingDelta("中"));
   state = applyEvent(state, textDelta("现在"));
   state = applyEvent(state, textDelta("八点"));
-  const markdown = renderPreview(state, OPTIONS);
-  assert.match(markdown, /🧠 思考中…（3 字）/);
-  assert.match(markdown, /现在八点/);
+  assert.deepEqual(state.parts, [{ kind: "text", text: "现在八点" }]);
+  assert.equal(renderPreview(state, OPTIONS), "现在八点");
 });
 
-test("render：text.done 是权威全文，替换增量累积", () => {
+test("render：text.done 用权威全文替换未收尾的正文分区", () => {
   let state = emptyPreview();
   state = applyEvent(state, textDelta("现在"));
   state = applyEvent(state, textDone("现在是二十点整"));
-  assert.match(renderPreview(state, OPTIONS), /^现在是二十点整$/m);
+  assert.deepEqual(state.parts, [{ kind: "text", text: "现在是二十点整", done: true }]);
+  assert.equal(renderPreview(state, OPTIONS), "现在是二十点整");
 });
 
-test("render：tool_call.done 追加调用行，tool_result.done 截断追加", () => {
+test("render：text.done 前面没有未收尾正文时新建一个已收尾分区", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, textDone("第一段"));
+  state = applyEvent(state, textDone("第二段"));
+  assert.deepEqual(state.parts, [
+    { kind: "text", text: "第一段", done: true },
+    { kind: "text", text: "第二段", done: true },
+  ]);
+  assert.equal(renderPreview(state, OPTIONS), "第一段\n\n第二段");
+});
+
+test("render：thinking.delta 累加进同一个思考分区，done 用事件时间闭合", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDelta("一下", "2026-10-21T10:00:01.000Z"));
+  state = applyEvent(state, thinkingDone("先想一下", "2026-10-21T10:00:04.230Z"));
+  assert.deepEqual(state.parts, [
+    { kind: "thought", chars: 4, startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:04.230Z" },
+  ]);
+});
+
+test("render：thinking.done 的 thinking 为空时保留累加的字符数", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("想", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDone("", "2026-10-21T10:00:02.000Z"));
+  assert.deepEqual(state.parts, [
+    { kind: "thought", chars: 1, startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:02.000Z" },
+  ]);
+});
+
+test("render：思考分区已闭合后新的思考另起一个分区", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("甲", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDone("甲", "2026-10-21T10:00:01.000Z"));
+  state = applyEvent(state, thinkingDelta("乙", "2026-10-21T10:00:02.000Z"));
+  assert.deepEqual(state.parts, [
+    { kind: "thought", chars: 1, startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:01.000Z" },
+    { kind: "thought", chars: 1, startedAt: "2026-10-21T10:00:02.000Z" },
+  ]);
+});
+
+test("render：没有未闭合思考分区时 thinking.done 追加一个零耗时分区", () => {
+  const state = applyEvent(emptyPreview(), thinkingDone("整段思考", "2026-10-21T10:00:03.000Z"));
+  assert.deepEqual(state.parts, [
+    {
+      kind: "thought",
+      chars: 4,
+      startedAt: "2026-10-21T10:00:03.000Z",
+      endedAt: "2026-10-21T10:00:03.000Z",
+    },
+  ]);
+});
+
+test("render：tool_call.done 记下 id 与名称，参数压空白后截断到 80 字", () => {
+  const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", `{"command":"${"x".repeat(100)}"}`));
+  const part = state.parts.at(-1);
+  assert.equal(part?.kind, "tool");
+  if (part?.kind !== "tool") return;
+  assert.equal(part.id, "c1");
+  assert.equal(part.name, "exec_command");
+  assert.equal(part.args, `{"command":"${"x".repeat(68)}…`);
+});
+
+test("render：tool_call.done 的参数里的密钥被打码", () => {
+  const state = applyEvent(
+    emptyPreview(),
+    toolCallDone("c1", "exec_command", '{"token":"penguin_abcdef123456","command":"ls"}'),
+  );
+  const part = state.parts.at(-1);
+  assert.equal(part?.kind, "tool");
+  if (part?.kind !== "tool") return;
+  assert.equal(part.args, '{"token":"penguin_***","command":"ls"}');
+});
+
+test("render：tool_call.done 完整落在截断范围内的密钥被打码成 penguin_***", () => {
+  const state = applyEvent(
+    emptyPreview(),
+    toolCallDone("c1", "exec_command", `{"token":"penguin_abcdef123456","command":"${"x".repeat(100)}"}`),
+  );
+  const part = state.parts.at(-1);
+  assert.equal(part?.kind, "tool");
+  if (part?.kind !== "tool") return;
+  assert.ok(part.args?.includes("penguin_***"), `密钥应被打码：${part.args}`);
+  assert.ok(!part.args?.includes("abcdef123456"), `密钥本体泄漏：${part.args}`);
+});
+
+test("render：tool_call.done 先脱敏再截断，跨 80 字切口的密钥不漏片段", () => {
+  // 密钥起点在切口之前：若先截断，只会留下 "penguin_sup" 这种不完整片段，redact 的正则匹配不到。
+  const args = `{"x":"${"x".repeat(52)}","token":"penguin_supersecret"}`;
+  const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", args));
+  const part = state.parts.at(-1);
+  assert.equal(part?.kind, "tool");
+  if (part?.kind !== "tool") return;
+  assert.ok(!part.args?.includes("supersecret"), `密钥本体泄漏：${part.args}`);
+  assert.doesNotMatch(part.args ?? "", /penguin_[A-Za-z0-9_-]/, `密钥片段泄漏：${part.args}`);
+  assert.ok(part.args?.includes("penguin_***"), `打码标记应完整可见：${part.args}`);
+});
+
+test("render：tool_call.done 参数为空时不记 args", () => {
+  const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", ""));
+  const part = state.parts.at(-1);
+  assert.deepEqual(part, { kind: "tool", id: "c1", name: "exec_command" });
+});
+
+test("render：tool_result.done 回填到最后一个同 id 且没有输出的工具分区", () => {
   let state = emptyPreview();
   state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}'));
-  state = applyEvent(state, toolResultDone("c1", "x".repeat(500)));
-  const markdown = renderPreview(state, OPTIONS);
-  assert.match(markdown, /🔧 调用 `exec_command`/);
-  assert.match(markdown, /└ x+…/);
-  assert.ok(markdown.length < 600, `应截断，实际 ${markdown.length}`);
+  state = applyEvent(state, toolCallDone("c2", "read_file", '{"path":"a.ts"}'));
+  state = applyEvent(state, toolResultDone("c1", "a.ts\nb.ts"));
+  assert.deepEqual(state.parts, [
+    { kind: "tool", id: "c1", name: "exec_command", args: '{"command":"ls"}', output: "a.ts\nb.ts" },
+    { kind: "tool", id: "c2", name: "read_file", args: '{"path":"a.ts"}' },
+  ]);
 });
 
-test("render：超过 maxChars 时首尾保留、中间标注省略", () => {
+test("render：tool_result.done 找不到对应调用时追加一个通用工具分区", () => {
+  const state = applyEvent(emptyPreview(), toolResultDone("c9", "孤儿输出"));
+  assert.deepEqual(state.parts, [{ kind: "tool", id: "c9", name: "工具", output: "孤儿输出" }]);
+});
+
+test("render：审批与压缩提示按事件顺序落成提示分区", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, {
+    type: "approval.requested",
+    at: "2026-10-21T10:00:00.000Z",
+    tool_call: { tool_call_id: "c1", name: "exec_command", arguments: '{"command":"rm -rf /"}' },
+  });
+  state = applyEvent(state, { type: "compaction.started", at: "2026-10-21T10:00:01.000Z", reason: "context", mode: "summarize", context: 1, turns: 2 });
+  assert.deepEqual(state.parts, [
+    { kind: "notice", text: "⚠️ 等待审批：`exec_command`" },
+    { kind: "notice", text: "🗜️ 正在压缩上下文…" },
+  ]);
+  assert.equal(
+    renderPreview(state, OPTIONS),
+    "⚠️ 等待审批：`exec_command`\n\n🗜️ 正在压缩上下文…",
+  );
+});
+
+test("render：未知事件类型被忽略", () => {
+  const state = applyEvent(emptyPreview(), { type: "mcp_connect.done", at: "", status: "completed", results: [] });
+  assert.deepEqual(state, emptyPreview());
+});
+
+test("render：回复分区按 Run 真实时序渲染，工具可夹在两段正文之间", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, toolCallDone("c1", "read_file", '{"path":"src/render.ts"}'));
+  state = applyEvent(state, textDelta("先看渲染器"));
+  state = applyEvent(state, textDone("先看渲染器"));
+  state = applyEvent(state, toolCallDone("c2", "exec_command", '{"command":"pnpm test"}'));
+  state = applyEvent(state, textDelta("再跑测试"));
+  state = applyEvent(state, textDone("再跑测试"));
+  const markdown = renderPreview(state, OPTIONS);
+  const at = (needle: string): number => {
+    const index = markdown.indexOf(needle);
+    assert.ok(index >= 0, `渲染结果里应出现 ${needle}：\n${markdown}`);
+    return index;
+  };
+  assert.ok(at("🧠 思考中…（4 字）") < at("read_file"), "思考分区在最前");
+  assert.ok(at("read_file") < at("先看渲染器"), "第一次工具调用在第一段正文之前");
+  assert.ok(at("先看渲染器") < at("exec_command"), "第一段正文在第二次工具调用之前");
+  assert.ok(at("exec_command") < at("再跑测试"), "工具调用夹在两段正文之间");
+});
+
+test("render：思考分区流式显示「思考中」，定稿显示耗时（毫秒精度）", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  assert.match(renderPreview(state, OPTIONS), /^\*\*🧠 思考中…（4 字）\*\*$/m);
+  state = applyEvent(state, thinkingDone("先想一下", "2026-10-21T10:00:04.230Z"));
+  assert.match(renderPreview(state, OPTIONS), /^\*\*🧠 思考 · 4 字 · 4\.2s\*\*$/m);
+});
+
+test("render：工具分区输出走围栏代码块，参数里的反引号换成单引号", () => {
+  const state = applyEvent(
+    emptyPreview(),
+    toolCallDone("c1", "exec_command", '{"command":"echo `hi`"}'),
+  );
+  const state2 = applyEvent(state, toolResultDone("c1", "hi\n再见"));
+  assert.equal(
+    renderPreview(state2, OPTIONS),
+    ["**🔧 exec_command**", "`{\"command\":\"echo 'hi'\"}`", "output:", "```", "hi", "再见", "```"].join("\n"),
+  );
+});
+
+test("render：工具输出按行保留末尾 8 行，超出行数时标注", () => {
+  const output = Array.from({ length: 20 }, (_, i) => `第 ${i + 1} 行`).join("\n");
+  const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command")), toolResultDone("c1", output));
+  const markdown = renderPreview(state, OPTIONS);
+  assert.ok(markdown.includes("第 20 行"), "末尾行要留下");
+  assert.ok(!markdown.includes("第 12 行"), "第 12 行应被丢掉");
+  assert.ok(markdown.includes("第 13 行"), "第 13 行是末尾 8 行的第一行");
+  assert.match(markdown, /（已截断，共 20 行，显示末尾 8 行）/);
+});
+
+test("render：工具输出每行截到 100 字符", () => {
+  const output = `短行\n${"x".repeat(150)}`;
+  const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command")), toolResultDone("c1", output));
+  const markdown = renderPreview(state, OPTIONS);
+  assert.ok(markdown.includes(`\n${"x".repeat(100)}…\n`), "长行应截到 100 字符再加省略号");
+});
+
+test("render：工具输出自带 ``` 时围栏加到四反引号", () => {
+  const output = "```\nconst a = 1;\n```";
+  const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command")), toolResultDone("c1", output));
+  assert.ok(renderPreview(state, OPTIONS).includes("````\n```\nconst a = 1;\n```\n````"));
+});
+
+test("render：单个正文段超过 maxChars 时首尾保留、中间标注省略", () => {
   let state = emptyPreview();
   state = applyEvent(state, textDelta("a".repeat(4000)));
   const markdown = renderPreview(state, { throttleMs: 0, throttleChars: 0, maxChars: 1000 });
@@ -64,9 +261,44 @@ test("render：超过 maxChars 时首尾保留、中间标注省略", () => {
   assert.match(markdown, /中间省略 \d+ 字/);
 });
 
-test("render：未知事件类型被忽略", () => {
-  const state = applyEvent(emptyPreview(), { type: "mcp_connect.done", at: "", status: "completed", results: [] });
-  assert.deepEqual(state, emptyPreview());
+test("render：思考分区加超长正文时总长受控，正文不被整体丢弃", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, textDelta("答".repeat(3600)));
+  const markdown = renderPreview(state, { throttleMs: 0, throttleChars: 0, maxChars: 3500 });
+  assert.ok(markdown.length <= 3510, `总长应受控，实际 ${markdown.length}`);
+  assert.match(markdown, /🧠 思考/, "思考标签要保留");
+  const bodyChars = (markdown.match(/答/g) ?? []).length;
+  assert.ok(bodyChars >= 1000, `正文应大段残留，实际 ${bodyChars}`);
+});
+
+test("render：多个分区合计超过 maxChars 时从中间整块丢弃并标注", () => {
+  let state = emptyPreview();
+  for (const piece of ["甲".repeat(400), "乙".repeat(400), "丙".repeat(400), "丁".repeat(400)]) {
+    state = applyEvent(state, textDelta(piece));
+    state = applyEvent(state, textDone(piece));
+  }
+  const markdown = renderPreview(state, { throttleMs: 0, throttleChars: 0, maxChars: 1300 });
+  assert.ok(markdown.length <= 1300, `实际 ${markdown.length}`);
+  assert.match(markdown, /……（中间省略 1 个分区）……/);
+  assert.ok(markdown.includes("甲".repeat(400)), "开头分区要留下");
+  assert.ok(markdown.includes("乙".repeat(400)), "靠前的分区要留下");
+  assert.ok(!markdown.includes("丙".repeat(400)), "最中间的分区被整块丢弃");
+  assert.ok(markdown.includes("丁".repeat(400)), "结尾分区要留下");
+});
+
+test("render：预算再紧就继续丢分区，直到只保得住头尾", () => {
+  let state = emptyPreview();
+  for (const piece of ["一".repeat(200), "二".repeat(200), "三".repeat(200), "四".repeat(200), "五".repeat(200), "六".repeat(200)]) {
+    state = applyEvent(state, textDelta(piece));
+    state = applyEvent(state, textDone(piece));
+  }
+  const markdown = renderPreview(state, { throttleMs: 0, throttleChars: 0, maxChars: 500 });
+  assert.ok(markdown.length <= 500, `实际 ${markdown.length}`);
+  assert.match(markdown, /……（中间省略 4 个分区）……/);
+  assert.ok(markdown.startsWith("一".repeat(200)), "开头分区要留下");
+  assert.ok(markdown.endsWith("六".repeat(200)), "结尾分区要留下");
+  assert.ok(!markdown.includes("三".repeat(200)), "中间分区被整块丢弃");
 });
 
 test("render：节流——时间未到且增量不足时不必编辑", () => {
@@ -81,6 +313,69 @@ test("render：节流——时间未到且增量不足时不必编辑", () => {
 
 test("render：空状态不值得编辑", () => {
   assert.equal(shouldFlush(emptyPreview(), { at: 0, chars: 0 }, 999_999, OPTIONS), false);
+});
+
+test("render：RunPreview 累积事件、按节流吐 markdown，并给出定稿快照", () => {
+  const preview = new RunPreview(OPTIONS);
+  assert.equal(preview.due(999_999), false, "还没有任何分区");
+  preview.update(textDelta("现在"));
+  assert.equal(preview.due(100), false, "1.5s 内且增量不足");
+  assert.equal(preview.due(2000), true, "超过 1.5s");
+  preview.noteFlushed(2000);
+  assert.equal(preview.due(2100), false, "刚 flush 过，增量也没涨");
+  assert.equal(preview.markdown(), "现在");
+  assert.deepEqual(preview.snapshot(), { parts: [{ kind: "text", text: "现在" }] });
+  preview.addNotice("🗜️ 正在压缩上下文…");
+  assert.deepEqual(preview.snapshot().parts.at(-1), { kind: "notice", text: "🗜️ 正在压缩上下文…" });
+});
+
+test("formatFinalText：累积正文与 outcome 一致时按分区原样定稿", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, textDelta("第一部"));
+  state = applyEvent(state, textDone("第一部"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}'));
+  state = applyEvent(state, textDelta("全部完成"));
+  state = applyEvent(state, textDone("全部完成"));
+  const text = formatFinalText({ status: "completed", text: "第一部\n\n全部完成", usage: { total: 42 } }, state);
+  assert.match(text, /\*\*🧠 思考 · 4 字\*\*/, "未闭合的思考段按已闭合样式显示，且省去耗时");
+  assert.match(text, /\*\*🔧 exec_command\*\*/);
+  assert.ok(text.indexOf("第一部") < text.indexOf("全部完成"), "两段正文都在，且保持时序");
+  assert.match(text, /\n\n---\n用量 42 tokens$/);
+});
+
+test("formatFinalText：累积正文与 outcome 不一致时改用 outcome 的单段正文", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, textDelta("流式里的旧文本"));
+  state = applyEvent(state, textDone("流式里的旧文本"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}'));
+  const text = formatFinalText({ status: "completed", text: "最终答案", usage: { total: 42 } }, state);
+  assert.ok(!text.includes("流式里的旧文本"), "旧正文分区应被删掉");
+  assert.match(text, /\*\*🔧 exec_command\*\*/, "工具分区保留");
+  assert.match(text, /最终答案\n\n---\n用量 42 tokens$/);
+});
+
+test("formatFinalText：outcome 没有正文时给出占位说明", () => {
+  const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command"));
+  const text = formatFinalText({ status: "completed", text: "   ", usage: null }, state);
+  assert.match(text, /（本轮没有文本输出）\n\n---\n用量未知$/);
+});
+
+test("formatFinalText：比较正文时忽略空白差异", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, textDelta("第一行\n  第二行"));
+  state = applyEvent(state, textDone("第一行\n  第二行"));
+  const text = formatFinalText({ status: "completed", text: "第一行 第二行", usage: { total: 1 } }, state);
+  assert.match(text, /第一行\n {2}第二行/, "只有空白差异时保留分区原样");
+});
+
+test("formatFinalText：未正常完成时页脚带上状态与原因", () => {
+  const state = applyEvent(emptyPreview(), textDone("做到一半"));
+  const text = formatFinalText(
+    { status: "aborted", text: "做到一半", error: { code: "user_abort", message: "用户中断" }, usage: { total: 7 } },
+    state,
+  );
+  assert.match(text, /做到一半\n\n---\n未正常完成（aborted）：用户中断\n用量 7 tokens$/);
 });
 
 test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一次", async () => {
@@ -118,8 +413,8 @@ test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一�
   assert.match(channel.edited.at(-1)?.markdown ?? "", /全部完成/);
   assert.match(channel.edited.at(-1)?.markdown ?? "", /用量 42 tokens/);
   // 中间某次编辑应包含思考行与工具行
-  assert.ok(channel.edited.some((e) => /🧠 思考中…（4 字）/.test(e.markdown)));
-  assert.ok(channel.edited.some((e) => /🔧 调用 `exec_command`/.test(e.markdown)));
+  assert.ok(channel.edited.some((e) => /\*\*🧠 思考中…（4 字）\*\*/.test(e.markdown)));
+  assert.ok(channel.edited.some((e) => /\*\*🔧 exec_command\*\*/.test(e.markdown)));
 });
 
 /**
