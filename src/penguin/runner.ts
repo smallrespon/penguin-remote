@@ -73,11 +73,20 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   let liveMessageId = placeholderId;
   /** 预览编辑串行化：避免上一次 flush 还没落地就改指向。 */
   let flushChain: Promise<void> = Promise.resolve();
+  /** Run 已结束：之后的预览 flush 一律作废，避免晚到的编辑盖掉定稿。 */
+  let finished = false;
   // 每次尝试（含 429 后重开）都用新的预览状态，避免上一次的增量文本残留。
   let preview = new RunPreview(spec.preview);
 
+  /** 等未落地的预览编辑做完，并此后再不让预览覆盖定稿。 */
+  const settlePreview = async (): Promise<void> => {
+    await flushChain;
+    finished = true;
+  };
+
   /** 把当前预览写进聊天里的消息；编辑不成就换一条新消息，再也发不出去才彻底放弃预览。 */
   const flushOnce = async (): Promise<void> => {
+    if (finished) return;
     const markdown = preview.markdown();
     try {
       await deps.channel.edit(liveMessageId, markdown);
@@ -154,6 +163,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     // 409 会话忙：转化为「进行中」提示，和其他入口一致。
     const failureText = error instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(error);
     // 预览消息还挂在聊天里，别让它停在「思考中…」：把结局写进同一条消息。
+    await settlePreview();
     await deliverFinal(deps, spec.chatId, liveMessageId, failureText, degraded);
     return {
       chatId: spec.chatId,
@@ -168,6 +178,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   }
 
   logger.info(`Run 完成：${outcome.status}，session=${outcome.sessionId}`);
+  await settlePreview();
   await deliverFinal(deps, spec.chatId, liveMessageId, formatFinalText(outcome), degraded);
 
   const modelId = await spec.client
