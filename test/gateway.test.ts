@@ -13,6 +13,7 @@ import { RunLog } from "../src/runlog.js";
 import { loadConfig } from "../src/config.js";
 import { formatSkillInput, helpText, parseCommand } from "../src/router.js";
 import { FakeAmspServer, runDone, textDelta, textDone } from "./helpers/fake-amsp.js";
+import { PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
 
 const silent = createLogger("error", () => {});
@@ -102,9 +103,12 @@ test("最小闭环：飞书一句话 → AMSP run → 同聊天收到一条最�
 
   assert.equal(server.runRequests().length, 1);
   assert.deepEqual(server.runRequests()[0]?.body, { input: "现在几点" });
+  // T6：先发占位消息，最终文本通过编辑落到同一条消息上
   assert.equal(channel.sent.length, 1);
-  assert.match(channel.lastSent(), /现在是20:00/);
-  assert.match(channel.lastSent(), /用量 42 tokens/);
+  assert.equal(channel.sent[0]?.markdown, PLACEHOLDER_TEXT);
+  const finalEdit = channel.edited.at(-1)?.markdown ?? "";
+  assert.match(finalEdit, /现在是20:00/);
+  assert.match(finalEdit, /用量 42 tokens/);
 });
 
 test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队", async () => {
@@ -116,7 +120,7 @@ test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队",
   const first = channel.receive("第一个任务");
   const run = await nextRun(server);
   await channel.receive("第二个任务");
-  assert.equal(channel.sent.length, 1);
+  assert.equal(channel.sent.length, 2, "占位消息 + 忙提示");
   assert.equal(channel.lastSent(), BUSY_HINT);
   assert.equal(server.runRequests().length, 1, "不应发起第二个 Run");
 

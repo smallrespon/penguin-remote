@@ -1,9 +1,15 @@
-// 单次 Run 的生命周期：发起 → 等结果 → 把最终文本发回聊天。
-// 流式预览（占位消息 + 节流编辑）在 T6 接入；此处只发最终一条。
+// 单次 Run 的生命周期：占位消息 → 节流编辑的流式预览 → 定稿。
+// 编辑失败（频率限制）时降级为最后一次性发送，不丢结果。
 
 import type { ChannelAdapter } from "../channels/types.js";
-import type { AmspClient, AmspRun, AmspRunOutcome } from "./amsp.js";
-import { formatFinalText, formatRunFailure } from "../render.js";
+import type { AmspClient, AmspEvent, AmspRun, AmspRunOutcome } from "./amsp.js";
+import {
+  PLACEHOLDER_TEXT,
+  RunPreview,
+  formatFinalText,
+  formatRunFailure,
+  type PreviewOptions,
+} from "../render.js";
 import type { Logger } from "../logger.js";
 
 export interface RunSpec {
@@ -12,6 +18,8 @@ export interface RunSpec {
   /** 续接的会话；省略则新建。 */
   sessionId?: string;
   client: AmspClient;
+  /** 流式预览节流参数。 */
+  preview: PreviewOptions;
   /** Run 一旦发起即回调（供 /stop 持有 abort）。 */
   onStart?: (run: AmspRun) => void;
 }
@@ -33,15 +41,35 @@ export interface RunDeps {
   logger: Logger;
 }
 
-/** 执行一次 Run 并把最终文本发回聊天；返回供 Registry / 审计记录的 report。 */
+/** 执行一次 Run 并把结果发回聊天；返回供 Registry / 审计记录的 report。 */
 export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunReport> {
   const startedAt = Date.now();
   const logger = deps.logger.child({ chat: spec.chatId });
   logger.info(`发起 Run：${spec.input.slice(0, 80)}`);
 
+  // 先发占位消息，拿到 message_id 后再开跑：事件到达时已有可编辑的消息。
+  const placeholderId = await deps.channel.send(spec.chatId, PLACEHOLDER_TEXT);
+
+  const preview = new RunPreview(spec.preview);
+  let degraded = false;
+
   const run = spec.client.streamRun({
     input: spec.input,
     ...(spec.sessionId !== undefined ? { sessionId: spec.sessionId } : {}),
+    onEvent: (event: AmspEvent) => {
+      preview.update(event);
+      if (degraded) return;
+      const now = Date.now();
+      if (!preview.due(now)) return;
+      preview.noteFlushed(now);
+      void deps.channel.edit(placeholderId, preview.markdown()).catch((error: unknown) => {
+        // 频率限制等：停止编辑，最后一次性发总结。
+        degraded = true;
+        logger.warn(
+          `预览编辑失败，降级为最终一次性发送：${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    },
   });
   spec.onStart?.(run);
   const sessionId = await run.sessionId.catch(() => null);
@@ -66,7 +94,8 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   }
 
   logger.info(`Run 完成：${outcome.status}，session=${outcome.sessionId}`);
-  await deps.channel.send(spec.chatId, formatFinalText(outcome));
+  await deliverFinal(deps, spec.chatId, placeholderId, formatFinalText(outcome), degraded);
+
   const modelId = await spec.client.session(outcome.sessionId).then(
     (info) => info.model_id,
     () => null,
@@ -81,4 +110,25 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     durationMs: Date.now() - startedAt,
     modelId,
   };
+}
+
+/** 定稿：优先编辑占位消息；编辑失败（或已降级）就新发一条，保证结果不丢。 */
+async function deliverFinal(
+  deps: RunDeps,
+  chatId: string,
+  placeholderId: string,
+  finalText: string,
+  degraded: boolean,
+): Promise<void> {
+  if (!degraded) {
+    try {
+      await deps.channel.edit(placeholderId, finalText);
+      return;
+    } catch (error: unknown) {
+      deps.logger.warn(
+        `定稿编辑失败，改为新发消息：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  await deps.channel.send(chatId, finalText);
 }
