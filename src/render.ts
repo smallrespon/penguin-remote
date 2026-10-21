@@ -1,5 +1,6 @@
 // 渲染器：AMSP 事件 → 增量 markdown（流式预览）。
 // 纯函数核心（applyEvent / renderPreview / shouldFlush）+ 薄状态壳 RunPreview。
+// 数据模型是单一有序的「回复分区」列表：思考、工具调用、正文、提示按 Run 的真实时序排列。
 
 import type { AmspEvent } from "@prismshadow/amsp";
 
@@ -14,89 +15,280 @@ export interface PreviewOptions {
   maxChars: number;
 }
 
-/** 工具输出在预览里截断到多长。 */
-export const TOOL_OUTPUT_LIMIT = 200;
+/** 上次 flush 的位置标记：发生时间与当时的渲染长度，节流判断用。 */
+export interface FlushMark {
+  at: number;
+  chars: number;
+}
+
+/** 工具调用参数在预览里截断到多长。 */
+export const TOOL_ARGS_LIMIT = 80;
+
+/** 工具输出在预览里最多保留几行（保留末尾）。 */
+export const TOOL_OUTPUT_MAX_LINES = 8;
+
+/** 工具输出的单行截到多宽。 */
+export const TOOL_OUTPUT_LINE_WIDTH = 100;
 
 export const PLACEHOLDER_TEXT = "🦐 思考中…";
 
 /** 聊天正在执行中的提示（Lane 忙、409 会话忙共用）。 */
 export const BUSY_HINT = "⏳ 这个聊天正在执行中，`/stop` 可中断，请稍候再发。";
 
-export interface PreviewState {
-  /** 累积的正文（assistant 文本）。 */
+/** 正文分区：模型输出的一段文字。 */
+export interface TextPart {
+  kind: "text";
   text: string;
-  thinkingChars: number;
-  tools: string[];
-  toolOutputs: string[];
-  /** 非正文的提示行（压缩、审批等）。 */
-  notices: string[];
-  /** 已收尾的 text.done 条数。 */
-  doneTexts: number;
+  /** text.done 收尾后为 true；未收尾的段落还会被后续 delta 追加。 */
+  done?: boolean;
 }
+
+/** 思考分区：只记字符数与起止时间，不落思考全文。 */
+export interface ThoughtPart {
+  kind: "thought";
+  chars: number;
+  startedAt: string;
+  endedAt?: string;
+}
+
+/** 工具调用分区：一个 tool_call_id 一行，参数与输出可选。 */
+export interface ToolPart {
+  kind: "tool";
+  id: string;
+  name: string;
+  args?: string;
+  output?: string;
+}
+
+/** 提示分区：审批、压缩等非正文信息。 */
+export interface NoticePart {
+  kind: "notice";
+  text: string;
+}
+
+export type PreviewPart = TextPart | ThoughtPart | ToolPart | NoticePart;
+
+export interface PreviewState {
+  /** 有序的回复分区。 */
+  parts: PreviewPart[];
+}
+
+/**
+ * 渲染场合：流式预览（Run 进行中）还是定稿（Run 结束）。
+ * 只影响一处——未闭合的思考段在预览里显示「思考中…」，定稿里按已闭合样式显示。
+ */
+type RenderMode = "preview" | "final";
 
 export function emptyPreview(): PreviewState {
-  return { text: "", thinkingChars: 0, tools: [], toolOutputs: [], notices: [], doneTexts: 0 };
+  return { parts: [] };
 }
 
+/** 压空白：连续空白折叠成单个空格并去掉首尾；跨分区比较与单行展示都用这个形态。 */
+function squash(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** 超长就砍掉尾巴加省略号。 */
+function ellipsize(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit)}…`;
+}
+
+/** 单行展示用：先压空白再截断（工具参数等）。 */
 function truncate(text: string, limit: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= limit ? flat : `${flat.slice(0, limit)}…`;
+  return ellipsize(squash(text), limit);
 }
 
 /** 把一个 AMSP 事件折叠进预览状态（纯函数，返回新状态）。 */
 export function applyEvent(state: PreviewState, event: AmspEvent): PreviewState {
   switch (event.type) {
-    case "text.delta":
+    case "text.delta": {
       if (event.role !== "assistant" || event.text === "") return state;
-      return { ...state, text: state.text + event.text };
+      const last = state.parts.at(-1);
+      // 紧跟着未收尾的正文段就是同一段话，继续追加。
+      if (last?.kind === "text" && last.done !== true) {
+        return { parts: [...state.parts.slice(0, -1), { ...last, text: last.text + event.text }] };
+      }
+      return { parts: [...state.parts, { kind: "text", text: event.text }] };
+    }
     case "text.done": {
       if (event.role !== "assistant" || event.text === "") return state;
-      // .done 是权威全文：第一条替换掉累积的增量，后续条目按段拼接。
-      const text =
-        state.doneTexts === 0 ? event.text : `${state.text}\n\n${event.text}`;
-      return { ...state, text, doneTexts: state.doneTexts + 1 };
+      // .done 是权威全文：替换掉未收尾的增量段；前面已是收尾段或非正文则另起一段。
+      const last = state.parts.at(-1);
+      if (last?.kind === "text" && last.done !== true) {
+        return { parts: [...state.parts.slice(0, -1), { ...last, text: event.text, done: true }] };
+      }
+      return { parts: [...state.parts, { kind: "text", text: event.text, done: true }] };
     }
-    case "thinking.delta":
-      return { ...state, thinkingChars: state.thinkingChars + event.thinking.length };
-    case "tool_call.done":
-      return { ...state, tools: [...state.tools, `🔧 调用 \`${event.name}\``] };
-    case "tool_result.done":
-      if (event.output === "") return state;
-      return { ...state, toolOutputs: [...state.toolOutputs, `└ ${truncate(event.output, TOOL_OUTPUT_LIMIT)}`] };
+    case "thinking.delta": {
+      const last = state.parts.at(-1);
+      // 未闭合的思考段接着数；否则以本事件的 at 开一段新的。
+      if (last?.kind === "thought" && last.endedAt === undefined) {
+        return {
+          parts: [...state.parts.slice(0, -1), { ...last, chars: last.chars + event.thinking.length }],
+        };
+      }
+      return {
+        parts: [...state.parts, { kind: "thought", chars: event.thinking.length, startedAt: event.at }],
+      };
+    }
+    case "thinking.done": {
+      const last = state.parts.at(-1);
+      const unclosed = last?.kind === "thought" && last.endedAt === undefined ? last : undefined;
+      // thinking.done 带的长度为 0 时（有的引擎只发 done），保留 delta 累加出来的值。
+      const chars = event.thinking.length !== 0 ? event.thinking.length : (unclosed?.chars ?? event.thinking.length);
+      if (unclosed !== undefined) {
+        return { parts: [...state.parts.slice(0, -1), { ...unclosed, chars, endedAt: event.at }] };
+      }
+      return { parts: [...state.parts, { kind: "thought", chars, startedAt: event.at, endedAt: event.at }] };
+    }
+    case "tool_call.done": {
+      // 先 redact 再 truncate：反过来会让跨过截断切口的密钥只漏出不完整片段，redact 的正则匹配不到。
+      const args =
+        event.arguments === ""
+          ? undefined
+          : truncate(redact(event.arguments), TOOL_ARGS_LIMIT);
+      return {
+        parts: [...state.parts, { kind: "tool", id: event.tool_call_id, name: event.name, ...(args !== undefined ? { args } : {}) }],
+      };
+    }
+    case "tool_result.done": {
+      // 结果可能晚于下一个调用才到：回填到最后一个同 id 且还没有输出的调用上。
+      const index = state.parts.findLastIndex(
+        (part) => part.kind === "tool" && part.id === event.tool_call_id && part.output === undefined,
+      );
+      const output = redact(event.output);
+      if (index === -1) {
+        return { parts: [...state.parts, { kind: "tool", id: event.tool_call_id, name: "工具", output }] };
+      }
+      const target = state.parts[index];
+      if (target?.kind !== "tool") return state;
+      const parts = [...state.parts];
+      parts[index] = { ...target, output };
+      return { parts };
+    }
     case "approval.requested":
-      return { ...state, notices: [...state.notices, `⚠️ 等待审批：\`${event.tool_call.name}\``] };
+      return { parts: [...state.parts, { kind: "notice", text: `⚠️ 等待审批：\`${event.tool_call.name}\`` }] };
     case "compaction.started":
-      return { ...state, notices: [...state.notices, "🗜️ 正在压缩上下文…"] };
+      return { parts: [...state.parts, { kind: "notice", text: "🗜️ 正在压缩上下文…" }] };
     default:
       return state;
   }
 }
 
-/** 渲染当前预览 markdown；超上限时首尾各留一半、中间标注省略。 */
+/** 渲染当前预览 markdown；超预算时优先整块丢弃中间分区，展不开时结尾分区段内截断（绝不整块丢弃）。 */
 export function renderPreview(state: PreviewState, options: PreviewOptions): string {
-  const parts: string[] = [];
-  if (state.thinkingChars > 0) parts.push(`🧠 思考中…（${state.thinkingChars} 字）`);
-  if (state.text !== "") parts.push(state.text);
-  if (state.tools.length > 0) parts.push(state.tools.join("\n"));
-  if (state.toolOutputs.length > 0) parts.push(state.toolOutputs.join("\n"));
-  if (state.notices.length > 0) parts.push(state.notices.join("\n"));
-  const joined = parts.join("\n\n");
-  if (joined.length <= options.maxChars) return joined;
-  const half = Math.floor(options.maxChars / 2);
-  const omitted = joined.length - options.maxChars;
-  return `${joined.slice(0, half)}\n\n…（中间省略 ${omitted} 字）…\n\n${joined.slice(-half)}`;
+  return renderParts(state.parts, options.maxChars, "preview");
+}
+
+/** 定稿渲染：同样的规则；不另设预算（沿用「定稿不受 maxChars 约束」的现状）。 */
+function renderFinal(state: PreviewState): string {
+  return renderParts(state.parts, Number.MAX_SAFE_INTEGER, "final");
+}
+
+function renderParts(parts: PreviewPart[], maxChars: number, mode: RenderMode): string {
+  const blocks = parts.map((part) => renderPart(part, mode)).filter((block) => block !== "");
+  return fitBudget(blocks, maxChars);
+}
+
+/** 拼接后仍超预算：优先保头尾各若干段，从最中间开始整块丢弃，丢弃处标注省略了几个分区。 */
+function fitBudget(blocks: string[], maxChars: number): string {
+  if (blocks.join("\n\n").length <= maxChars) return blocks.join("\n\n");
+  const marker = (dropped: number): string => `……（中间省略 ${dropped} 个分区）……`;
+  // 保留的分区数从多到少试，头尾均分；第一个放得下的就是答案。
+  for (let kept = blocks.length - 1; kept >= 2; kept--) {
+    const head = Math.ceil(kept / 2);
+    const tail = kept - head;
+    const candidate = [
+      ...blocks.slice(0, head),
+      marker(blocks.length - kept),
+      ...blocks.slice(blocks.length - tail),
+    ].join("\n\n");
+    if (candidate.length <= maxChars) return candidate;
+  }
+  // 展不开两个分区：开头分区最多拿一半预算（信息量最高），剩下的都给结尾分区段内截断——
+  // 最后一个分区通常是最终答案，永远不被整块丢弃；单分区状态下它就是全部内容。
+  if (blocks.length === 1) return capBlock(blocks[0] ?? "", maxChars);
+  const head = capBlock(blocks[0] ?? "", Math.floor(maxChars / 2));
+  const dropped = blocks.length - 2;
+  const note = dropped > 0 ? marker(dropped) : "";
+  // 2 = 拼接用的一个 "\n\n"；丢过分区时再多一个分隔与标注的长度。
+  const tailBudget = maxChars - head.length - note.length - (dropped > 0 ? 4 : 2);
+  const tail = capBlock(blocks.at(-1) ?? "", tailBudget);
+  return dropped > 0 ? `${head}\n\n${note}\n\n${tail}` : `${head}\n\n${tail}`;
+}
+
+/** 单个渲染块超预算：首尾对半砍、中间标注省略字数；结果保证不超过预算。 */
+function capBlock(block: string, budget: number): string {
+  if (budget <= 0) return "";
+  if (block.length <= budget) return block;
+  const omitted = block.length - budget;
+  const note = `…（中间省略 ${omitted} 字）…`;
+  const half = Math.floor((budget - note.length - 4) / 2); // 4 = 标注两边的 "\n\n"
+  if (half <= 0) return `${block.slice(0, budget - 1)}…`;
+  return `${block.slice(0, half)}\n\n${note}\n\n${block.slice(-half)}`;
+}
+
+function renderPart(part: PreviewPart, mode: RenderMode): string {
+  switch (part.kind) {
+    case "text":
+      return part.text;
+    case "thought":
+      return renderThought(part, mode);
+    case "tool":
+      return renderTool(part);
+    case "notice":
+      return part.text;
+  }
+}
+
+function renderThought(part: ThoughtPart, mode: RenderMode): string {
+  // 定稿时还没闭合的思考段：按已闭合的样式显示，但拿不到耗时就省掉。
+  if (part.endedAt === undefined) {
+    return mode === "final" ? `**🧠 思考 · ${part.chars} 字**` : `**🧠 思考中…（${part.chars} 字）**`;
+  }
+  const seconds = (Date.parse(part.endedAt) - Date.parse(part.startedAt)) / 1000;
+  return `**🧠 思考 · ${part.chars} 字 · ${seconds.toFixed(1)}s**`;
+}
+
+function renderTool(part: ToolPart): string {
+  const lines = [`**🔧 ${part.name}**`];
+  if (part.args !== undefined && part.args !== "") {
+    // 反引号会撑破行内代码，先换成单引号。
+    lines.push(`\`${part.args.replace(/`/g, "'")}\``);
+  }
+  if (part.output !== undefined && part.output !== "") {
+    lines.push("output:", fencedOutput(part.output));
+  }
+  return lines.join("\n");
+}
+
+/** 工具输出的围栏代码块：保留末尾几行、每行限宽，超出行数时显式标注。 */
+function fencedOutput(output: string): string {
+  const lines = output.split("\n");
+  const kept = lines.length > TOOL_OUTPUT_MAX_LINES ? lines.slice(-TOOL_OUTPUT_MAX_LINES) : lines;
+  const body = kept.map((line) => truncateLine(line, TOOL_OUTPUT_LINE_WIDTH)).join("\n");
+  // 输出里自带 ``` 时把围栏加长，否则代码块会被提前合上。
+  const fence = output.includes("```") ? "````" : "```";
+  const note =
+    lines.length > TOOL_OUTPUT_MAX_LINES
+      ? `\n（已截断，共 ${lines.length} 行，显示末尾 ${TOOL_OUTPUT_MAX_LINES} 行）`
+      : "";
+  return `${fence}\n${body}\n${fence}${note}`;
+}
+
+/** 代码行裁剪：不压空白（围栏代码块里缩进有意义），只砍宽度。 */
+function truncateLine(line: string, limit: number): string {
+  return ellipsize(line, limit);
 }
 
 /** 节流判断：距今够久，或累积够多，才值得编辑一次。 */
 export function shouldFlush(
   state: PreviewState,
-  lastFlush: { at: number; chars: number },
+  lastFlush: FlushMark,
   now: number,
   options: PreviewOptions,
 ): boolean {
-  if (state.text.length === 0 && state.tools.length === 0 && state.toolOutputs.length === 0 && state.notices.length === 0) {
-    return false;
-  }
+  if (state.parts.length === 0) return false;
   if (now - lastFlush.at >= options.throttleMs) return true;
   return previewLength(state) - lastFlush.chars >= options.throttleChars;
 }
@@ -108,7 +300,7 @@ function previewLength(state: PreviewState): number {
 /** 有状态薄壳：给 runner 用；节流判断与渲染都委托纯函数。 */
 export class RunPreview {
   private state: PreviewState = emptyPreview();
-  private lastFlush: { at: number; chars: number } = { at: 0, chars: 0 };
+  private lastFlush: FlushMark = { at: 0, chars: 0 };
   private readonly options: PreviewOptions;
 
   constructor(options: PreviewOptions) {
@@ -134,7 +326,17 @@ export class RunPreview {
 
   /** 追加一条非正文提示（如审批结果）。 */
   addNotice(text: string): void {
-    this.state = { ...this.state, notices: [...this.state.notices, text] };
+    this.state = { parts: [...this.state.parts, { kind: "notice", text }] };
+  }
+
+  /**
+   * 当前分区快照，供定稿使用。
+   * 直接返回内部 state 是安全的：applyEvent 与 addNotice 全是替换式更新（新数组、新对象），
+   * 没有任何路径就地修改 parts 或其元素；后续 update 也是整体替换 state，
+   * 所以调用方拿到引用后，内容不会再变。
+   */
+  snapshot(): PreviewState {
+    return this.state;
   }
 }
 
@@ -144,18 +346,36 @@ function formatUsage(usage: { total: number } | null): string {
 }
 
 /** 一次 Run 结束后发给聊天的最终文本。 */
-export function formatFinalText(outcome: {
-  status: string;
-  text: string;
-  error?: { code: string; message: string };
-  usage: { total: number } | null;
-}): string {
-  const body = outcome.text.trim() === "" ? "（本轮没有文本输出）" : outcome.text.trim();
+export function formatFinalText(
+  outcome: {
+    status: string;
+    text: string;
+    error?: { code: string; message: string };
+    usage: { total: number } | null;
+  },
+  state: PreviewState,
+): string {
+  const body = renderFinal({ parts: finalParts(outcome, state) });
   if (outcome.status === "completed") {
     return `${body}\n\n---\n${formatUsage(outcome.usage)}`;
   }
   const reason = outcome.error?.message ?? outcome.error?.code ?? outcome.status;
   return `${body}\n\n---\n未正常完成（${outcome.status}）：${reason}\n${formatUsage(outcome.usage)}`;
+}
+
+/**
+ * 定稿分区：流式攒下来的正文与 outcome 的正文（压空白后）一致，就按分区原样呈现，
+ * 保住思考、工具与它们的时序；不一致说明 outcome 才是权威全文，换成它单独一段。
+ */
+function finalParts(outcome: { text: string }, state: PreviewState): PreviewPart[] {
+  const finalText = outcome.text.trim();
+  const accumulated = state.parts
+    .filter((part): part is TextPart => part.kind === "text")
+    .map((part) => part.text)
+    .join("\n\n");
+  if (finalText !== "" && squash(accumulated) === squash(finalText)) return state.parts;
+  const body = finalText === "" ? "（本轮没有文本输出）" : finalText;
+  return [...state.parts.filter((part) => part.kind !== "text"), { kind: "text", text: body, done: true }];
 }
 
 /** 面向用户的错误提示（密钥打码后）。 */
