@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Gateway, BUSY_HINT } from "../src/gateway.js";
+import { Gateway, BUSY_HINT, type TierController } from "../src/gateway.js";
 import { Lanes } from "../src/lanes.js";
 import { createLogger } from "../src/logger.js";
 import { AmspClient } from "../src/penguin/amsp.js";
@@ -26,7 +26,12 @@ function makeConfig() {
   });
 }
 
-async function makeGateway(server: FakeAmspServer, channel = new FakeChannel(), stateDir?: string) {
+async function makeGateway(
+  server: FakeAmspServer,
+  channel = new FakeChannel(),
+  stateDir?: string,
+  tiers?: TierController,
+) {
   const dir = stateDir ?? (await mkdtemp(join(tmpdir(), "pr-state-")));
   const registry = await Registry.load(dir, {
     projectId: "default_project",
@@ -47,8 +52,26 @@ async function makeGateway(server: FakeAmspServer, channel = new FakeChannel(), 
         apiKey: "penguin_test",
         fetch: server.fetch,
       }),
+    ...(tiers ? { tiers } : {}),
   });
   return { gateway, channel, registry, runLog, stateDir: dir };
+}
+
+/** 记录调用的假 TierController（档位命令由 owner 动态模式实现，这里只验分发）。 */
+function fakeTiers() {
+  const calls: string[] = [];
+  const controller: TierController = {
+    listProjects: async (chatId) => (calls.push(`listProjects:${chatId}`), "PROJECTS"),
+    selectProject: async (chatId, name) => (calls.push(`selectProject:${chatId}:${name}`), "PICKED"),
+    listAgents: async (chatId) => (calls.push(`listAgents:${chatId}`), "AGENTS"),
+    selectAgent: async (chatId, name) => (calls.push(`selectAgent:${chatId}:${name}`), "PICKED"),
+    listModels: async (chatId) => (calls.push(`listModels:${chatId}`), "MODELS"),
+    selectModel: async (chatId, name) => (calls.push(`selectModel:${chatId}:${name}`), "PICKED"),
+    selectThinking: async (chatId, level) => (calls.push(`selectThinking:${chatId}:${level}`), "PICKED"),
+    selectWorkspace: async (chatId, path) => (calls.push(`selectWorkspace:${chatId}:${path}`), "PICKED"),
+    describeTiers: async (chatId) => (calls.push(`describeTiers:${chatId}`), "- 模型：`stepfun/step-3`"),
+  };
+  return { calls, controller };
 }
 
 type Events = Parameters<FakeAmspServer["push"]>[1][];
@@ -346,6 +369,65 @@ test("/status 显示上次 Run 用量；/sessions 列出模型列", async () => 
 
   await channel.receive("/sessions");
   assert.match(channel.lastSent(), /step-3/);
+});
+
+// ---- T7：档位命令分发 ----
+
+test("档位命令：/project /agent /model /thinking /workspace 都带上 chatId 转发", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { calls, controller } = fakeTiers();
+  const { gateway } = await makeGateway(server, channel, undefined, controller);
+  await gateway.start();
+
+  await channel.receive("/project");
+  assert.deepEqual(calls.at(-1), "listProjects:oc_chat");
+  assert.equal(channel.lastSent(), "PROJECTS");
+
+  await channel.receive("/project demo");
+  assert.deepEqual(calls.at(-1), "selectProject:oc_chat:demo");
+
+  await channel.receive("/agent");
+  assert.deepEqual(calls.at(-1), "listAgents:oc_chat");
+
+  await channel.receive("/agent coder");
+  assert.deepEqual(calls.at(-1), "selectAgent:oc_chat:coder");
+
+  await channel.receive("/model");
+  assert.deepEqual(calls.at(-1), "listModels:oc_chat");
+
+  await channel.receive("/model step-3");
+  assert.deepEqual(calls.at(-1), "selectModel:oc_chat:step-3");
+
+  await channel.receive("/thinking high");
+  assert.deepEqual(calls.at(-1), "selectThinking:oc_chat:high");
+
+  await channel.receive("/workspace /tmp/x");
+  assert.deepEqual(calls.at(-1), "selectWorkspace:oc_chat:/tmp/x");
+});
+
+test("档位命令：控制器缺失时明确提示，不静默失败", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("/project");
+  assert.match(channel.lastSent(), /档位切换未启用/);
+  await channel.receive("/model step-3");
+  assert.match(channel.lastSent(), /档位切换未启用/);
+});
+
+test("/status 注入档位回显（describeTiers）", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { calls, controller } = fakeTiers();
+  const { gateway } = await makeGateway(server, channel, undefined, controller);
+  await gateway.start();
+
+  await channel.receive("/status");
+  assert.match(channel.lastSent(), /模型：`stepfun\/step-3`/);
+  assert.deepEqual(calls, ["describeTiers:oc_chat"]);
 });
 
 // ---- router 纯函数 ----

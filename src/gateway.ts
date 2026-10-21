@@ -9,22 +9,23 @@ import type { AgentRef, AmspClient } from "./penguin/amsp.js";
 import { executeRun } from "./penguin/runner.js";
 import type { Registry } from "./registry.js";
 import type { RunLog } from "./runlog.js";
+import { BUSY_HINT } from "./render.js";
 import { formatSkillInput, helpText, parseCommand, type Command } from "./router.js";
 
-export const BUSY_HINT = "⏳ 这个聊天正在执行中，`/stop` 可中断，请稍候再发。";
+export { BUSY_HINT };
 
 /** 档位切换（owner 动态模式）入口；T7 注入实现，缺省时命令不可用。 */
 export interface TierController {
-  listProjects(): Promise<string>;
-  selectProject(name: string): Promise<string>;
-  listAgents(): Promise<string>;
-  selectAgent(name: string): Promise<string>;
-  listModels(): Promise<string>;
-  selectModel(name: string): Promise<string>;
-  selectThinking(level: string): Promise<string>;
-  selectWorkspace(path: string): Promise<string>;
+  listProjects(chatId: string): Promise<string>;
+  selectProject(chatId: string, name: string): Promise<string>;
+  listAgents(chatId: string): Promise<string>;
+  selectAgent(chatId: string, name: string): Promise<string>;
+  listModels(chatId: string): Promise<string>;
+  selectModel(chatId: string, name: string): Promise<string>;
+  selectThinking(chatId: string, level: string): Promise<string>;
+  selectWorkspace(chatId: string, path: string): Promise<string>;
   /** /status 里的档位回显。 */
-  describeTiers(): Promise<string>;
+  describeTiers(chatId: string): Promise<string>;
 }
 
 export interface GatewayDeps {
@@ -109,28 +110,28 @@ export class Gateway {
         await this.handleStop(message.chatId);
         return;
       case "project":
-        await this.withTiers(message.chatId, (tiers) => tiers.listProjects());
+        await this.withTiers(message.chatId, (t) => t.listProjects(message.chatId));
         return;
       case "project.select":
-        await this.withTiers(message.chatId, (tiers) => tiers.selectProject(parsed.name));
+        await this.withTiers(message.chatId, (t) => t.selectProject(message.chatId, parsed.name));
         return;
       case "agent":
-        await this.withTiers(message.chatId, (tiers) => tiers.listAgents());
+        await this.withTiers(message.chatId, (t) => t.listAgents(message.chatId));
         return;
       case "agent.select":
-        await this.withTiers(message.chatId, (tiers) => tiers.selectAgent(parsed.name));
+        await this.withTiers(message.chatId, (t) => t.selectAgent(message.chatId, parsed.name));
         return;
       case "model":
-        await this.withTiers(message.chatId, (tiers) => tiers.listModels());
+        await this.withTiers(message.chatId, (t) => t.listModels(message.chatId));
         return;
       case "model.select":
-        await this.withTiers(message.chatId, (tiers) => tiers.selectModel(parsed.name));
+        await this.withTiers(message.chatId, (t) => t.selectModel(message.chatId, parsed.name));
         return;
       case "thinking":
-        await this.withTiers(message.chatId, (tiers) => tiers.selectThinking(parsed.level));
+        await this.withTiers(message.chatId, (t) => t.selectThinking(message.chatId, parsed.level));
         return;
       case "workspace":
-        await this.withTiers(message.chatId, (tiers) => tiers.selectWorkspace(parsed.path));
+        await this.withTiers(message.chatId, (t) => t.selectWorkspace(message.chatId, parsed.path));
         return;
       case "invalid":
         await this.reply(message.chatId, `⚠️ ${parsed.reason}`);
@@ -143,6 +144,7 @@ export class Gateway {
 
   /** 档位命令统一入口：控制器缺失时给出明确提示。 */
   private async withTiers(chatId: string, call: (tiers: TierController) => Promise<string>): Promise<void> {
+    // chatId 由调用方闭包捕获，这里只做统一的存在性检查。
     const tiers = this.deps.tiers;
     if (tiers === undefined) {
       await this.reply(chatId, "⚠️ 档位切换未启用（owner 会话未配置）。");
@@ -291,7 +293,7 @@ export class Gateway {
       `- Skill：${binding.skillSticky !== null ? `粘滞「${binding.skillSticky}」` : binding.skill !== null ? `一次性「${binding.skill}」` : "无"}`,
     ];
     if (this.deps.tiers) {
-      lines.push(await this.deps.tiers.describeTiers());
+      lines.push(await this.deps.tiers.describeTiers(chatId));
     }
     if (binding.sessionId !== null) {
       try {

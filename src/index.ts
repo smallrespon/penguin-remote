@@ -6,8 +6,11 @@ import { FeishuChannel } from "./channels/feishu.js";
 import { Lanes } from "./lanes.js";
 import { Gateway } from "./gateway.js";
 import { AmspClient } from "./penguin/amsp.js";
+import { AgentSupply } from "./penguin/agents.js";
+import { OwnerSession } from "./penguin/owner.js";
 import { Registry } from "./registry.js";
 import { RunLog } from "./runlog.js";
+import { TierCommands } from "./tiers.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -15,11 +18,26 @@ async function main(): Promise<void> {
 
   const channel = new FeishuChannel({ bin: config.larkBin, logger });
   const lanes = new Lanes();
-  const registry = await Registry.load(
-    config.stateDir,
-    { projectId: config.defaultProjectId, agentId: config.defaultAgentId },
-  );
+  const registry = await Registry.load(config.stateDir, {
+    projectId: config.defaultProjectId,
+    agentId: config.defaultAgentId,
+  });
   const runLog = await RunLog.load(config.stateDir);
+
+  const owner = new OwnerSession({
+    bin: config.penguinBin,
+    baseUrl: config.ownerApiBaseUrl,
+    ttlSeconds: config.ownerTokenTtlSeconds,
+    refreshMarginSeconds: config.ownerTokenRefreshMarginSeconds,
+    logger,
+  });
+  const supply = new AgentSupply({
+    owner,
+    baseUrl: config.amspBaseUrl,
+    stateDir: config.stateDir,
+    logger,
+  });
+  const tiers = new TierCommands({ owner, supply, registry, logger });
 
   const gateway = new Gateway({
     config,
@@ -28,12 +46,13 @@ async function main(): Promise<void> {
     logger,
     registry,
     runLog,
+    tiers,
     clientFor: async (agent) => {
-      const key = config.amspApiKey;
-      if (key === null) {
-        throw new Error("未配置 AMSP_API_KEY：无法调用 AMSP");
+      // AMSP_API_KEY 是显式覆盖：设了就不自动铸 key（运维/调试用）。
+      if (config.amspApiKey !== null) {
+        return new AmspClient({ baseUrl: config.amspBaseUrl, agent, apiKey: config.amspApiKey });
       }
-      return new AmspClient({ baseUrl: config.amspBaseUrl, agent, apiKey: key });
+      return supply.clientFor(agent);
     },
   });
 
