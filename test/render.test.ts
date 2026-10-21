@@ -122,7 +122,45 @@ test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一�
   assert.ok(channel.edited.some((e) => /🔧 调用 `exec_command`/.test(e.markdown)));
 });
 
-test("流式预览：编辑一直失败时先换一条新消息，仍失败才降级为最终一次性发送", async () => {
+test("流式预览：编辑次数反复用尽时持续换新消息，定稿落在最新一条上", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  channel.editLimitPerMessage = 1;
+  const client = new AmspClient({
+    baseUrl: server.baseUrl,
+    agent: { projectId: "default_project", agentId: "default_agent" },
+    apiKey: "penguin_test",
+    fetch: server.fetch,
+  });
+  const report = executeRun({ channel, logger: silent }, {
+    chatId: "oc_1",
+    input: "长任务",
+    client,
+    preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+  });
+  const run = await nextRun(server);
+  for (const piece of ["第一段", "第二段", "第三段", "第四段"]) {
+    server.push(run, textDelta(piece));
+    await tick();
+  }
+  server.push(run, textDone("最终答案"));
+  server.push(run, runDone());
+  server.close(run);
+  await report;
+
+  // 每条消息只允许编辑 1 次：占位 + 三次续接 + 定稿所在的那条
+  assert.equal(channel.sent.length, 4, `应持续换消息续接，实际 ${channel.sent.length}`);
+  const last = channel.sent.at(-1);
+  const finalEdit = channel.edited.at(-1);
+  assert.equal(finalEdit?.messageId, last?.messageId, "定稿应落在最新一条消息上");
+  assert.match(finalEdit?.markdown ?? "", /最终答案/);
+  // 每条消息都被编辑过，且编辑次数都不超过上限
+  const counts = new Map<string, number>();
+  for (const edit of channel.edited) counts.set(edit.messageId, (counts.get(edit.messageId) ?? 0) + 1);
+  assert.ok([...counts.values()].every((n) => n <= 1), "不该有消息被编辑超过上限");
+});
+
+test("流式预览：编辑从未成功过时直接降级为最终一次性发送，不白换消息", async () => {
   const server = new FakeAmspServer();
   const channel = new FakeChannel();
   channel.failEditWith = new Error("too many requests");
@@ -146,9 +184,8 @@ test("流式预览：编辑一直失败时先换一条新消息，仍失败才�
   server.close(run);
   await report;
 
-  assert.equal(channel.edited.length, 0, "编辑一直失败，不应重试同一条消息");
-  // 占位 + 换的新预览消息 + 最终总结
-  assert.equal(channel.sent.length, 3);
+  assert.equal(channel.edited.length, 0, "编辑从未成功，不该换消息白试");
+  assert.equal(channel.sent.length, 2, "占位 + 降级后的总结");
   assert.match(channel.lastSent(), /最终答案/);
 });
 
