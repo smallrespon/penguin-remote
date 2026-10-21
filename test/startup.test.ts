@@ -10,6 +10,9 @@ const VALID_ENV = {
   DEFAULT_AGENT_ID: "default_agent",
 };
 
+/** 真实 lark-cli 冒烟只在装有 lark-cli 的机器上跑；CI 镜像里没有它，跳过。 */
+const larkCliReady = spawnSync("lark-cli", ["--version"], { stdio: "ignore" }).error === undefined;
+
 test("冒烟：缺配置时进程以非零码退出并列出全部缺失项", () => {
   const result = spawnSync(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: repoRoot,
@@ -22,7 +25,7 @@ test("冒烟：缺配置时进程以非零码退出并列出全部缺失项", ()
   assert.match(result.stderr, /DEFAULT_AGENT_ID/);
 });
 
-test("冒烟：配置齐全时进程启动、收到 SIGTERM 干净退出（真实 lark-cli consume）", async () => {
+test("冒烟：配置齐全时进程启动、收到 SIGTERM 干净退出（真实 lark-cli consume）", { skip: larkCliReady ? false : "环境里没有 lark-cli" }, async () => {
   const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: repoRoot,
     env: { ...process.env, ...VALID_ENV },
