@@ -1,6 +1,6 @@
 # 飞书 ⇄ PenguinHarness 桥接程序 — 实施计划
 
-> 状态：tickets 已发布（2026-10-21）。仓库 smallrespon/penguin-remote；spec 见 issue #1，tracer-bullet tickets 为 issue #2–#10（T1–T9，含原生 blocking 依赖边）；下一步按 frontier 逐个 `/implement`（T1/T2/T3 无阻塞可立即开工）。
+> 状态：**v1.0.0 已发布**（2026-10-21）。仓库 smallrespon/penguin-remote；spec 见 issue #1，tracer-bullet tickets 为 issue #2–#10（T1–T9，全部关闭）；PR #11（T1–T9）与 #12（回复分区）均已合并，tag `v1.0.0` + GitHub Release 已建；唯一剩余步骤是仓库转公开（人类在 GitHub 设置页操作，见 §14）。
 > 目标：通过飞书机器人 App 链接一台正在运行的 PenguinHarness，在聊天里驱动它干活。
 
 ---
@@ -401,3 +401,23 @@ Run 的回复在飞书消息里按「回复分区」结构化展示（词条见 
 5. 定稿消息保留全部分区（思考标签 + 工具轨迹 + 正文 + 用量页脚），与预览一致。
 6. 不新增配置项；消息超长时优先整块丢弃中间分区并标注「……（中间省略 N 个分区）……」，单个正文段超预算时段内首尾对半砍；展不开时结尾分区（通常是最终答案）段内截断，永远不整块丢弃。
 7. 定稿正文以 `outcome.text` 为准：与流式累积的正文在忽略空白差异后不一致时，替换为 `outcome.text` 单段（保证答案不丢）；一致时保留全部分区原样。
+
+---
+
+## 14. 发布（2026-10-21）
+
+v1.0.0 发布清单与唯一剩余步骤。
+
+**已完成**：
+
+- PR #11（T1–T9）、PR #12（回复分区）均已合并；`main` 即发布代码（merge commit `5af813b`）。
+- `LICENSE`（MIT）、`CHANGELOG.md`（1.0.0 条目）、`package.json` version 1.0.0；README 增加 CI / License / Node 徽章与「许可」节，并修正「已知限制」（私聊路径已真人验收，测试数 120 → 123）。
+- tag `v1.0.0` + GitHub Release 已创建；仓库 description / topics 已设置。
+- 全量验证：`pnpm typecheck`、`pnpm test`（123 个全绿）、`pnpm build` 通过；push 后 CI 绿。
+- 移除 `HANDOFF.md`（实现期的内部交接文档，内容已过期且对公众读者有误导）。
+
+**发布形态**：源码发布——tag `v1.0.0` + GitHub Release 说明；不发布 npm 包、不附构建产物（dist/ 由用户自行 `pnpm build` 产出）。`package.json` 保留 `private: true` 防止误发 npm。
+
+**唯一剩余步骤（人类操作）**：GitHub 仓库设置页把 `smallrespon/penguin-remote` 从 Private 改为 Public。除此之外无未决项。
+
+**后续可选（不阻塞发布）**：审批卡片闭环（v2，§4.2）；按工具定制投影与 diff 渲染（`docs/research/zcode-reply-structure.md` 第 8 节）；Agent 回收脚本（§11 风险 5）。
