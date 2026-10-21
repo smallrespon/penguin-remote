@@ -23,7 +23,8 @@
 
 ### 发布产物
 
-- Release 附带 `penguin-remote-1.0.0.tar.gz`：构建产物 `dist/src/` + 生产依赖（hoisted `node_modules/`）+ 部署文件，解压即用（Node 24 + `.env` 即可启动，部署机无需 pnpm）。重新打包：`bash scripts/package.sh`。
+- `penguin-remote-linux-x64.gz`：**单文件可执行程序**（Node SEA）——Node 运行时与全部依赖编译进同一个 ELF，目标机无需 Node/pnpm，`gunzip && chmod +x && ./penguin-remote-linux-x64` 即用。仅支持 linux-x64，其他平台用 `bash scripts/build-sea.sh` 在目标机自建。
+- `penguin-remote-1.0.0.tar.gz`：构建产物 `dist/src/` + 生产依赖（hoisted `node_modules/`）+ 部署文件，解压即用（需要 Node 24）。重新打包：`bash scripts/package.sh`。
 - 不发布 npm 包；源码安装方式见 README「部署」。
 
 ### 已知限制

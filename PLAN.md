@@ -416,7 +416,10 @@ v1.0.0 发布清单与唯一剩余步骤。
 - 全量验证：`pnpm typecheck`、`pnpm test`（123 个全绿）、`pnpm build` 通过；push 后 CI 绿。
 - 移除 `HANDOFF.md`（实现期的内部交接文档，内容已过期且对公众读者有误导）。
 
-**发布形态**：源码发布——tag `v1.0.0` + GitHub Release；**不发 npm 包**（`package.json` 保留 `private: true`），但 Release 附带打包产物 `penguin-remote-1.0.0.tar.gz`（`scripts/package.sh` 生成：`dist/src/` 构建产物 + hoisted 生产依赖 `node_modules/` + 部署文件，解压即用，部署机无需 pnpm）。
+**发布形态**：源码发布——tag `v1.0.0` + GitHub Release；**不发 npm 包**（`package.json` 保留 `private: true`）。Release 附两个产物，均由 `scripts/package.sh` 一键生成：
+
+1. `penguin-remote-linux-x64.gz`——**单文件可执行程序**（Node SEA）：tsc 编译 → esbuild 打成单文件 CJS → 生成 SEA blob → 注入官方 Node 运行时副本；目标机无需 Node/pnpm，解压即跑。仅限 linux-x64，其他平台在目标机跑 `scripts/build-sea.sh` 自建。
+2. `penguin-remote-1.0.0.tar.gz`——`dist/src/` 构建产物 + hoisted 生产依赖 `node_modules/` + 部署文件，解压即用（需要 Node 24）。
 
 **唯一剩余步骤（人类操作）**：GitHub 仓库设置页把 `smallrespon/penguin-remote` 从 Private 改为 Public。除此之外无未决项。
 
