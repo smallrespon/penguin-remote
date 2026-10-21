@@ -28,9 +28,37 @@ interface LarkEnvelope {
 
 const MENTION_PLACEHOLDER = /@_user_\d+/g;
 
-/** 剥掉文本里的 @ 占位符并压缩空白。 */
-export function stripMentions(text: string): string {
-  return text.replace(MENTION_PLACEHOLDER, " ").replace(/\s+/g, " ").trim();
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * 剥掉文本里的 @：占位符（`@_user_1`）与已渲染成显示名的 @（`@名字` / 行首的名字）。
+ * lark-cli 的 content 是「预渲染可读文本」，两种形状都要防。
+ */
+export function stripMentions(text: string, mentionNames: readonly string[] = []): string {
+  let out = text.replace(MENTION_PLACEHOLDER, " ");
+  for (const name of [...mentionNames].filter((n) => n.length >= 2).sort((a, b) => b.length - a.length)) {
+    const escaped = escapeRegExp(name);
+    out = out.replace(new RegExp(`@${escaped}`, "g"), " ");
+    out = out.replace(new RegExp(`^\\s*${escaped}(?=\\s|$)`, "u"), " ");
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+/** content 可能是预渲染文本，也可能是 `{"text":"..."}` 原文；两者都取到可读文本。 */
+function readContent(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as { text?: unknown };
+      if (typeof parsed.text === "string") return parsed.text;
+    } catch {
+      // 不是 JSON：按纯文本用
+    }
+  }
+  return raw;
 }
 
 /**
@@ -62,8 +90,11 @@ export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMes
     );
     if (!mentioned) return null;
   }
+  const mentionNames = mentions
+    .map((m) => (typeof m === "object" && m !== null ? str((m as { name?: unknown }).name) : ""))
+    .filter((name) => name !== "");
 
-  const text = stripMentions(str(payload.content));
+  const text = stripMentions(readContent(payload.content), mentionNames);
   if (text === "") return null;
   return { chatId, chatType, messageId, senderId, text };
 }
@@ -166,42 +197,38 @@ export class FeishuChannel implements ChannelAdapter {
   }
 
   async send(chatId: string, markdown: string): Promise<string> {
-    const result = await this.run(this.bin, [
-      "im",
-      "+messages-send",
-      "--as",
-      "bot",
-      "--chat-id",
-      chatId,
-      "--markdown",
-      "-",
-    ], { input: markdown });
-    return this.requireMessageId(result, "发送");
+    const result = await this.runLark(
+      ["im", "+messages-send", "--as", "bot", "--chat-id", chatId, "--markdown", "-"],
+      markdown,
+      "发送",
+    );
+    const messageId = result.data?.message_id;
+    if (typeof messageId !== "string") throw new Error("lark-cli 未返回 message_id");
+    return messageId;
   }
 
   async edit(messageId: string, markdown: string): Promise<void> {
-    const result = await this.run(
-      this.bin,
+    await this.runLark(
       ["im", "+messages-edit", "--as", "bot", "--message-id", messageId, "--markdown", "-"],
-      { input: markdown },
+      markdown,
+      "编辑",
     );
-    const envelope = parseEnvelope(result.stdout);
-    if (result.status !== 0 || envelope?.ok !== true) {
-      throw new Error(
-        `编辑消息失败（lark-cli exit=${result.status}）：${envelope?.error?.message ?? result.stderr.trim()}`,
-      );
-    }
   }
 
-  private requireMessageId(result: { status: number | null; stdout: string; stderr: string }, what: string): string {
+  /** 跑一条 lark-cli 写操作：stdin 传内容，校验输出信封，失败带原因抛出。 */
+  private async runLark(
+    args: string[],
+    input: string,
+    what: string,
+  ): Promise<{ data?: { message_id?: string } }> {
+    const result = await this.run(this.bin, args, { input });
     const envelope = parseEnvelope(result.stdout);
-    const messageId = envelope?.data?.message_id;
-    if (result.status !== 0 || envelope?.ok !== true || typeof messageId !== "string") {
+    if (result.status !== 0 || envelope?.ok !== true) {
       throw new Error(
         `${what}消息失败（lark-cli exit=${result.status}）：${envelope?.error?.message ?? result.stderr.trim()}`,
       );
     }
-    return messageId;
+    return { data: envelope.data };
   }
 
   async stop(): Promise<void> {

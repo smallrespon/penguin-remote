@@ -11,6 +11,8 @@ export interface SessionRecord {
   sessionId: string;
   title: string;
   at: string;
+  /** 该会话所用模型（run 结束后回填；未知则缺省）。 */
+  model?: string;
 }
 
 export interface Binding {
@@ -104,12 +106,23 @@ export class Registry {
   }
 
   /** 记录一次新会话：写入历史（去重、置顶、限量）并设为当前会话。 */
-  async noteSession(chatId: string, record: { sessionId: string; title: string }): Promise<void> {
+  async noteSession(
+    chatId: string,
+    record: { sessionId: string; title: string; model?: string },
+  ): Promise<void> {
     const at = this.now().toISOString();
     await this.update(chatId, (binding) => {
+      const previous = binding.history.find((item) => item.sessionId === record.sessionId);
       binding.sessionId = record.sessionId;
       binding.history = [
-        { sessionId: record.sessionId, title: record.title, at },
+        {
+          sessionId: record.sessionId,
+          title: record.title,
+          at,
+          ...(record.model ?? previous?.model !== undefined
+            ? { model: record.model ?? previous?.model }
+            : {}),
+        },
         ...binding.history.filter((item) => item.sessionId !== record.sessionId),
       ].slice(0, HISTORY_LIMIT);
     });

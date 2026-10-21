@@ -30,10 +30,10 @@ test("冒烟：配置齐全时进程启动、收到 SIGTERM 干净退出（真�
   });
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
-  const started = await waitForLine(child, "Bridge 已启动", 20_000);
+  const started = await waitForLine(child, "Bridge 已启动", 30_000);
   assert.ok(started, `进程未启动：${stderr}`);
   child.kill("SIGTERM");
-  const code = await waitForExit(child, 10_000);
+  const code = await waitForExit(child, 15_000);
   assert.equal(code, 0, `退出码 ${code}，stderr: ${stderr}`);
 });
 

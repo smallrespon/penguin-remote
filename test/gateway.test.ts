@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { Gateway, BUSY_HINT } from "../src/gateway.js";
-import { LaneQueue } from "../src/lanes.js";
+import { Lanes } from "../src/lanes.js";
 import { createLogger } from "../src/logger.js";
 import { AmspClient } from "../src/penguin/amsp.js";
 import { Registry } from "../src/registry.js";
@@ -35,14 +35,14 @@ async function makeGateway(server: FakeAmspServer, channel = new FakeChannel(), 
   const gateway = new Gateway({
     config: makeConfig(),
     channel,
-    lanes: new LaneQueue(),
+    lanes: new Lanes(),
     logger: silent,
     registry,
     runLog,
-    clientFor: async ({ projectId, agentId }) =>
+    clientFor: async (agent) =>
       new AmspClient({
         baseUrl: server.baseUrl,
-        agent: `${projectId}/${agentId}`,
+        agent,
         apiKey: "penguin_test",
         fetch: server.fetch,
       }),
@@ -50,17 +50,29 @@ async function makeGateway(server: FakeAmspServer, channel = new FakeChannel(), 
   return { gateway, channel, registry, runLog, stateDir: dir };
 }
 
-/** 等下一个 run 出现，推完事件后收尾。 */
-async function completeRun(server: FakeAmspServer, events: Parameters<FakeAmspServer["push"]>[1][]) {
-  await waitFor(() => server.runs.length > 0);
-  const run = server.lastRun();
+type Events = Parameters<FakeAmspServer["push"]>[1][];
+
+/** 等下一个（新的）run 出现并返回它。 */
+async function nextRun(server: FakeAmspServer): Promise<ReturnType<FakeAmspServer["lastRun"]>> {
+  const before = server.runs.length;
+  await waitFor(() => server.runs.length > before);
+  return server.lastRun();
+}
+
+/** 给指定 run 推完事件并收尾。 */
+function finishRun(server: FakeAmspServer, run: ReturnType<FakeAmspServer["lastRun"]>, events: Events): void {
   for (const event of events) server.push(run, event);
   server.close(run);
 }
 
+/** 等下一个 run 出现，推完事件后收尾。 */
+async function completeRun(server: FakeAmspServer, events: Events): Promise<void> {
+  finishRun(server, await nextRun(server), events);
+}
+
 /** 取第 n 次 runs 请求的 input。 */
 function inputOf(server: FakeAmspServer, index: number): string {
-  const body = server.requests[index]?.body as { input?: string } | undefined;
+  const body = server.runRequests()[index]?.body as { input?: string } | undefined;
   return body?.input ?? "";
 }
 
@@ -88,8 +100,8 @@ test("最小闭环：飞书一句话 → AMSP run → 同聊天收到一条最�
   await completeRun(server, [textDelta("现在是"), textDelta("20:00"), textDone("现在是20:00"), runDone()]);
   await received;
 
-  assert.equal(server.requests.length, 1);
-  assert.deepEqual(server.requests[0]?.body, { input: "现在几点" });
+  assert.equal(server.runRequests().length, 1);
+  assert.deepEqual(server.runRequests()[0]?.body, { input: "现在几点" });
   assert.equal(channel.sent.length, 1);
   assert.match(channel.lastSent(), /现在是20:00/);
   assert.match(channel.lastSent(), /用量 42 tokens/);
@@ -102,13 +114,13 @@ test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队",
   await gateway.start();
 
   const first = channel.receive("第一个任务");
-  await waitFor(() => server.runs.length > 0);
+  const run = await nextRun(server);
   await channel.receive("第二个任务");
   assert.equal(channel.sent.length, 1);
   assert.equal(channel.lastSent(), BUSY_HINT);
-  assert.equal(server.runs.length, 1, "不应发起第二个 Run");
+  assert.equal(server.runRequests().length, 1, "不应发起第二个 Run");
 
-  await completeRun(server, [textDelta("完成"), textDone("完成"), runDone()]);
+  finishRun(server, run, [textDelta("完成"), textDone("完成"), runDone()]);
   await first;
   assert.equal(server.runs.length, 1);
 });
@@ -201,7 +213,7 @@ test("/new 后下一条消息开新会话；/sessions 与 /use 续聊", async ()
   const second = channel.receive("第二问");
   await completeRun(server, [textDone("答 2"), runDone()]);
   await second;
-  const secondBody = server.requests.at(-1)?.body as { session_id?: string };
+  const secondBody = server.runRequests().at(-1)?.body as { session_id?: string };
   assert.equal(secondBody.session_id, undefined, "/new 后不应带 session_id");
 
   // /use 2 切回第一个会话（列表新的在前）
@@ -210,7 +222,7 @@ test("/new 后下一条消息开新会话；/sessions 与 /use 续聊", async ()
   const third = channel.receive("第三问");
   await completeRun(server, [textDone("答 3"), runDone()]);
   await third;
-  const thirdBody = server.requests.at(-1)?.body as { session_id?: string };
+  const thirdBody = server.runRequests().at(-1)?.body as { session_id?: string };
   assert.equal(thirdBody.session_id, sessionId);
 });
 
@@ -229,7 +241,7 @@ test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () =>
   assert.match(channel.lastSent(), /没有正在执行/);
 
   const running = channel.receive("长任务");
-  await waitFor(() => server.runs.length > 0);
+  await nextRun(server);
   await channel.receive("/stop");
   assert.match(channel.lastSent(), /已中断/);
   await running;
@@ -287,6 +299,49 @@ test("/help 含全部命令与风险提示；未知命令与非法参数有明�
   assert.match(channel.lastSent(), /用法/);
   await channel.receive("/thinking ultra");
   assert.match(channel.lastSent(), /用法/);
+});
+
+test("Run 进行中再来消息：不排队、也不消耗这个聊天的一次性 skill", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  // 先让一个任务在跑
+  const first = channel.receive("任务一");
+  const run = await nextRun(server);
+
+  // 忙时设一次性 skill，再插一条普通消息：只提示，skill 不被消耗
+  await channel.receive("/skill lark-im");
+  await channel.receive("插嘴");
+  assert.equal(channel.lastSent(), BUSY_HINT);
+
+  finishRun(server, run, [textDone("好"), runDone()]);
+  await first;
+
+  const second = channel.receive("继续用 skill");
+  await completeRun(server, [textDone("好"), runDone()]);
+  await second;
+  assert.equal(inputOf(server, 1), formatSkillInput("lark-im", "继续用 skill"));
+});
+
+test("/status 显示上次 Run 用量；/sessions 列出模型列", async () => {
+  const server = new FakeAmspServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  const first = channel.receive("第一个任务");
+  await completeRun(server, [textDone("答 1"), runDone()]);
+  await first;
+
+  await channel.receive("/status");
+  assert.match(channel.lastSent(), /上次 Run/);
+  assert.match(channel.lastSent(), /42 tokens/);
+  assert.match(channel.lastSent(), /step-3/);
+
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /step-3/);
 });
 
 // ---- router 纯函数 ----

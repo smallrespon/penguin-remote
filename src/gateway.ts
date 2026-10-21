@@ -3,9 +3,9 @@
 
 import type { ChannelAdapter, IncomingMessage } from "./channels/types.js";
 import type { BridgeConfig } from "./config.js";
-import type { LaneQueue } from "./lanes.js";
+import type { Lanes } from "./lanes.js";
 import type { Logger } from "./logger.js";
-import type { AmspClient, AmspRunOutcome } from "./penguin/amsp.js";
+import type { AgentRef, AmspClient } from "./penguin/amsp.js";
 import { executeRun } from "./penguin/runner.js";
 import type { Registry } from "./registry.js";
 import type { RunLog } from "./runlog.js";
@@ -30,12 +30,12 @@ export interface TierController {
 export interface GatewayDeps {
   config: BridgeConfig;
   channel: ChannelAdapter;
-  lanes: LaneQueue;
+  lanes: Lanes;
   logger: Logger;
   registry: Registry;
   runLog: RunLog;
   /** 取某个 Agent 的 AMSP 客户端（内部持有对应 key）。 */
-  clientFor: (agent: { projectId: string; agentId: string }) => Promise<AmspClient>;
+  clientFor: (agent: AgentRef) => Promise<AmspClient>;
   /** owner 动态模式控制器；未注入时档位命令不可用。 */
   tiers?: TierController;
 }
@@ -109,14 +109,28 @@ export class Gateway {
         await this.handleStop(message.chatId);
         return;
       case "project":
+        await this.withTiers(message.chatId, (tiers) => tiers.listProjects());
+        return;
       case "project.select":
+        await this.withTiers(message.chatId, (tiers) => tiers.selectProject(parsed.name));
+        return;
       case "agent":
+        await this.withTiers(message.chatId, (tiers) => tiers.listAgents());
+        return;
       case "agent.select":
+        await this.withTiers(message.chatId, (tiers) => tiers.selectAgent(parsed.name));
+        return;
       case "model":
+        await this.withTiers(message.chatId, (tiers) => tiers.listModels());
+        return;
       case "model.select":
+        await this.withTiers(message.chatId, (tiers) => tiers.selectModel(parsed.name));
+        return;
       case "thinking":
+        await this.withTiers(message.chatId, (tiers) => tiers.selectThinking(parsed.level));
+        return;
       case "workspace":
-        await this.handleTier(message.chatId, parsed);
+        await this.withTiers(message.chatId, (tiers) => tiers.selectWorkspace(parsed.path));
         return;
       case "invalid":
         await this.reply(message.chatId, `⚠️ ${parsed.reason}`);
@@ -127,10 +141,27 @@ export class Gateway {
     }
   }
 
+  /** 档位命令统一入口：控制器缺失时给出明确提示。 */
+  private async withTiers(chatId: string, call: (tiers: TierController) => Promise<string>): Promise<void> {
+    const tiers = this.deps.tiers;
+    if (tiers === undefined) {
+      await this.reply(chatId, "⚠️ 档位切换未启用（owner 会话未配置）。");
+      return;
+    }
+    await this.reply(chatId, await call(tiers));
+  }
+
   // ---- Run ----
 
   private async handleRun(message: IncomingMessage, text: string): Promise<void> {
     const chatId = message.chatId;
+
+    // 忙就直接提示：不排队，也不消耗这个聊天的一次性 skill。
+    if (this.deps.lanes.isBusy(chatId)) {
+      await this.reply(chatId, BUSY_HINT);
+      return;
+    }
+
     const binding = this.deps.registry.bindingFor(chatId);
 
     // skill：一次性优先，否则粘滞；注入后清掉一次性。
@@ -142,12 +173,6 @@ export class Gateway {
     }
     const input = skill === null ? text : formatSkillInput(skill, text);
 
-    if (this.deps.lanes.isBusy(chatId)) {
-      await this.reply(chatId, BUSY_HINT);
-      return;
-    }
-
-    const startedAt = Date.now();
     const attempt = await this.deps.lanes.run(chatId, async () => {
       const client = await this.deps.clientFor({
         projectId: binding.projectId,
@@ -181,17 +206,10 @@ export class Gateway {
       await this.deps.registry.noteSession(chatId, {
         sessionId: report.sessionId,
         title: text.slice(0, 40),
+        ...(report.modelId !== null ? { model: report.modelId } : {}),
       });
     }
-    await this.deps.runLog.append({
-      chatId,
-      sessionId: report.sessionId,
-      status: report.status,
-      usageTotal: report.usageTotal,
-      requests: report.requests,
-      durationMs: Date.now() - startedAt,
-      ...(report.error !== undefined ? { error: report.error } : {}),
-    });
+    await this.deps.runLog.append(report);
   }
 
   private async safeReply(chatId: string, markdown: string): Promise<void> {
@@ -212,10 +230,14 @@ export class Gateway {
     }
     const lines = binding.history.map(
       (item, index) =>
-        `${index + 1}. ${item.title || "（无标题）"} — ${item.at.slice(0, 16).replace("T", " ")} — \`${item.sessionId}\``,
+        `${index + 1}. ${item.title || "（无标题）"} — ${item.at.slice(0, 16).replace("T", " ")}` +
+        `${item.model !== undefined ? ` — \`${item.model}\`` : ""} — \`${item.sessionId}\``,
     );
     const current = binding.sessionId === null ? "无（下一条消息新建）" : `\`${binding.sessionId}\``;
-    await this.reply(chatId, `**最近会话**（当前：${current}）\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`);
+    await this.reply(
+      chatId,
+      `**最近会话**（当前：${current}）\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`,
+    );
   }
 
   private async handleUse(chatId: string, index: number): Promise<void> {
@@ -280,6 +302,17 @@ export class Gateway {
     } else {
       lines.push("**会话状态**：尚未开始");
     }
+
+    const last = await this.deps.runLog.lastFor(chatId);
+    if (last !== null) {
+      lines.push(
+        `**上次 Run**：${last.status}` +
+          `${last.usageTotal !== null ? `，${last.usageTotal} tokens` : ""}` +
+          `，${(last.durationMs / 1000).toFixed(1)}s` +
+          `${last.modelId !== null ? `，\`${last.modelId}\`` : ""}`,
+      );
+    }
+
     if (this.deps.lanes.isBusy(chatId)) lines.push("", BUSY_HINT);
     await this.reply(chatId, lines.join("\n"));
   }
@@ -292,41 +325,5 @@ export class Gateway {
     }
     await active.abort();
     await this.reply(chatId, "🛑 已中断当前执行。");
-  }
-
-  private async handleTier(chatId: string, parsed: Command): Promise<void> {
-    const tiers = this.deps.tiers;
-    if (tiers === undefined) {
-      await this.reply(chatId, "⚠️ 档位切换未启用（owner 会话未配置）。");
-      return;
-    }
-    switch (parsed.kind) {
-      case "project":
-        await this.reply(chatId, await tiers.listProjects());
-        return;
-      case "project.select":
-        await this.reply(chatId, await tiers.selectProject(parsed.name));
-        return;
-      case "agent":
-        await this.reply(chatId, await tiers.listAgents());
-        return;
-      case "agent.select":
-        await this.reply(chatId, await tiers.selectAgent(parsed.name));
-        return;
-      case "model":
-        await this.reply(chatId, await tiers.listModels());
-        return;
-      case "model.select":
-        await this.reply(chatId, await tiers.selectModel(parsed.name));
-        return;
-      case "thinking":
-        await this.reply(chatId, await tiers.selectThinking(parsed.level));
-        return;
-      case "workspace":
-        await this.reply(chatId, await tiers.selectWorkspace(parsed.path));
-        return;
-      default:
-        await this.reply(chatId, "⚠️ 暂不支持的命令。");
-    }
   }
 }

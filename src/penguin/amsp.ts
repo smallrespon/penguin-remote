@@ -45,6 +45,17 @@ export class RunStreamError extends Error {
 export type RunInput = string | InputItem[];
 export type ApprovalDecision = "allow" | "deny";
 
+/** 一个 Agent 的坐标。 */
+export interface AgentRef {
+  projectId: string;
+  agentId: string;
+}
+
+/** AMSP 路由里的 `<projectId>/<agentId>`。 */
+export function agentPath(ref: AgentRef): string {
+  return `${ref.projectId}/${ref.agentId}`;
+}
+
 export interface AmspRunOutcome {
   sessionId: string;
   status: StopReason;
@@ -78,8 +89,8 @@ export interface AmspRun {
 
 export interface AmspClientOptions {
   baseUrl: string;
-  /** `<projectId>/<agentId>`。 */
-  agent: string;
+  /** 目标 Agent。 */
+  agent: AgentRef;
   apiKey: string;
   /** 测试注入的传输层。 */
   fetch?: typeof fetch;
@@ -87,7 +98,7 @@ export interface AmspClientOptions {
 
 export class AmspClient {
   private readonly baseUrl: string;
-  private readonly agent: string;
+  private readonly agent: AgentRef;
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch | undefined;
 
@@ -101,7 +112,7 @@ export class AmspClient {
   private client(): AgentClient {
     return new AgentClient({
       baseUrl: this.baseUrl,
-      agent: this.agent,
+      agent: agentPath(this.agent),
       apiKey: this.apiKey,
       ...(this.fetchImpl ? { fetch: this.fetchImpl } : {}),
     });
