@@ -3,6 +3,8 @@ import type { ChannelAdapter, IncomingMessage } from "../../src/channels/types.j
 export interface SentMessage {
   chatId: string;
   markdown: string;
+  /** send 返回的 message_id（后续 edit 打在它上面）。 */
+  messageId: string;
 }
 
 export interface EditedMessage {
@@ -20,6 +22,9 @@ export class FakeChannel implements ChannelAdapter {
   failSendWith: Error | null = null;
   /** 让 edit 抛出（模拟飞书编辑频率限制）。 */
   failEditWith: Error | null = null;
+  /** 单条消息允许的编辑次数上限（模拟飞书 230072）；null = 不限。 */
+  editLimitPerMessage: number | null = null;
+  private readonly editCounts = new Map<string, number>();
 
   async start(handler: (message: IncomingMessage) => void | Promise<void>): Promise<void> {
     this.handler = handler;
@@ -31,12 +36,18 @@ export class FakeChannel implements ChannelAdapter {
 
   async send(chatId: string, markdown: string): Promise<string> {
     if (this.failSendWith !== null) throw this.failSendWith;
-    this.sent.push({ chatId, markdown });
-    return `om_fake_${this.nextId++}`;
+    const messageId = `om_fake_${this.nextId++}`;
+    this.sent.push({ chatId, markdown, messageId });
+    return messageId;
   }
 
   async edit(messageId: string, markdown: string): Promise<void> {
     if (this.failEditWith !== null) throw this.failEditWith;
+    const count = (this.editCounts.get(messageId) ?? 0) + 1;
+    this.editCounts.set(messageId, count);
+    if (this.editLimitPerMessage !== null && count > this.editLimitPerMessage) {
+      throw new Error(`The message has reached the number of times it can be edited. (${messageId})`);
+    }
     this.edited.push({ messageId, markdown });
   }
 

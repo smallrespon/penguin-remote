@@ -62,8 +62,42 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   const placeholderId = await deps.channel.send(spec.chatId, PLACEHOLDER_TEXT);
 
   let degraded = false;
+  /** 已经换过一条新消息继续预览（飞书对单条消息的编辑次数有上限，见 flushOnce）。 */
+  let chained = false;
+  /** 当前承载预览的消息 id（换消息后指向新消息，定稿也编辑它）。 */
+  let liveMessageId = placeholderId;
+  /** 预览编辑串行化：避免上一次 flush 还没落地就改指向。 */
+  let flushChain: Promise<void> = Promise.resolve();
   // 每次尝试（含 429 后重开）都用新的预览状态，避免上一次的增量文本残留。
   let preview = new RunPreview(spec.preview);
+
+  /** 把当前预览写进聊天里的消息；编辑不成就换一条新消息，再失败才彻底放弃预览。 */
+  const flushOnce = async (): Promise<void> => {
+    const markdown = preview.markdown();
+    try {
+      await deps.channel.edit(liveMessageId, markdown);
+      return;
+    } catch (error: unknown) {
+      logger.warn(`预览编辑失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (chained) {
+      degraded = true;
+      logger.warn("换消息后仍编辑失败，放弃流式预览，改为最终一次性发送");
+      return;
+    }
+    // 飞书对单条消息的编辑次数有上限（实测 230072 "reached the number of times it can be edited"）。
+    // 长任务的后半程不能因此没有进度可见：换一条新消息继续承载预览。
+    try {
+      liveMessageId = await deps.channel.send(spec.chatId, markdown);
+      chained = true;
+      logger.info("预览消息编辑次数已用尽，换用新消息继续");
+    } catch (error: unknown) {
+      degraded = true;
+      logger.warn(
+        `新发预览消息失败，改为最终一次性发送：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
 
   const startRun = (): AmspRun => {
     preview = new RunPreview(spec.preview);
@@ -76,13 +110,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
         const now = Date.now();
         if (!preview.due(now)) return;
         preview.noteFlushed(now);
-        void deps.channel.edit(placeholderId, preview.markdown()).catch((error: unknown) => {
-          // 频率限制等：停止编辑，最后一次性发总结。
-          degraded = true;
-          logger.warn(
-            `预览编辑失败，降级为最终一次性发送：${error instanceof Error ? error.message : String(error)}`,
-          );
-        });
+        flushChain = flushChain.then(() => flushOnce());
       },
       // 审批：allow-all 模式下不会来；来了就按策略决定，并让用户在预览里看到结果。
       onApproval: (request, ctx) => {
@@ -117,8 +145,8 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     logger.warn(`Run 失败：${message}`);
     // 409 会话忙：转化为「进行中」提示，和其他入口一致。
     const failureText = error instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(error);
-    // 占位消息还挂在聊天里，别让它停在「思考中…」：把结局写进同一条消息。
-    await deliverFinal(deps, spec.chatId, placeholderId, failureText, degraded);
+    // 预览消息还挂在聊天里，别让它停在「思考中…」：把结局写进同一条消息。
+    await deliverFinal(deps, spec.chatId, liveMessageId, failureText, degraded);
     return {
       chatId: spec.chatId,
       sessionId,
@@ -132,7 +160,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   }
 
   logger.info(`Run 完成：${outcome.status}，session=${outcome.sessionId}`);
-  await deliverFinal(deps, spec.chatId, placeholderId, formatFinalText(outcome), degraded);
+  await deliverFinal(deps, spec.chatId, liveMessageId, formatFinalText(outcome), degraded);
 
   const modelId = await spec.client
     .session(outcome.sessionId)
