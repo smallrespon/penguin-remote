@@ -154,3 +154,37 @@ test("owner 路由：非 2xx 抛出 OwnerError 且带状态码", async () => {
     },
   );
 });
+
+test("fetchAuthed：供会话 API 复用——带 cookie 与 JSON 头，透传 method/body", async () => {
+  const fake = fakeRun("---penguin-auth-token---\ntok_1");
+  const owner = new FakeOwnerServer({
+    "POST /api/sessions/s1/tasks": { sessionId: "s1", queued: true },
+  });
+  const session = makeSession(fake, owner);
+
+  const response = await session.fetchAuthed("/sessions/s1/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input: [{ type: "text", text: "在吗" }] }),
+  });
+  assert.equal(response.status, 200);
+  const request = owner.requests.at(-1);
+  assert.equal(request?.path, "/api/sessions/s1/tasks");
+  assert.equal(request?.cookie, "penguin_session=tok_1");
+  assert.deepEqual(request?.body, { input: [{ type: "text", text: "在吗" }] });
+  // 调用方自带的 Content-Type 不被覆盖
+  assert.equal(fake.calls.length, 1, "令牌复用，不重复铸造");
+});
+
+test("fetchAuthed：401 时重铸一次再试（会话 API 的令牌过期自愈）", async () => {
+  const fake = fakeRun("---penguin-auth-token---\ntok_1");
+  const owner = new FakeOwnerServer({ "GET /api/sessions/s1": { session: { sessionId: "s1" } } });
+  owner.failNextWith(401);
+  const session = makeSession(fake, owner);
+
+  const response = await session.fetchAuthed("/sessions/s1");
+  assert.equal(response.status, 200);
+  assert.equal(fake.calls.length, 2, "401 后应重铸");
+  assert.equal(owner.requests.length, 2);
+  assert.equal(owner.requests.at(-1)?.cookie, "penguin_session=tok_1");
+});

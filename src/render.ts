@@ -1,8 +1,8 @@
-// 渲染器：AMSP 事件 → 增量 markdown（流式预览）。
+// 渲染器：Run 事件 → 增量 markdown（流式预览）。
 // 纯函数核心（applyEvent / renderPreview / shouldFlush）+ 薄状态壳 RunPreview。
 // 数据模型是单一有序的「回复分区」列表：思考、工具调用、正文、提示按 Run 的真实时序排列。
 
-import type { AmspEvent } from "@prismshadow/amsp";
+import type { RunEvent } from "./run-event.js";
 
 import { redact } from "./logger.js";
 
@@ -99,7 +99,7 @@ function truncate(text: string, limit: number): string {
 }
 
 /** 把一个 AMSP 事件折叠进预览状态（纯函数，返回新状态）。 */
-export function applyEvent(state: PreviewState, event: AmspEvent): PreviewState {
+export function applyEvent(state: PreviewState, event: RunEvent): PreviewState {
   switch (event.type) {
     case "text.delta": {
       if (event.role !== "assistant" || event.text === "") return state;
@@ -307,7 +307,7 @@ export class RunPreview {
     this.options = options;
   }
 
-  update(event: AmspEvent): void {
+  update(event: RunEvent): void {
     this.state = applyEvent(this.state, event);
   }
 
@@ -366,16 +366,25 @@ export function formatFinalText(
 /**
  * 定稿分区：流式攒下来的正文与 outcome 的正文（压空白后）一致，就按分区原样呈现，
  * 保住思考、工具与它们的时序；不一致说明 outcome 才是权威全文，换成它单独一段。
+ * outcome 没有正文时（典型：中断发生在完整文本落盘前），保留流式累积的正文——
+ * 那是当时最好的答案；连流式正文也没有，才给占位说明。
  */
 function finalParts(outcome: { text: string }, state: PreviewState): PreviewPart[] {
   const finalText = outcome.text.trim();
-  const accumulated = state.parts
-    .filter((part): part is TextPart => part.kind === "text")
-    .map((part) => part.text)
-    .join("\n\n");
-  if (finalText !== "" && squash(accumulated) === squash(finalText)) return state.parts;
-  const body = finalText === "" ? "（本轮没有文本输出）" : finalText;
-  return [...state.parts.filter((part) => part.kind !== "text"), { kind: "text", text: body, done: true }];
+  const textParts = state.parts.filter((part): part is TextPart => part.kind === "text");
+  const accumulated = textParts.map((part) => part.text).join("\n\n");
+  if (finalText !== "") {
+    if (squash(accumulated) === squash(finalText)) return state.parts;
+    return [
+      ...state.parts.filter((part) => part.kind !== "text"),
+      { kind: "text", text: finalText, done: true },
+    ];
+  }
+  if (textParts.length > 0) return state.parts;
+  return [
+    ...state.parts.filter((part) => part.kind !== "text"),
+    { kind: "text", text: "（本轮没有文本输出）", done: true },
+  ];
 }
 
 /** 面向用户的错误提示（密钥打码后）。 */

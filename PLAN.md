@@ -1,6 +1,6 @@
 # 飞书 ⇄ PenguinHarness 桥接程序 — 实施计划
 
-> 状态：**v1.0.0 已发布**（2026-10-21）。仓库 smallrespon/penguin-remote；spec 见 issue #1，tracer-bullet tickets 为 issue #2–#10（T1–T9，全部关闭）；PR #11（T1–T9）与 #12（回复分区）均已合并，tag `v1.0.0` + GitHub Release 已建；唯一剩余步骤是仓库转公开（人类在 GitHub 设置页操作，见 §14）。
+> 状态：**v1.0.0 已发布**（2026-10-21）。仓库 smallrespon/penguin-remote；spec 见 issue #1，tracer-bullet tickets 为 issue #2–#10（T1–T9，全部关闭）；PR #11（T1–T9）与 #12（回复分区）均已合并，tag `v1.0.0` + GitHub Release 已建；唯一剩余步骤是仓库转公开（人类在 GitHub 设置页操作，见 §14）。**v1.1 变更进行中**：不建 Agent + 会话走 chat 路径（不归档），见 §15 / ADR-0005。
 > 目标：通过飞书机器人 App 链接一台正在运行的 PenguinHarness，在聊天里驱动它干活。
 
 ---
@@ -123,35 +123,29 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 
 ## 4. 核心设计决策
 
-### 4.1 传输层：AMSP HTTP/SSE，而不是包一层 CLI
+### 4.1 传输层：会话 API HTTP/SSE（ADR-0005，2026-10-21 起取代 AMSP）
 
-- 选型：Bridge 直接以 HTTP 客户端调 `/api/amsp/v1`（用官方 `@prismshadow/amsp` 客户端或裸 SSE 解析），飞书侧用 lark-cli 子进程。
-- 理由：AMSP 就是官方给外部程序设计的入口；有流式、有审批、有 abort、有会话续接；跨机只需要 Base URL + key。
-- 否掉「包 `penguin run` CLI」：虽然 `penguin run --server` 支持逐次指定 `--model-id/--thinking/--workspace`，但它阻塞到任务结束、无流式、审批只能整体 allow-all，且远程场景要额外管 SSH/登录态。作为 v2 的备选运输层保留（见 4.2）。
+- 选型：Bridge 以 owner 令牌当 `penguin_session` cookie，直连 PenguinHarness 的会话 API——`POST /api/projects/:p/agents/:a/sessions` 建会话（带 model / workspace / approvalMode）、`PATCH /api/sessions/:id` 钉 thinkingLevel、订阅 `GET /api/sessions/:id/stream`（SSE）后 `POST /api/sessions/:id/tasks` 投递、`POST /api/sessions/:id/abort` 中断、`POST /api/sessions/:id/approvals/:toolCallId` 应答审批。飞书侧仍用 lark-cli 子进程。
+- 理由：这是 `penguin chat` 驱动服务器的同一条路，建出来的是**普通会话**（`source: "user"`），不进「已归档聊天」、`penguin session ls` 直接可见；且建会话接口本身就接受 model / workspace / approvalMode，档位可以按聊天隔离而不必动 Agent。
+- 否掉「保留 AMSP + 建完立刻 unarchive」：AMSP 拒绝续接非它创建的会话（校验 `client: "api"`），创建与执行无法拆成两条路；且 AMSP 没有逐次覆盖参数，档位隔离仍要建 Agent，与「不能创建 Agent」冲突。
+- v1.0 及以前用的是 AMSP（per-agent key、`/api/amsp/v1`）；它建的会话被服务端按规则归档，这正是本次切换的动因（见 ADR-0005）。
 
-### 4.2 换模型 / 换思考程度 / 换工作区 / 换 Project / 换 Agent：Owner 动态模式（已定）
+### 4.2 换模型 / 换思考程度 / 换工作区 / 换 Project / 换 Agent：按聊天存 binding（ADR-0005）
 
-**已定决策（2026-10-21）**：同机部署；owner 动态模式；私聊 + 群聊；审批模式 allow-all；额外要求支持换 project、换 agent。
+**已定决策（2026-10-21 晚，用户拍板）**：Bridge **不创建任何 Agent**，一律用配置里的默认 Agent；档位按聊天存放在 binding，只在建新会话时下发；`/agent` 保留（只切现有 Agent）；服务端遗留的专属 Agent 全部清理。
 
-这是本计划最关键的取舍，根源是 §2.1 的约束：model / thinkingLevel / workspace 是 Agent 级设置，run 请求不能逐次覆盖，且只在建新会话时生效。
-
-**Owner 动态模式（v1 采用）**
-
-- Bridge 调 owner 级路由 `PUT /api/projects/:p/agents/:a/api` 动态改 model / thinkingLevel / workspace，改完美下次 `/new`（或切换后首条消息）即用新档位开对话。
-- **凭据机制（已验证，无需密码）**：同机部署下，Bridge 直接 shell `penguin auth token`（默认 TTL 1 小时，上限 30 天）铸出一个 `via="cli"` 的会话，把它当 `penguin_session` cookie 用。源码与实测确认：该会话「行为与密码登录完全一致」，能过 owner 路由的 `requireHuman`（2026-10-21 实测：铸令牌后 PUT 设置返回 200，无 cookie 返回 401）。token 只驻内存、不落盘、不进日志，过期前重铸。
-- **全局副作用与隔离**：Agent API 设置是全局的——改一个 Agent 的 model，所有之后新建的 API 会话都用它。两个飞书聊天共用同一 Agent 会互相干扰。解法：**按聊天懒建专属 Agent**。某个聊天第一次需要非默认档位时，Bridge 用 owner 会话 `POST /api/projects/:p/agents` 建一个 `feishu_<chatId 哈希>` Agent，按需 PUT 它的 API 设置，并 `POST .../api/keys` 为它铸一个 key（AMSP 只认 key，不认 cookie）。之后这个聊天的换模型/思考/工作区都只动自己的 Agent，互不干扰。
-- **换 Project**：AMSP 路径本身带 `:projectId`，key 按 (project, agent) 发放。Bridge 用 owner 会话拉 `GET /api/projects` 列项目、`GET /api/projects/:p/agents` 列 Agent，`/project <名字>` 切项目、`/agent <名字>` 切 Agent（切 Agent = 换对话，session 按 Agent 隔离，语义正确）。
-- **换模型/思考/工作区**：`/model`、`/thinking`、`/workspace` 直接改当前绑定 Agent 的 API 设置（即时生效于下一个新会话），并回显当前值。可选档位从 Project 配置里的可用模型动态拉取（`GET /api/projects/:p/models`）。
-- **审批 allow-all 的后果**：没有任何 `approval.requested`，审批卡片链路整个变成可选（ticket T8 降为 v2）。allow-all + 群聊意味着「能被机器人接收的消息 = 全权限驱动 Agent」，访问控制只剩 allowlist 一道闸，见 §7。
-- **T8 的实际落地（2026-10-21）**：v1 不做审批卡片，`src/approvals.ts` 只保留策略接缝（`ApprovalPolicy` + 默认 `denyAll`）。若用户手动把某个 Agent 的审批模式改成 `always-ask`，Bridge 会拒绝所有审批、在流式预览里写明「已拒绝」，并在 `/agent` 切换时提前提示；`/status` 也会显示该 Agent 的审批模式。
-
-**备选（未采用，记录在案）**：Profile 池——人工预建几个配好档位的 Agent，纯 key 认证、零人类凭据，但档位组合不自由、切换粒度粗。若日后想收敛凭据，可回退此方案。
+- **档位存 binding**：`/model`、`/thinking`、`/workspace` 把值写进该聊天的 binding（Registry 持久化），不碰任何 Agent 的设置。下一条消息若需新建会话，建会话时带上这些值（model 以 `provider`+`modelId` 成对下发；thinkingLevel 建后 PATCH 钉上）。已存在的会话保持它创建时的设置——「下一新会话生效」在这里是字面语义。
+- **零互相影响**：每个聊天的档位只在自己的 binding 里，改一个聊天不影响其他聊天，也不影响默认 Agent 本身。
+- **换 Project**：`/project <名字>` 切项目；Agent 归位到默认（agentId 是项目级的），session 重置；model/thinking 随项目重置（模型目录是项目级的），workspace 保留。列表从 owner 路由 `GET /api/projects` 拉。
+- **换 Agent**：`/agent <名字>` 只在现有 Agent 间切（`GET /api/projects/:p/agents`），切完换对话（session 按 Agent 隔离）。不再需要「API 已开启 / 审批模式」检查——会话 API 不认 key，审批模式由 Bridge 在建会话时统一设 allow-all。
+- **审批 allow-all**：建会话时 `approvalMode: "allow-all"`，不产生审批请求；万一到来（服务端配置变化），按 `denyAll` 策略应答并在预览里注明（v2 再做飞书卡片）。
 
 ### 4.3 会话与「换对话」
 
-- Registry 记录每个 chat 用过的所有 session（`run.started` 回来时落盘），`/sessions` 列最近 N 条（标题取服务端生成的标题或首条消息摘要），`/use <n>` 把绑定切回该 session，下一条消息带 `session_id` 续聊。
-- 注意：AMSP 公网路由只能按 id 查单个会话，列会话靠 Bridge 自己的 Registry（OpenClaw 式「Gateway 是单一事实来源」）。
-- `/new` = 清掉当前 sessionId 绑定，下一条消息新建。
+- Registry 记录每个 chat 用过的所有 session（task 投递返回时落盘），`/sessions` 列最近 N 条（标题取服务端生成的标题或首条消息摘要），`/use <n>` 把绑定切回该 session，下一条消息继续往这个会话投递。
+- 会话列表仍靠 Bridge 自己的 Registry（OpenClaw 式「Gateway 是单一事实来源」）；会话 API 虽能按 Agent 列会话，但跨聊天/跨项目的汇总视图没有，自持更简单。
+- `/new` = 清掉当前 sessionId 绑定，下一条消息新建（新建时带上当前档位）。
+- 迁移约定：v1.0 时期 AMSP 建的会话是 `source: "api"`（已归档）。它们仍可被会话 API 续接（续了也保持归档），绑定保留、自然老化；自 ADR-0005 起新建的会话都是普通会话。
 
 ### 4.4 使用 Skill
 
@@ -167,15 +161,17 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 ### 4.5 流式预览与渲染
 
 - 每条 Run 开始：发一条占位消息（markdown，内容为「🦐 思考中…」），拿到 `message_id`。
-- AMSP 事件 → 增量文本，按「回复分区」结构渲染（格式细节见 §13）：`text.delta` 累积正文分区；`thinking.delta` 折叠成思考标签行「🧠 思考中…（n 字）」；`tool_call.done` 追加「🔧 工具名」+ 一行截断到 80 字的参数；`tool_result.done` 回填 `output:` 围栏代码块（末尾 8 行、每行 ≤100 字符）；`run.done` 收尾（状态、请求数、token 用量）。
-- 节流：每 ≥1.5s 或累积 ≥300 字符才 `messages-edit` 一次；最终定稿一次。编辑失败（频率限制）退化为「不编辑，最后一次性发总结」。
-- 交互卡片不能用 edit 更新（用 patch），所以审批卡片与文本预览分开管理。
+- **订阅先于投递**：先连 `GET /api/sessions/:id/stream`（SSE，首事件是 `task_state` 快照），再 `POST .../tasks`，保证不丢事件。
+- 事件映射（OmniMessage → 回复分区，格式细节见 §13）：`partial_text` 增量累积正文分区，完整的 assistant `text` 消息收尾；`partial_thinking`/`thinking` 折叠成思考标签行「🧠 思考中…（n 字）」；`tool_call` 追加「🔧 工具名」+ 一行截断到 80 字的参数（先 redact 后截断）；`tool_call_output` 回填 `output:` 围栏代码块（末尾 8 行、每行 ≤100 字符）；`compaction_begin` 记一条「🗜️ 正在压缩上下文…」提示分区。
+- 终局判定：`task_state` 从 running 回 idle 即 Run 结束；`request_end` 的 status（completed / aborted / fatal / retryable）与 `abort` 事件的 error_code 决定结局文案；`token_usage` 的 session 累计值做用量页脚。
+- 节流：每 ≥1.5s 或累积 ≥300 字符才 `messages-edit` 一次；最终定稿一次。编辑失败（频率限制）退化为「不编辑，最后一次性发总结」；单条消息编辑次数用尽（实测 20 次）换新消息续接预览。
+- 断流处置：SSE 中途断开不会让服务端停止任务，Bridge 显式 `POST .../abort` 中止并把该 Run 记为失败，避免僵尸任务占住会话。
 
 ### 4.6 并发与限流
 
 - Lane Queue：同一 `chatId` 串行；Run 进行中该聊天再来消息 → 回复「正在执行中，`/stop` 可中断」并丢弃（不排队，避免惊鹜）。
-- 跨聊天并行数受 Agent 的 `maxConcurrentRuns`（默认 4）限制；收到 429 按 `Retry-After` 退避重试；409（会话忙）转化为上面的进行中提示。
-- Bridge 重启 = 所有在途 Run 断流被中止 → 可接受；重启后 Registry 里的 session 仍可 `/use` 续聊。
+- 会话 API 的并发语义是「忙时入队」（`queueIfBusy`）而非 409；Bridge 的 Lane 已经保证一个聊天同时只投递一个任务，正常不会撞上。撞上就等队列自然排空（仍在同一个 SSE 订阅里守到 idle）。
+- Bridge 重启 = 所有在途 Run 的订阅断开 → 显式 abort 掉；重启后 Registry 里的 session 仍可 `/use` 续聊。
 
 ---
 
@@ -187,17 +183,17 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 | `/new` | 新开会话（清 session 绑定） |
 | `/sessions` | 列出本聊天绑定过的最近 10 个会话（序号/标题/时间/模型） |
 | `/use <n>` | 切到第 n 个会话 |
-| `/project` / `/project <名字>` | 列出（owner 会话拉 `GET /api/projects`）/ 切换项目；切项目 = 换 Agent = 换对话 |
+| `/project` / `/project <名字>` | 列出（owner 会话拉 `GET /api/projects`）/ 切换项目；切项目 = Agent 归位默认 + 换对话（session 按 Agent 隔离） |
 | `/agent` / `/agent <名字>` | 列出（`GET /api/projects/:p/agents`）/ 切换 Agent；切 Agent = 换对话（session 按 Agent 隔离） |
-| `/model <名字>` | 改当前绑定 Agent 的 API 设置里的 model，下一新会话生效 |
-| `/thinking <level>` | 改当前绑定 Agent 的 thinkingLevel，下一新会话生效 |
-| `/workspace <路径或名字>` | 改当前绑定 Agent 的 workspace，下一新会话生效 |
+| `/model <名字>` | 把模型写进本聊天 binding，下一新会话生效 |
+| `/thinking <level>` | 把思考档位写进本聊天 binding，下一新会话生效 |
+| `/workspace <路径或名字>` | 把工作区写进本聊天 binding，下一新会话生效 |
 | `/skill <名字> [on\|off]` | 一次性 / 粘滞 / 关闭 |
-| `/status` | 当前绑定（project/agent/模型/思考/工作区）+ 会话状态（`GET /sessions/:id`）+ 上次用量 |
-| `/stop` | 中断当前 Run |
+| `/status` | 当前绑定（project/agent/会话/本聊天档位）+ 会话状态（`GET /api/sessions/:id`）+ 上次用量 |
+| `/stop` | 中断当前 Run（`POST /api/sessions/:id/abort`） |
 | （无命令） | 普通文本 → 直接作为 Run 输入 |
 
-`/model`、`/thinking`、`/workspace` 的可选值从 Project 配置动态拉取（`GET /api/projects/:p/models`），不写死。首次在某聊天里改档位时，Bridge 自动为该聊天建专属 Agent（`feishu_<chatId 哈希>`）并铸 key，避免全局设置互相干扰（见 §4.2）。
+`/model`、`/thinking`、`/workspace` 的可选值从 Project 配置动态拉取（`GET /api/projects/:p/models`），不写死。档位只写本聊天的 binding，建新会话时下发，不建 Agent、不动共享 Agent（见 §4.2 / ADR-0005）。
 
 `/model` 列表取舍：模型目录实测有五百多个（2026-10-21 是 524 个，还在涨），全列会把飞书消息撑爆，因此**列表只展示前 30 个并注明总数**；匹配切换不受此限（`provider/modelId`、裸 `modelId`、displayName 全量匹配，唯一命中即切换）。这是对 §12「动态列全部」的有意 UX 取舍。
 
@@ -211,22 +207,20 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 ```
 state/
-├── bindings.json     # { "<chatId>": { projectId, agentId, sessionId, skill?, skillSticky?, history: [{sessionId, title, at, model?, projectId?, agentId?}], updatedAt } }
-├── runs.jsonl        # 每次 run 一行：chatId/sessionId/status/usage/耗时（审计与成本）
-└── agents.json       # Bridge 创建的专属 Agent 与 key 的登记：{ "<projectId>/<agentId>": { chatId, keyId, createdAt } }
+├── bindings.json     # { "<chatId>": { projectId, agentId, sessionId, skill?, skillSticky?, model?, thinkingLevel?, workspace?, history: [{sessionId, title, at, model?, projectId?, agentId?}], updatedAt } }
+└── runs.jsonl        # 每次 run 一行：chatId/sessionId/status/usage/耗时（审计与成本）
 ```
 
 - 原子写（tmp + rename）；启动时加载，缺文件即全新。
-- 密钥不进 state 文件：每个 Agent 的 key 铸出后只存进程内存 map（`agentId → key`），落盘的只有 keyId 与 Agent 归属；进程重启后按 keyId 重新铸（`POST .../api/keys`，旧 key 可留可删）。
-- owner 会话令牌（`penguin auth token`）只驻内存，过期前重铸，不落盘、不进日志。
+- 档位（model / thinkingLevel / workspace）就在 binding 里，缺省 = 跟随 Agent 与 Project 默认；换 Project 时重置 model/thinking（模型目录是项目级的），workspace 保留。
+- 迁移：v1.0 遗留的、agentId 为 `feishu_*` 专属 Agent 的绑定，加载时归位到默认 Agent。
+- owner 会话令牌（`penguin auth token`）只驻内存，过期前重铸，不落盘、不进日志。Bridge 不持有任何 per-agent key。
 
 ---
 
 ## 7. 安全设计
 
-- **密钥分两类管**：
-  - Agent API key（AMSP 用）：Bridge 自铸、只驻内存，日志对 `penguin_` 打码；
-  - owner 会话令牌：`penguin auth token` 现铸现用，TTL 1h（可按需调大），过期重铸；全程不落盘。
+- **密钥只有一类**：owner 会话令牌（`penguin auth token` 现铸现用，TTL 1h，过期重铸；全程不落盘、不进日志）。ADR-0005 起 Bridge 不再铸造、不持有任何 per-agent key。
 - **访问控制（已定：开放）**：访问范围定为「任何能与机器人对话的人」，不设 allowlist——用户已确认接受这个暴露面。配套措施：群聊仍需 @ 机器人才响应（防误触发）；`/help` 回复里常驻一句风险提示；README 用显眼位置写明「任何能给机器人发消息的人都能全权限驱动 Agent」。allowlist 代码保留为配置项（默认空=开放），想收紧时填几个 chat_id 即可。
 - **远端暴露**：已定同机部署，server 保持回环监听即可，零暴露。若哪天改跨机：`penguin server --host 0.0.0.0`（或反代 + HTTPS），并把 key 当密码管理；不要开 keyless。
 - **高危操作可见性**：allow-all 模式下工具调用直接执行，飞书侧靠流式预览展示 `tool_call`/`tool_result`（截断显示），`runs.jsonl` 留审计轨迹。
@@ -251,17 +245,19 @@ state/
 │   ├── router.ts            # 命令解析与分发
 │   ├── lanes.ts             # 按 chatId 串行队列
 │   ├── registry.ts          # bindings 持久化
-│   ├── penguin/owner.ts     # owner 会话：penguin auth token 铸/换 + settings/keys/agents 路由
-│   ├── penguin/agents.ts    # Agent 与 key 的供给：懒建专属 Agent、key 内存管理、项目/Agent 清单
-│   ├── penguin/amsp.ts      # AMSP 客户端封装（runs/abort/session；approvals 留接口）
-│   ├── penguin/runner.ts    # 单次 Run 生命周期（订阅→渲染→审批→收尾）
-│   ├── render.ts            # AMSP 事件 → 增量 markdown
-│   └── approvals.ts         # 审批卡片构建与回调
+│   ├── penguin/owner.ts     # owner 会话：penguin auth token 铸/换 + settings/agents 路由 + fetchAuthed（供会话 API 复用）
+│   ├── penguin/sessions.ts  # 会话 API 客户端（建会话/PATCH/SSE 订阅/tasks/abort/approvals，ADR-0005）
+│   ├── penguin/omni.ts      # OmniMessage → RunEvent 翻译 + RunTracker（终局/用量/正文）
+│   ├── penguin/runner.ts    # 单次 Run 生命周期（续接或新建会话→订阅→投递→守终局→定稿）
+│   ├── run-event.ts         # Bridge 自有 RunEvent 联合类型（渲染层只认这套）
+│   ├── render.ts            # RunEvent → 增量 markdown
+│   └── approvals.ts         # 审批策略接缝（v1 默认一律拒绝）
 ├── state/                   # 运行时状态（bindings.json / runs.jsonl）
 └── scripts/start.sh         # 前台启动；systemd unit 另附
 ```
 
-- 部署：`scripts/start.sh`（`node --enable-source-maps dist/index.js`）+ 可选 systemd user unit；日志滚动到 `logs/`。
+- 部署：`scripts/start.sh`（`node --enable-source-maps dist/src/index.js`）+ 可选 systemd user unit；日志滚动到 `logs/`。
+- 代码结构为 v1.1 现状（ADR-0005 起无 amsp.ts / agents.ts，运行时零依赖）；v1.0 的 AMSP 传输与专属 Agent 供给已删，历史描述以上方各节与 §15 为准。
 
 ---
 
@@ -424,3 +420,25 @@ v1.0.0 发布清单与唯一剩余步骤。
 **唯一剩余步骤（人类操作）**：GitHub 仓库设置页把 `smallrespon/penguin-remote` 从 Private 改为 Public。除此之外无未决项。
 
 **后续可选（不阻塞发布）**：审批卡片闭环（v2，§4.2）；按工具定制投影与 diff 渲染（`docs/research/zcode-reply-structure.md` 第 8 节）；Agent 回收脚本（§11 风险 5）。
+
+---
+
+## 15. v1.1：不建 Agent + 会话走 chat 路径（2026-10-21，ADR-0005）
+
+**动因（用户原话）**：「不能创建 agent，默认用默认 agent；更换 workspace 后会更换 agent 这个不行，每个配置都是单独的，不能互相影响；对话的创建用 chat 命令，用 chat 我想要不归档的。」
+
+**根因**：v1.0 的档位隔离靠「按聊天懒建专属 Agent」——AMSP 没有逐次覆盖参数，model / thinkingLevel / workspace 是 Agent 级设置。副作用正是用户看到的：改一次档位就换 Agent、Agent 数量随聊天增长、404 事故（登记残留）的温床；且 AMSP 建的会话 `source: "api"`，被服务端按规则归档。
+
+**落地清单**（用户 2026-10-21 拍板 5 项：传输切换 / 档位存 binding / `/agent` 保留 / 清理残留 / 旧绑定保留续接）：
+
+| # | 项 | 落点 |
+|---|----|------|
+| 1 | 传输层换会话 API（建会话 / PATCH thinking / SSE 订阅 / tasks / abort / approvals），删 `src/penguin/amsp.ts` 与 `@prismshadow/amsp` 依赖 | `src/penguin/sessions.ts`、`src/penguin/runner.ts` |
+| 2 | Bridge 自有 RunEvent 联合类型，OmniMessage → RunEvent 翻译器（纯函数） | `src/run-event.ts`、`src/render.ts` 改导入 |
+| 3 | Binding 加 `model` / `thinkingLevel` / `workspace`；加载时把 `feishu_*` 绑定迁回默认 Agent | `src/registry.ts` |
+| 4 | 档位命令改写 binding；`/project` 切项目重置 model/thinking、保留 workspace；删 `approvalWarning` | `src/tiers.ts` |
+| 5 | 配置：`OWNER_API_BASE_URL` 取代 `AMSP_BASE_URL`，删 `AMSP_API_KEY` | `src/config.ts`、`.env` |
+| 6 | 删 `src/penguin/agents.ts`、`state/agents.json`；owner.ts 暴露 `fetchAuthed`（SSE 用） | `src/penguin/owner.ts`、`src/index.ts` |
+| 7 | 真实验收后清理服务端两个遗留 `feishu_*` Agent 与 key，重启 Bridge | 运维动作 |
+
+**验收标准**：飞书发消息 → PenguinHarness 侧新建会话 `source: "user"`、`archived: false`（`penguin session ls` 不加 `-a` 可见）；服务端不再新增任何 Agent；两个聊天各自 `/workspace`、`/model` 互不影响；`/status` 显示本聊天档位；旧会话仍可 `/use` 续接。

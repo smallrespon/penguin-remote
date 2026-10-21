@@ -1,10 +1,11 @@
-// 审批（v2 可选）：allow-all 模式下服务端不会发 approval.requested，
+// 审批（v2 可选）：allow-all 模式下服务端不会发 approval_request，
 // 所以 v1 不做飞书审批卡片。这里保留接缝——策略接口 + 默认「一律拒绝」，
 // 让切到 always-ask 的 Agent 时行为明确（拒绝并可见），而不是静默挂住。
 
-import type { ApprovalDecision } from "./penguin/amsp.js";
+/** 审批决定：允许或拒绝。 */
+export type ApprovalDecision = "allow" | "deny";
 
-/** 一次审批请求（来自 AMSP 的 `approval.requested`）。 */
+/** 一次审批请求（来自会话流的 `approval_request`）。 */
 export interface ApprovalRequest {
   sessionId: string;
   toolCallId: string;

@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const VALID_ENV = {
-  AMSP_BASE_URL: "http://localhost/api/amsp/v1",
+  OWNER_API_BASE_URL: "http://localhost/api",
   DEFAULT_PROJECT_ID: "default_project",
   DEFAULT_AGENT_ID: "default_agent",
 };
@@ -16,11 +16,11 @@ const larkCliReady = spawnSync("lark-cli", ["--version"], { stdio: "ignore" }).e
 test("冒烟：缺配置时进程以非零码退出并列出全部缺失项", () => {
   const result = spawnSync(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: repoRoot,
-    env: { ...process.env, AMSP_BASE_URL: "", DEFAULT_PROJECT_ID: "", DEFAULT_AGENT_ID: "" },
+    env: { ...process.env, OWNER_API_BASE_URL: "", DEFAULT_PROJECT_ID: "", DEFAULT_AGENT_ID: "" },
     encoding: "utf8",
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /AMSP_BASE_URL/);
+  assert.match(result.stderr, /OWNER_API_BASE_URL/);
   assert.match(result.stderr, /DEFAULT_PROJECT_ID/);
   assert.match(result.stderr, /DEFAULT_AGENT_ID/);
 });

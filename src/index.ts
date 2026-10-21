@@ -5,8 +5,8 @@ import { createLogger } from "./logger.js";
 import { FeishuChannel } from "./channels/feishu.js";
 import { Lanes } from "./lanes.js";
 import { Gateway } from "./gateway.js";
-import { AgentSupply } from "./penguin/agents.js";
 import { OwnerSession } from "./penguin/owner.js";
+import { SessionClient } from "./penguin/sessions.js";
 import { Registry } from "./registry.js";
 import { RunLog } from "./runlog.js";
 import { TierCommands } from "./tiers.js";
@@ -30,22 +30,12 @@ async function main(): Promise<void> {
     refreshMarginSeconds: config.ownerTokenRefreshMarginSeconds,
     logger,
   });
-  const supply = new AgentSupply({
-    owner,
-    baseUrl: config.amspBaseUrl,
-    stateDir: config.stateDir,
-    logger,
-    // env 里的兜底 key 只对默认 Agent 生效；其他 Agent（含懒建的专属 Agent）一律自铸 key。
-    ...(config.amspApiKey !== null
-      ? {
-          staticKey: config.amspApiKey,
-          staticAgent: { projectId: config.defaultProjectId, agentId: config.defaultAgentId },
-        }
-      : {}),
+  // 会话 API 与档位清单共用同一条 owner 会话（令牌只驻内存，401 自动重铸重试）。
+  const sessions = new SessionClient({
+    fetchAuthed: (path, init) => owner.fetchAuthed(path, init),
   });
   const tiers = new TierCommands({
     owner,
-    supply,
     registry,
     logger,
     defaultAgentId: config.defaultAgentId,
@@ -58,8 +48,8 @@ async function main(): Promise<void> {
     logger,
     registry,
     runLog,
+    sessions,
     tiers,
-    clientFor: (agent) => supply.clientFor(agent),
   });
 
   const shutdown = async (signal: string): Promise<void> => {

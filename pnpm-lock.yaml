@@ -7,10 +7,6 @@ settings:
 importers:
 
   .:
-    dependencies:
-      '@prismshadow/amsp':
-        specifier: 0.2.16
-        version: 0.2.16
     devDependencies:
       '@types/node':
         specifier: ^24.10.0
@@ -186,10 +182,6 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@prismshadow/amsp@0.2.16':
-    resolution: {integrity: sha512-6OyslR2Xc+WNKHwSoyX1vGKHcdxyzIfJfcFm+F7Riu+ekAgwSOSr9JKyFvL+6bTrf1CXab35AngqPVvQFJ7qFg==}
-    engines: {node: '>=24'}
-
   '@types/node@24.19.2':
     resolution: {integrity: sha512-93d49wCWJkCyN87MxLpNN6KXPCwFw7bVUg79mGUV1OS40JGWwVCr8n61DXCSqz7CV6/VfPkb7xec7uP2M+QHWQ==}
 
@@ -304,8 +296,6 @@ snapshots:
 
   '@esbuild/win32-x64@0.28.2':
     optional: true
-
-  '@prismshadow/amsp@0.2.16': {}
 
   '@types/node@24.19.2':
     dependencies:

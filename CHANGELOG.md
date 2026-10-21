@@ -2,6 +2,23 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-10-21
+
+不建 Agent + 会话走 chat 路径（ADR-0005，supersede ADR-0002 的专属 Agent 决策）。用户原话：「不能创建 agent，默认用默认 agent；每个配置都是单独的，不能互相影响；对话的创建用 chat 命令，用 chat 我想要不归档的。」
+
+### 变更
+
+- **传输层换会话 API**：AMSP + per-agent key → owner 令牌当 cookie 的会话 API（`penguin chat` 同款路径：建会话 → SSE 订阅 → `POST tasks` 投递）。新建会话 `source: "user"`，不再被服务端按规则归档，`penguin session ls` 直接可见。删 `src/penguin/amsp.ts` 与 `@prismshadow/amsp` 依赖（运行时零依赖）。
+- **档位按聊天隔离**：`/model`、`/thinking`、`/workspace` 写进各聊天自己的 binding，建新会话时下发（model 以 `provider`+`modelId` 成对下发；thinkingLevel 建后 PATCH 钉上）；Bridge 不再创建任何 Agent，也不再改任何 Agent 的设置。换 Project 时模型/思考随项目重置，workspace 保留。
+- **Bridge 自有事件模型**：新增 `src/run-event.ts`（RunEvent 联合）与 `src/penguin/omni.ts`（OmniMessage → RunEvent 纯函数翻译 + RunTracker），终局优先级 / 用量合计 / 正文拼接语义复刻原 AMSP 客户端。
+- **`/agent` 保留**：只切现有 Agent，绝不创建。
+- **清理**：删 `src/penguin/agents.ts`、`state/agents.json`、`.env` 的 `AMSP_API_KEY`/`AMSP_BASE_URL`（改为 `OWNER_API_BASE_URL`）；加载时把 `feishu_*` 绑定迁回默认 Agent（那些会话经会话 API 实测不可达，引用置空，历史记录按归属自然过滤）。
+- **断流处置**：SSE 断流不会让服务端停止任务，显式 abort 避免僵尸任务占会话；409（会话忙）除外。
+
+### 工程
+
+- 新增 `test/registry.test.ts`（原无 registry 单测）；omni / sessions / runner / gateway / render 测试全部改走假会话 API。测试 148 个全绿，`pnpm typecheck` / `pnpm build` 通过。
+
 ## [1.0.0] - 2026-10-21
 
 首个正式版本：飞书机器人 ⇄ PenguinHarness 桥接程序（Bridge）v1 全部功能，测试 123 个全绿，飞书端到端真人验收通过。

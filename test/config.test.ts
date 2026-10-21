@@ -5,14 +5,13 @@ import { ConfigError, loadConfig } from "../src/config.js";
 import { redact } from "../src/logger.js";
 
 const VALID = {
-  AMSP_BASE_URL: "http://localhost/api/amsp/v1",
+  OWNER_API_BASE_URL: "http://localhost/api",
   DEFAULT_PROJECT_ID: "default_project",
   DEFAULT_AGENT_ID: "default_agent",
 };
 
 test("loadConfig 接受最小配置并套用默认值", () => {
   const config = loadConfig({ ...VALID });
-  assert.equal(config.amspBaseUrl, "http://localhost/api/amsp/v1");
   assert.equal(config.ownerApiBaseUrl, "http://localhost/api");
   assert.equal(config.defaultProjectId, "default_project");
   assert.equal(config.defaultAgentId, "default_agent");
@@ -29,13 +28,12 @@ test("loadConfig 接受最小配置并套用默认值", () => {
 test("loadConfig 接受自定义值并去掉基址末尾斜杠", () => {
   const config = loadConfig({
     ...VALID,
-    AMSP_BASE_URL: "http://localhost:7364/api/amsp/v1/",
+    OWNER_API_BASE_URL: "http://localhost:7364/api/",
     STATE_DIR: "/var/lib/penguin-remote",
     ALLOWLIST: " oc_xxx , ou_yyy ",
     LOG_LEVEL: "debug",
     PREVIEW_THROTTLE_MS: "800",
   });
-  assert.equal(config.amspBaseUrl, "http://localhost:7364/api/amsp/v1");
   assert.equal(config.ownerApiBaseUrl, "http://localhost:7364/api");
   assert.deepEqual(config.allowlist, ["oc_xxx", "ou_yyy"]);
   assert.equal(config.logLevel, "debug");
@@ -47,7 +45,7 @@ test("loadConfig 缺必需项时一次性列出全部缺失项并以非零语义
     () => loadConfig({}),
     (error: unknown) => {
       assert.ok(error instanceof ConfigError);
-      assert.match(error.message, /AMSP_BASE_URL/);
+      assert.match(error.message, /OWNER_API_BASE_URL/);
       assert.match(error.message, /DEFAULT_PROJECT_ID/);
       assert.match(error.message, /DEFAULT_AGENT_ID/);
       return true;
@@ -55,10 +53,10 @@ test("loadConfig 缺必需项时一次性列出全部缺失项并以非零语义
   );
 });
 
-test("loadConfig 拒绝非法值：URL、路径后缀、非法 id、坏数字、坏级别、TTL 不大于余量", () => {
+test("loadConfig 拒绝非法值：URL、非法 id、坏数字、坏级别、TTL 不大于余量", () => {
   const cases: Array<[Record<string, string>, RegExp]> = [
-    [{ ...VALID, AMSP_BASE_URL: "not-a-url" }, /不是合法 URL/],
-    [{ ...VALID, AMSP_BASE_URL: "http://localhost/api/v1" }, /路径须以/],
+    [{ ...VALID, OWNER_API_BASE_URL: "not-a-url" }, /不是合法 URL/],
+    [{ ...VALID, OWNER_API_BASE_URL: "" }, /OWNER_API_BASE_URL/],
     [{ ...VALID, DEFAULT_AGENT_ID: "bad id!" }, /非法字符/],
     [{ ...VALID, PREVIEW_THROTTLE_MS: "0" }, /正整数/],
     [{ ...VALID, PREVIEW_THROTTLE_MS: "1.5" }, /正整数/],
