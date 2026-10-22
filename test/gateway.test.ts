@@ -376,7 +376,8 @@ test("/sessions 实时列出服务端未归档会话：→ 标当前会话、标
 
   await channel.receive("/sessions");
   const text = channel.lastSent();
-  assert.match(text, /\*\*最近会话\*\*（当前：`session-remote-1`）/);
+  assert.match(text, /\*\*未归档会话\*\*（共 3 个）/);
+  assert.ok(!text.includes("显示最近"), "不超过 50 条时不加截断注明");
   assert.ok(
     text.includes("→ 1. 远程会话 第二行标题 — 2026-10-22 10:00 — `step-3` — `session-remote-1`"),
     `当前会话行首应带 →、换行拍平、时间取 lastActiveAt：${text}`,
@@ -407,6 +408,45 @@ test("/use 跳到只存在于服务端实时列表的远程会话；越界提示
   assert.equal(registry.bindingFor("oc_chat").sessionId, "session-remote-1");
 });
 
+test("/sessions 超过 50 条：头部注明总数、只显示最近 50 个，/use 只跳得动列表内的（ADR-0011）", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  // 60 个未归档会话：s60 最新、s1 最旧（lastActiveAt 每分钟一档）
+  for (let i = 1; i <= 60; i += 1) {
+    const at = new Date(Date.parse("2026-10-22T09:00:00.000Z") + i * 60_000).toISOString();
+    server.addSession({ sessionId: `s${i}`, title: `会话 ${i}`, lastActiveAt: at });
+  }
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.match(text, /\*\*未归档会话\*\*（共 60 个）/, "头部注明截断前的真实总数");
+  assert.ok(
+    text.includes("（显示最近 50 个，更早的会话未列出、暂不可 `/use` 跳转）"),
+    `超过 50 条时如实注明截断：${text}`,
+  );
+  assert.ok(text.includes("1. 会话 60"), "最新的一条排第 1");
+  assert.ok(text.includes("50. 会话 11"), "第 50 条只到倒数第 50 新的会话");
+  assert.ok(!text.includes("`s10`"), "更早的会话不列出");
+  assert.equal(
+    text.split("\n").filter((line) => /^\d+\. /.test(line)).length,
+    50,
+    "只渲染 50 行",
+  );
+  assert.match(text, /用 `\/use <序号>` 切回去续聊。/);
+
+  // /use 打的是同一份（截断后的）列表：第 50 个跳得动，第 51 个不可跳
+  await channel.receive("/use 50");
+  assert.match(channel.lastSent(), /已切回会话 `s11`/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, "s11");
+
+  await channel.receive("/use 51");
+  assert.match(channel.lastSent(), /⚠️ 没有第 51 个会话/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, "s11", "越界不动绑定");
+});
+
 test("实时列表查询失败：/sessions 与 /use 退回本地历史并首行注明", async () => {
   const server = new FakeSessionServer();
   server.defaultScript = happyScript("答 1");
@@ -425,7 +465,7 @@ test("实时列表查询失败：/sessions 与 /use 退回本地历史并首行�
   const text = channel.lastSent();
   assert.ok(text.startsWith("⚠️ 实时列表查询失败，显示本地历史"), `首行应注明兜底：${text}`);
   assert.ok(text.includes(sessionId), "仍列出本地历史会话");
-  assert.ok(text.includes("**最近会话**"), "兜底渲染沿用现有版式");
+  assert.ok(text.includes("**未归档会话**"), "兜底渲染与实时同版式");
 
   server.nextListStatus = 500;
   await channel.receive("/use 1");

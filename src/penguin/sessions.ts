@@ -1,7 +1,7 @@
 // 会话 API 客户端：Bridge 与 PenguinHarness 之间的唯一传输层（ADR-0005）。
 // 走 `penguin chat` 同款路径——owner 令牌当 penguin_session cookie：
 //   建会话 POST /api/projects/:p/agents/:a/sessions（普通会话，不归档）
-//   列表   GET  /api/projects/:p/agents/:a/sessions（未归档过滤在客户端，ADR-0008）
+//   列表   GET  /api/projects/:p/agents/:a/sessions（未归档过滤在客户端；条数不截断，ADR-0011）
 //   钉思考 PATCH /api/sessions/:id
 //   订阅   GET  /api/sessions/:id/stream（SSE）
 //   投递   POST /api/sessions/:id/tasks
@@ -52,9 +52,6 @@ export interface SessionListItem {
   lastActiveAt: string | null;
   modelId: string | null;
 }
-
-/** 会话列表条数上限（与 Registry 的 HISTORY_LIMIT 一致：兜底本地历史也用这个数）。 */
-export const SESSION_LIST_LIMIT = 10;
 
 export interface TaskStartResult {
   /** 实际承载任务的会话 id（自愈改名后与请求的 id 不同）。 */
@@ -260,9 +257,10 @@ export class SessionClient {
   }
 
   /**
-   * 当前 (project, agent) 下的会话列表（ADR-0008）。服务端返回全部会话（含已归档），
-   * 未归档过滤 / lastActiveAt 倒序 / 截断都在客户端做——与 `penguin session ls` 同口径。
-   * 远程（Web / CLI / 其他客户端）新建的未归档会话因此也可见、可跳。
+   * 当前 (project, agent) 下的**全部**未归档会话（ADR-0008 / ADR-0011）。服务端返回全部
+   * 会话（含已归档），未归档过滤 / lastActiveAt 倒序在客户端做；条数不再截断——展示层
+   * （网关）自己决定截断到多少并注明总数。远程（Web / CLI / 其他客户端）新建的未归档
+   * 会话因此也可见、可跳。
    */
   async listSessions(projectId: string, agentId: string): Promise<SessionListItem[]> {
     const data = await this.request<{ sessions?: unknown }>(
@@ -292,7 +290,8 @@ export class SessionClient {
       if (left === right) return 0;
       return left < right ? 1 : -1;
     });
-    return items.slice(0, SESSION_LIST_LIMIT);
+    // ADR-0011：不做条数截断，全部未归档会话交给调用方（展示截断在网关层）
+    return items;
   }
 
   /**

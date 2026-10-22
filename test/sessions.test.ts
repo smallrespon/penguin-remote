@@ -15,6 +15,11 @@ function client(server: FakeSessionServer): SessionClient {
   return new SessionClient({ fetchAuthed: server.fetchAuthed });
 }
 
+/** 第 i 分钟的 ISO 时间戳（基准 + i 分钟，i 可以很大也不会分钟越界）。 */
+function at(i: number): string {
+  return new Date(Date.parse("2026-10-22T09:00:00.000Z") + i * 60_000).toISOString();
+}
+
 test("createSession：成对下发 model、带 workspace 与 allow-all", async () => {
   const server = new FakeSessionServer();
   const info = await client(server).createSession("default_project", "default_agent", {
@@ -207,16 +212,23 @@ test("listSessions：按 (project, agent) 隔离，别的 Agent 的会话看不�
   );
 });
 
-test("listSessions：截断到 10 条（与 HISTORY_LIMIT 一致）", async () => {
+test("listSessions：不截断，返回全部未归档会话（ADR-0011，截断移到网关展示层）", async () => {
   const server = new FakeSessionServer();
-  for (let i = 1; i <= 12; i += 1) {
-    server.addSession({ sessionId: `s${i}`, lastActiveAt: `2026-10-22T09:${String(i).padStart(2, "0")}:00.000Z` });
+  for (let i = 1; i <= 60; i += 1) {
+    server.addSession({ sessionId: `s${i}`, lastActiveAt: at(i) });
   }
+  server.addSession({ sessionId: "s_notime" }); // 缺 lastActiveAt：排最后
+  server.addSession({ sessionId: "s_archived", archived: true, lastActiveAt: at(61) }); // 已归档：不返回
 
   const items = await client(server).listSessions("default_project", "default_agent");
-  assert.equal(items.length, 10);
-  assert.equal(items[0]?.sessionId, "s12", "最新的在前");
-  assert.equal(items[9]?.sessionId, "s3", "只保留最近 10 条");
+  assert.equal(items.length, 61, "超过旧的 10 条上限也全部返回（含缺时间的那条）");
+  assert.equal(items[0]?.sessionId, "s60", "最新的在前");
+  assert.equal(items[59]?.sessionId, "s1", "最旧的未归档会话也在");
+  assert.equal(items[60]?.sessionId, "s_notime", "缺 lastActiveAt 的排最后");
+  assert.ok(
+    !items.some((item) => item.sessionId === "s_archived"),
+    "已归档会话仍不返回",
+  );
 });
 
 test("listSessions：响应缺 sessions 字段（或条目畸形）时给空列表", async () => {

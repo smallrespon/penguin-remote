@@ -58,6 +58,12 @@ interface SessionListEntry {
 /** 列表查询失败时的兜底注明（ADR-0008：结果不丢，老行为降级为兜底）。 */
 const LIVE_LIST_FALLBACK_NOTE = "⚠️ 实时列表查询失败，显示本地历史";
 
+/**
+ * 会话列表展示层截断（ADR-0011）：服务端实时列表返回全部未归档会话，这里只限制
+ * 「展示出来、且 /use 跳得到」的条数；总数在回复头部注明，超出的更早会话不可跳。
+ */
+const SESSION_DISPLAY_LIMIT = 50;
+
 /** 标题拍平（服务端标题可能含换行）后截断到 40 字；空标题给占位。 */
 const TITLE_MAX_CHARS = 40;
 
@@ -302,38 +308,36 @@ export class Gateway {
   /**
    * /sessions 与 /use 共用的列表来源（ADR-0008）：实时查服务端当前 (project, agent) 下的
    * 未归档会话；查询失败（网络错误 / 非 2xx）时退回 Registry 本地历史，调用方负责注明。
+   * ADR-0011：实时路径返回全量未归档会话，这里统一截断到展示条数——/use 只允许跳到列表里
+   * 看得见的会话，未列出的更早会话不可跳；total 是截断前的真实总数，供回复头部注明。
+   * 本地兜底路径保持原有口径（Registry 的 HISTORY_LIMIT=10），不假装全量。
    */
-  private async sessionListFor(chatId: string): Promise<{ entries: SessionListEntry[]; live: boolean }> {
+  private async sessionListFor(chatId: string): Promise<{ entries: SessionListEntry[]; total: number; live: boolean }> {
     const binding = this.deps.registry.bindingFor(chatId);
     try {
       const items = await this.deps.sessions.listSessions(binding.projectId, binding.agentId);
-      return {
-        entries: items.map((item) => ({
-          sessionId: item.sessionId,
-          title: item.title,
-          at: item.lastActiveAt,
-          model: item.modelId,
-        })),
-        live: true,
-      };
+      const entries = items.map((item) => ({
+        sessionId: item.sessionId,
+        title: item.title,
+        at: item.lastActiveAt,
+        model: item.modelId,
+      }));
+      return { entries: entries.slice(0, SESSION_DISPLAY_LIMIT), total: entries.length, live: true };
     } catch (error: unknown) {
       const text = redact(error instanceof Error ? error.message : String(error));
       this.logger.warn(`实时会话列表查询失败，改用本地历史：${text}`);
-      return {
-        entries: this.deps.registry.sessionsFor(binding).map((item) => ({
-          sessionId: item.sessionId,
-          title: item.title,
-          at: item.at,
-          model: item.model ?? null,
-        })),
-        live: false,
-      };
+      const entries = this.deps.registry.sessionsFor(binding).map((item) => ({
+        sessionId: item.sessionId,
+        title: item.title,
+        at: item.at,
+        model: item.model ?? null,
+      }));
+      return { entries: entries.slice(0, SESSION_DISPLAY_LIMIT), total: entries.length, live: false };
     }
   }
 
   private async handleSessions(chatId: string): Promise<void> {
-    const binding = this.deps.registry.bindingFor(chatId);
-    const { entries, live } = await this.sessionListFor(chatId);
+    const { entries, total, live } = await this.sessionListFor(chatId);
     if (entries.length === 0) {
       // 实时为空 = 没有未归档会话（可能都已归档）；本地为空才是「没有历史会话」。
       const empty =
@@ -343,9 +347,14 @@ export class Gateway {
       await this.reply(chatId, empty);
       return;
     }
+    const binding = this.deps.registry.bindingFor(chatId);
     const lines = entries.map((entry, index) => sessionLine(entry, index, binding.sessionId));
-    const current = binding.sessionId === null ? "无（下一条消息新建）" : `\`${binding.sessionId}\``;
-    const body = `**最近会话**（当前：${current}）\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
+    // ADR-0011：头部注明截断前的真实总数；超出展示条数时如实说明更早的会话未列出、暂不可跳。
+    const truncationNote =
+      total > SESSION_DISPLAY_LIMIT
+        ? `\n（显示最近 ${SESSION_DISPLAY_LIMIT} 个，更早的会话未列出、暂不可 \`/use\` 跳转）`
+        : "";
+    const body = `**未归档会话**（共 ${total} 个）${truncationNote}\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
     await this.reply(chatId, withFallbackNote(live, body));
   }
 

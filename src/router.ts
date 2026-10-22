@@ -6,7 +6,7 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 /** 命令清单：帮助文本的唯一事实来源。 */
 const COMMANDS: ReadonlyArray<{ usage: string; summary: string }> = [
   { usage: "/new", summary: "新开会话（上下文干净）" },
-  { usage: "/sessions", summary: "列出本聊天最近用过的会话" },
+  { usage: "/sessions", summary: "实时列出当前 Project/Agent 下未归档的会话（最近 50 条，注明总数）" },
   { usage: "/use <序号>", summary: "切回某个旧会话续聊" },
   { usage: "/project", summary: "列出 / 切换 Project（`/project <名字>`）" },
   { usage: "/agent", summary: "列出 / 切换 Agent（`/agent <名字>`）" },
