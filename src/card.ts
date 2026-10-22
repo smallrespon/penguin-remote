@@ -1,0 +1,225 @@
+// 飞书交互卡片（Card 2.0）构建：Run 回复的卡片版渲染器。
+// 与 render.ts 的文本版同源——同一批分区（定稿走 finalParts，保证答案不丢）、
+// 同一套预算装配思路（超预算先整块丢中间分区，展不开再段内截断），只是载体不同。
+// 结构按 lark-cli 实测可发送、可 patch 的形态组织：工具调用放进默认收起的折叠面板。
+
+import type { PreviewPart, PreviewState, ToolPart } from "./render.js";
+import { finalParts, fencedOutput, thoughtLabel } from "./render.js";
+
+/** 整卡 JSON.stringify 后的字符预算：飞书 patch 上限 30KB，留余量。 */
+export const CARD_BUDGET_CHARS = 20000;
+
+/** 飞书单卡元素个数硬上限；丢分区的逻辑顺带覆盖，这里兜底。 */
+const MAX_ELEMENTS = 200;
+
+/** 标题模板色（Card 2.0 header.template 取值）。 */
+export type CardTemplate = "blue" | "green" | "red";
+
+/** markdown 元素：正文与提示原样展开；思考标签与面板内容用小字（notation）。 */
+export interface MarkdownElement {
+  tag: "markdown";
+  content: string;
+  text_size?: "notation";
+}
+
+/** 可折叠面板：工具调用的载体，默认收起，标题带名称与参数。 */
+export interface CollapsiblePanelElement {
+  tag: "collapsible_panel";
+  expanded: boolean;
+  header: { title: MarkdownElement };
+  elements: MarkdownElement[];
+}
+
+/** Card 2.0 元素：本项目只用 markdown、hr 与可折叠面板三种。 */
+export type CardElement = MarkdownElement | { tag: "hr" } | CollapsiblePanelElement;
+
+/** Card 2.0 卡片 JSON 的结构化类型（schema / config / header / body）。 */
+export interface RunCard {
+  schema: "2.0";
+  config: { update_multi: boolean; width_mode: "default" };
+  header: { title: { tag: "plain_text"; content: string }; template: CardTemplate };
+  body: { direction: "vertical"; padding: "12px 12px 16px 12px"; elements: CardElement[] };
+}
+
+/** 定稿卡的 outcome：与 render.ts formatFinalText 的第一个参数同形。 */
+export interface RunOutcomeInput {
+  status: string;
+  text: string;
+  error?: { code: string; message: string };
+  usage: { total: number } | null;
+}
+
+/** 占位卡：Run 开始前先落地，拿到 message_id 后再 patch 成预览卡。 */
+export function placeholderCard(): RunCard {
+  return card("🦐 思考中…", "blue", []);
+}
+
+/** 预览卡：Run 进行中，按当前分区渲染（思考一行标签、工具收进面板、正文展开）。 */
+export function buildPreviewCard(state: PreviewState): RunCard {
+  return assemble("🦐 执行中…", "blue", state.parts, "preview", []);
+}
+
+/** 定稿卡：分区与文本定稿同源（finalParts），页脚带用量；未正常完成时带状态与原因。 */
+export function buildRunCard(outcome: RunOutcomeInput, state: PreviewState): RunCard {
+  const completed = outcome.status === "completed";
+  return assemble(
+    completed ? "✅ 完成" : "❌ 未正常完成",
+    completed ? "green" : "red",
+    finalParts(outcome, state),
+    "final",
+    footer(outcome),
+  );
+}
+
+/** 装配：分区 → 元素，过预算装配，再套上卡片外壳。 */
+function assemble(
+  title: string,
+  template: CardTemplate,
+  parts: PreviewPart[],
+  mode: "preview" | "final",
+  footer: CardElement[],
+): RunCard {
+  // 一个分区恰好渲染成一个元素（工具是折叠面板），所以「丢分区」就是丢元素。
+  const elements = parts.map((part) => partElement(part, mode));
+  const fits = (candidate: CardElement[]): boolean =>
+    JSON.stringify(card(title, template, [...candidate, ...footer])).length <= CARD_BUDGET_CHARS &&
+    candidate.length + footer.length <= MAX_ELEMENTS;
+  return card(title, template, [...fitBudget(elements, fits), ...footer]);
+}
+
+/** 分区 → 元素：正文与提示原样展开；思考是一行小字标签；工具进默认收起的折叠面板。 */
+function partElement(part: PreviewPart, mode: "preview" | "final"): CardElement {
+  switch (part.kind) {
+    case "text":
+      return { tag: "markdown", content: part.text };
+    case "thought":
+      return { tag: "markdown", content: thoughtLabel(part, mode), text_size: "notation" };
+    case "notice":
+      return { tag: "markdown", content: part.text };
+    case "tool":
+      return toolPanel(part);
+  }
+}
+
+/** 工具分区 → 折叠面板：标题「**🔧 名称** · `参数`」，面板里是参数与输出的围栏块。 */
+function toolPanel(part: ToolPart): CollapsiblePanelElement {
+  const args = part.args === undefined || part.args === "" ? undefined : part.args;
+  const output = part.output === undefined || part.output === "" ? undefined : part.output;
+  // 反引号会撑破标题里的行内代码与面板里的围栏，先换成单引号（与 render.ts 的 renderTool 一致）。
+  const shownArgs = args === undefined ? undefined : args.replace(/`/g, "'");
+  const title =
+    shownArgs === undefined ? `**🔧 ${part.name}**` : `**🔧 ${part.name}** · \`${shownArgs}\``;
+  const blocks: string[] = [];
+  if (shownArgs !== undefined) blocks.push(`\`\`\`json\n${shownArgs}\n\`\`\``);
+  if (output !== undefined) blocks.push(fencedOutput(output));
+  return {
+    tag: "collapsible_panel",
+    expanded: false,
+    header: { title: { tag: "markdown", content: title } },
+    elements: [
+      { tag: "markdown", content: blocks.length > 0 ? blocks.join("\n\n") : "（无详情）", text_size: "notation" },
+    ],
+  };
+}
+
+/** 定稿页脚：hr + 一行小字；未正常完成的文案与 formatFinalText 完全一致，只是载体不同。 */
+function footer(outcome: RunOutcomeInput): CardElement[] {
+  const usage = outcome.usage === null ? "用量未知" : `用量 ${outcome.usage.total} tokens`;
+  const content =
+    outcome.status === "completed"
+      ? usage
+      : `未正常完成（${outcome.status}）：${outcome.error?.message ?? outcome.error?.code ?? outcome.status}\n${usage}`;
+  return [{ tag: "hr" }, { tag: "markdown", content, text_size: "notation" }];
+}
+
+/**
+ * 预算装配（文本版 fitBudget 的卡片版）：整卡 JSON.stringify 测长（含页脚），
+ * 并防飞书单卡 200 元素的硬上限。超预算时优先从最中间整块丢分区，丢弃处插入一条 notice，
+ * 头尾均分、保尾优先——最后一个分区通常是最终答案，永不整块丢；
+ * 展不开时对头尾元素的内容做首尾对半砍并标注省略字数，保证结果不超预算。
+ */
+function fitBudget(elements: CardElement[], fits: (candidate: CardElement[]) => boolean): CardElement[] {
+  if (fits(elements)) return elements;
+  // 保留的分区数从多到少试，头尾均分；第一个放得下的就是答案。
+  for (let kept = elements.length - 1; kept >= 2; kept--) {
+    const head = Math.ceil(kept / 2);
+    const tail = kept - head;
+    const candidate = [
+      ...elements.slice(0, head),
+      dropNotice(elements.length - kept),
+      ...elements.slice(elements.length - tail),
+    ];
+    if (fits(candidate)) return candidate;
+  }
+  // 展不开两个分区：开头元素最多拿一半预算，剩下的都给结尾元素段内截断。
+  return capElements(elements, fits);
+}
+
+/** 丢分区处的标注：与 render.ts fitBudget 的 marker 同文案。 */
+function dropNotice(dropped: number): CardElement {
+  return { tag: "markdown", content: `……（中间省略 ${dropped} 个分区）……` };
+}
+
+/**
+ * 展不开（连头尾两个分区都放不下）时的段内截断：开头元素最多拿一半预算，
+ * 剩余给结尾元素；单分区时全部预算给它。JSON 转义会让字符数膨胀，
+ * 按原始字符预算砍完重测，仍超预算就整体对半收紧，直到放得下。
+ */
+function capElements(elements: CardElement[], fits: (candidate: CardElement[]) => boolean): CardElement[] {
+  const first = elements[0];
+  if (first === undefined) return elements;
+  const last = elements.at(-1) ?? first;
+  const single = elements.length === 1;
+  const dropped = elements.length - 2;
+  const middle = dropped > 0 ? [dropNotice(dropped)] : [];
+  for (let budget = CARD_BUDGET_CHARS; budget > 0; budget = Math.floor(budget / 2)) {
+    const cappedFirst = capElement(first, single ? budget : Math.floor(budget / 2));
+    const tailBudget = budget - contentLength(cappedFirst);
+    const candidate = single ? [cappedFirst] : [cappedFirst, ...middle, capElement(last, tailBudget)];
+    if (fits(candidate)) return candidate;
+  }
+  // 防御：空内容的骨架卡片本身远小于预算，理论上到不了这里。
+  return single ? [capElement(first, 0)] : [capElement(first, 0), ...middle, capElement(last, 0)];
+}
+
+/** 元素的原始内容字符数（JSON 测长前的口径）：markdown 看 content，折叠面板看面板内容。 */
+function contentLength(element: CardElement): number {
+  if (element.tag === "markdown") return element.content.length;
+  if (element.tag === "collapsible_panel") {
+    return element.elements.reduce((total, item) => total + item.content.length, 0);
+  }
+  return 0;
+}
+
+/** 段内截断单个元素的内容：首尾对半砍、中间标注省略字数（与 render.ts 的 capBlock 同算法）。 */
+function capElement(element: CardElement, budget: number): CardElement {
+  if (element.tag === "markdown") return { ...element, content: capContent(element.content, budget) };
+  if (element.tag === "collapsible_panel") {
+    return {
+      ...element,
+      elements: element.elements.map((item) => ({ ...item, content: capContent(item.content, budget) })),
+    };
+  }
+  return element;
+}
+
+/** 内容超预算：首尾对半砍、中间标注省略字数；结果保证不超过预算。 */
+function capContent(content: string, budget: number): string {
+  if (budget <= 0) return "";
+  if (content.length <= budget) return content;
+  const omitted = content.length - budget;
+  const note = `…（中间省略 ${omitted} 字）…`;
+  const half = Math.floor((budget - note.length - 4) / 2); // 4 = 标注两边的 "\n\n"
+  if (half <= 0) return `${content.slice(0, budget - 1)}…`;
+  return `${content.slice(0, half)}\n\n${note}\n\n${content.slice(-half)}`;
+}
+
+/** 卡片外壳：header 用 plain_text 标题 + 模板色，body 纵向排列。 */
+function card(title: string, template: CardTemplate, elements: CardElement[]): RunCard {
+  return {
+    schema: "2.0",
+    config: { update_multi: true, width_mode: "default" },
+    header: { title: { tag: "plain_text", content: title }, template },
+    body: { direction: "vertical", padding: "12px 12px 16px 12px", elements },
+  };
+}
