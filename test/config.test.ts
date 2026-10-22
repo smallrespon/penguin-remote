@@ -53,6 +53,18 @@ test("loadConfig 缺必需项时一次性列出全部缺失项并以非零语义
   );
 });
 
+test("loadConfig：AMWH_RENDER_SCRIPT 缺省为 null（关闭自动渲染），配置后生效，空白视为 null", () => {
+  assert.equal(loadConfig({ ...VALID }).amwhRenderScript, null);
+  assert.equal(
+    loadConfig({ ...VALID, AMWH_RENDER_SCRIPT: "/opt/am.mjs" }).amwhRenderScript,
+    "/opt/am.mjs",
+  );
+  assert.equal(loadConfig({ ...VALID, AMWH_RENDER_SCRIPT: "   " }).amwhRenderScript, null);
+  assert.equal(loadConfig({ ...VALID, AMWH_RENDER_SCRIPT: "" }).amwhRenderScript, null);
+  // 可选项不参与 problems：配了坏值也不该让启动失败
+  assert.equal(loadConfig({ ...VALID, AMWH_RENDER_SCRIPT: "not-a-path" }).amwhRenderScript, "not-a-path");
+});
+
 test("loadConfig 拒绝非法值：URL、非法 id、坏数字、坏级别、TTL 不大于余量", () => {
   const cases: Array<[Record<string, string>, RegExp]> = [
     [{ ...VALID, OWNER_API_BASE_URL: "not-a-url" }, /不是合法 URL/],

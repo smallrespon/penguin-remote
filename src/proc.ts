@@ -14,11 +14,11 @@ export interface RunResult {
 export function runCommand(
   bin: string,
   args: string[],
-  opts: { input?: string; timeoutMs?: number } = {},
+  opts: { input?: string; timeoutMs?: number; env?: Record<string, string | undefined> } = {},
 ): Promise<RunResult> {
-  const { input, timeoutMs = 30_000 } = opts;
+  const { input, timeoutMs = 30_000, env } = opts;
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], ...(env !== undefined ? { env } : {}) });
     let stdout = "";
     let stderr = "";
     let settled = false;

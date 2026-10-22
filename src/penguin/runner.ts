@@ -5,6 +5,9 @@
 // 占位 / 预览 / 定稿都承载为交互卡片（ADR-0006），卡片发送或更新失败时整体退回文本链路。
 
 import type { ChannelAdapter, OutboundMessage } from "../channels/types.js";
+import { basename, dirname } from "node:path";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import type { ApprovalPolicy } from "../approvals.js";
 import { denyAll } from "../approvals.js";
 import { redact } from "../logger.js";
@@ -17,8 +20,11 @@ import {
   RunPreview,
   formatFinalText,
   formatRunFailure,
+  type FinalOutcome,
   type PreviewOptions,
+  type PreviewState,
 } from "../render.js";
+import { checkPage, extractPagePaths, hasRichBlocks, renderPage, stripPageLinks, toDraft } from "../htmlpage.js";
 import type { AgentRef, ModelRef, SessionClient, TaskInputPart } from "./sessions.js";
 import { SessionBusyError } from "./sessions.js";
 import { RunTracker, isApprovalRequest, isTaskState } from "./omni.js";
@@ -50,6 +56,8 @@ export interface RunSpec {
   client: SessionClient;
   /** 流式预览节流参数。 */
   preview: PreviewOptions;
+  /** 富内容自动渲染器（answer-me-with-html 的 am.mjs，ADR-0012）；null / 缺省 = 关闭。 */
+  htmlRenderScript?: string | null;
   /** 会话就绪即回调（供 /stop 持有 abort）。 */
   onStart?: (handle: RunHandle) => void;
 }
@@ -313,11 +321,21 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   logger.info(`Run 完成：${outcome.status}，session=${sessionId}`);
   await settlePreview();
   const snapshot = preview.snapshot();
+
+  // ---- HTML 页交付（ADR-0012）----
+  // 顺序要紧：先把 Agent 产出的页面挑出来、把死链从定稿文本里剥掉，再建定稿卡——
+  // 飞书里点不动的本地链接没有意义。剥链对 outcome 全文与正文分区同构应用，
+  // 这样 finalParts 的「流式累积 vs outcome 权威全文」比较不会被单侧修改破坏。
+  const pages = await collectPages(outcome.text, logger);
+  const stripped = pages.length > 0 ? stripPageLinks(outcome.text, pages) : outcome.text;
+  const finalOutcome: FinalOutcome = pages.length > 0 ? { ...outcome, text: stripped } : outcome;
+  const finalState: PreviewState = pages.length > 0 ? stripParts(snapshot, pages) : snapshot;
   await deliverFinal(deps, spec.chatId, liveMessageId, {
     carrier,
-    card: carrier === "card" ? buildRunCard(outcome, snapshot) : null,
-    text: formatFinalText(outcome, snapshot),
+    card: carrier === "card" ? buildRunCard(finalOutcome, finalState) : null,
+    text: formatFinalText(finalOutcome, finalState),
   }, degraded);
+  await deliverPages(deps, spec, pages, stripped, logger);
 
   const modelId = await spec.client
     .sessionInfo(sessionId)
@@ -364,6 +382,93 @@ interface FinalContent {
   carrier: Carrier;
   card: RunCard | null;
   text: string;
+}
+
+/**
+ * 从定稿文本里挑出真能转发的页面（ADR-0012）：提取 → 逐个校验存在、是文件、.html、不超上限。
+ * 校验不过只记日志——页面发不出去不影响卡片定稿，结果不丢是老原则。
+ */
+async function collectPages(text: string, logger: Logger): Promise<string[]> {
+  const pages: string[] = [];
+  for (const path of extractPagePaths(text)) {
+    const check = await checkPage(path);
+    if (check.ok) {
+      pages.push(path);
+      continue;
+    }
+    logger.warn(`跳过页面 ${path}：${check.reason ?? "不可转发"}`);
+  }
+  return pages;
+}
+
+/**
+ * 剥链同构应用到正文分区：流式攒下来的正文与 outcome 的权威全文过同一个变换，
+ * 原本相等的两边变换后仍然相等，finalParts 的比较口径不被破坏。
+ */
+function stripParts(state: PreviewState, paths: readonly string[]): PreviewState {
+  return {
+    parts: state.parts.map((part) =>
+      part.kind === "text" ? { ...part, text: stripPageLinks(part.text, paths) } : part,
+    ),
+  };
+}
+
+/**
+ * 丢掉一个自动渲染出来的临时产物：删文件，顺手收掉 mkdtemp 出来的那个临时目录
+ * （只收 `os.tmpdir()` 直下一层的，绝不碰用户自己的目录）。删不掉不影响结果——
+ * 它本来就是要丢的东西。
+ */
+async function discardArtifact(path: string): Promise<void> {
+  const parent = dirname(path);
+  const ours = dirname(parent) === tmpdir();
+  try {
+    await rm(path, { force: true });
+    if (ours) await rm(parent, { recursive: true, force: true });
+  } catch {
+    // 见上
+  }
+}
+
+/**
+ * HTML 页交付（ADR-0012）：Agent 产出的页面逐个以文件消息发进聊天；一页都没产出、
+ * 配置了渲染器、且清理后的回复还含 a2ui / mermaid 围栏时，先渲染成 HTML 页再发。
+ *
+ * 全程只记日志：定稿卡已经发出去了，这里是加分项，任何一步失败都不能让 Run 收尾出事。
+ */
+async function deliverPages(
+  deps: RunDeps,
+  spec: RunSpec,
+  pages: readonly string[],
+  text: string,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const forwarded = [...pages];
+    const temporary: string[] = [];
+    const script = spec.htmlRenderScript ?? null;
+    if (forwarded.length === 0 && script !== null && hasRichBlocks(text)) {
+      try {
+        const artifact = await renderPage(toDraft(text), { script });
+        forwarded.push(artifact);
+        temporary.push(artifact);
+      } catch (error: unknown) {
+        logger.warn(`HTML 页渲染失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    for (const page of forwarded) {
+      try {
+        await deps.channel.send(spec.chatId, { kind: "file", path: page, name: basename(page) });
+      } catch (error: unknown) {
+        logger.warn(`页面发送失败（${page}）：${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        // 自动渲染的产物是临时文件，发完就删（发送失败也删，与 downloadImage 同一纪律）；
+        // Agent 自己产出的页面不归我们管，不能删。
+        if (temporary.includes(page)) await discardArtifact(page);
+      }
+    }
+  } catch (error: unknown) {
+    logger.warn(`HTML 页交付失败：${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**

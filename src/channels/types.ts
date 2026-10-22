@@ -17,8 +17,11 @@ export interface IncomingMessage {
   images: string[];
 }
 
-/** 一条出站消息：纯文本，或一张交互卡片（Card 2.0）。 */
-export type OutboundMessage = { kind: "text"; text: string } | { kind: "card"; card: RunCard };
+/** 一条出站消息：纯文本、一张交互卡片（Card 2.0），或一个文件（ADR-0012 的 HTML 页面）。 */
+export type OutboundMessage =
+  | { kind: "text"; text: string }
+  | { kind: "card"; card: RunCard }
+  | { kind: "file"; path: string; name?: string };
 
 /** Channel 适配器统一接口：收消息（onMessage）、发消息（send）、改消息（edit）。 */
 export interface ChannelAdapter {
@@ -26,7 +29,7 @@ export interface ChannelAdapter {
   start(handler: (message: IncomingMessage) => void | Promise<void>): Promise<void>;
   /** 停止消费并清理子进程。 */
   stop(): Promise<void>;
-  /** 发一条消息（文本或交互卡片），返回消息 id。 */
+  /** 发一条消息（文本、交互卡片或文件），返回消息 id。 */
   send(chatId: string, message: OutboundMessage): Promise<string>;
   /** 改一条机器人自己发出的消息（文本或交互卡片）。 */
   edit(messageId: string, message: OutboundMessage): Promise<void>;

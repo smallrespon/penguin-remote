@@ -156,6 +156,16 @@ pnpm build       # 产出 dist/
 
 实现按 `PLAN.md`（唯一事实来源）的 ticket 逐个推进，每个 ticket 内先写测试；领域词汇见 `GLOSSARY.md`，架构决策见 `docs/adr/`。
 
+## HTML 页交付
+
+飞书卡片渲染不了 mermaid 图与 a2ui 组件块。远程 Agent 用 answer-me-with-html 技能把复杂回复渲染成一页离线 HTML 时，Bridge 把页面文件作为**文件消息**发进聊天，跟在定稿卡片之后到达：
+
+- **默认转发 Agent 产出的页面**（无需配置）：定稿文本里的 `.html` 绝对路径链接——技能约定的尾链 `[页面](</abs/path.html>)`、`file://` URL、以及直接写的裸路径——校验存在、是文件、不超过 20MB 后逐个发出。被转发的链接会从定稿文本里剥掉（飞书里点不动的本地链接没有意义）；文件不存在 / 发送失败都只记日志，不影响卡片定稿。
+- **富内容自动渲染**（opt-in）：设 `AMWH_RENDER_SCRIPT` 指向渲染器（answer-me-with-html 插件技能里的 `am.mjs`），当回复含 ` ```a2ui ` 或 ` ```mermaid ` 围栏、且 Agent 没有自己产出页面时，Bridge 把回复转换成 amwh 草稿后渲染成单文件 HTML 一并发出。a2ui 的 choice / form / steps / callout / metrics / weather / clock / countdown 会映射成 amwh 的 ask / 表格 / 编号列表 / callout / 表格 / kv / kv；mermaid 只转换能无损解析的简单 flowchart 与 sequenceDiagram，出现子图、classDef、participant 等一概保留源码围栏——**宁可留源码，不产出错图**。转换与渲染失败只记日志。
+- **a2ui 交互性在飞书里丢失**：choice / form 的「页面上选择 → 复制回传」回路在文件消息里断裂，HTML 页只是静态展示；要交互仍请在飞书客户端里直接和机器人对话。
+
+渲染器由插件分发与升级，Bridge 不内置：未配置 `AMWH_RENDER_SCRIPT` 的部署没有自动渲染，但转发页面始终可用。
+
 ## 已知限制
 
 - **没有审批卡片**（v2 可选）：allow-all 模式下服务端不会发 `approval_request`。若手动把某个 Agent 的审批模式改成 `always-ask`，Bridge 会拒绝所有审批并在回复里说明，不会挂起等待。

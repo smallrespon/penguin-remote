@@ -19,6 +19,8 @@ export interface BridgeConfig {
   previewThrottleMs: number;
   previewThrottleChars: number;
   previewMaxChars: number;
+  /** 富内容自动渲染器（answer-me-with-html 的 am.mjs，ADR-0012）；null = 关闭。 */
+  amwhRenderScript: string | null;
 }
 
 /** 配置缺失或非法：消息列出全部问题，启动即失败。 */
@@ -104,6 +106,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const throttleChars = intField(env, "PREVIEW_THROTTLE_CHARS", 300, problems);
   const maxChars = intField(env, "PREVIEW_MAX_CHARS", 3500, problems);
 
+  // 可选项：没配（或只配了空白）就是关闭自动渲染，不当成配置错误。
+  const amwhRenderScript = env.AMWH_RENDER_SCRIPT?.trim() || null;
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -120,5 +125,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     previewThrottleMs: throttleMs,
     previewThrottleChars: throttleChars,
     previewMaxChars: maxChars,
+    amwhRenderScript,
   };
 }

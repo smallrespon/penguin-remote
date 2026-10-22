@@ -267,6 +267,7 @@ export class Gateway {
               throttleChars: this.deps.config.previewThrottleChars,
               maxChars: this.deps.config.previewMaxChars,
             },
+            htmlRenderScript: this.deps.config.amwhRenderScript,
             onStart: (handle) => {
               this.activeRuns.set(chatId, { abort: handle.abort });
             },

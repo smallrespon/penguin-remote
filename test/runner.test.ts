@@ -4,6 +4,10 @@
 // 卡片发送或 patch 失败时退回原有文本链路——两类承载都要覆盖。
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import { executeRun, type RunHandle } from "../src/penguin/runner.js";
@@ -493,4 +497,171 @@ test("发起 Run 日志只含文本摘要，不泄露 data URL", async () => {
   assert.equal(report.status, "completed");
   assert.ok(lines.some((line) => line.includes("发起 Run：看这张图")), `应记录文本摘要：${lines.join("\n")}`);
   assert.ok(!lines.some((line) => line.includes("data:image")), "日志不应出现 data URL");
+});
+
+// ---- T13：HTML 页交付（ADR-0012）----
+
+/** 一轮正文为 text 的正常 Run（HTML 页交付测试用：正文可控）。 */
+function textScript(text: string): Array<string | { hang: true }> {
+  return [
+    frame.taskState("idle"),
+    frame.taskState("running"),
+    frame.omni({ type: "text", role: "assistant", text, stop_reason: "completed" }),
+    frame.taskState("idle"),
+    frame.done(),
+  ];
+}
+
+/** 一个真的 .html 文件（落在一次性临时目录里，用完删）。 */
+async function makePage(name = "page.html"): Promise<{ dir: string; path: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "runner-page-"));
+  const path = join(dir, name);
+  await writeFile(path, "<html><body>页面</body></html>");
+  return { dir, path };
+}
+
+/** 假渲染器脚本：读 stdin，把 `-o` 指向的路径写成非空 HTML；exitCode 控制成败。 */
+async function makeRenderer(exitCode: number): Promise<string> {
+  const path = join(await mkdtemp(join(tmpdir(), "runner-render-")), "fake-am.mjs");
+  await writeFile(
+    path,
+    [
+      "import { writeFileSync } from \"node:fs\";",
+      "const args = process.argv.slice(2);",
+      "await new Promise((r) => { process.stdin.resume(); process.stdin.on(\"end\", r); });",
+      `if (${exitCode} !== 0) { process.stderr.write("fake render boom\\n"); process.exit(${exitCode}); }`,
+      "writeFileSync(args[args.indexOf(\"-o\") + 1], \"<html><body>渲染产物</body></html>\");",
+    ].join("\n"),
+  );
+  return path;
+}
+
+test("回复含页面链接且文件存在：定稿卡剥掉死链，并发出 file 消息", async () => {
+  const server = new FakeSessionServer();
+  const page = await makePage();
+  server.defaultScript = textScript(`结论如下。\n\n[打开页面](<${page.path}>)`);
+  const channel = new FakeChannel();
+
+  try {
+    const report = await runOnce(server, channel);
+    assert.equal(report.status, "completed");
+
+    const final = flatText(lastEdited(channel));
+    assert.ok(!final.includes("打开页面"), `死链应被剥掉：${final}`);
+    assert.ok(final.includes("结论如下。"));
+
+    const files = channel.sent.filter((s) => s.message.kind === "file");
+    assert.equal(files.length, 1);
+    assert.deepEqual(files[0]?.message, { kind: "file", path: page.path, name: "page.html" });
+  } finally {
+    await rm(page.dir, { recursive: true, force: true });
+  }
+});
+
+test("回复里的页面文件不存在：不发文件消息，定稿卡保留原样", async () => {
+  const server = new FakeSessionServer();
+  const missing = join(tmpdir(), "penguin-remote-missing-page.html");
+  server.defaultScript = textScript(`结论如下。\n\n[打开页面](<${missing}>)`);
+  const channel = new FakeChannel();
+
+  const report = await runOnce(server, channel);
+  assert.equal(report.status, "completed");
+  assert.equal(channel.sent.filter((s) => s.message.kind === "file").length, 0);
+  assert.ok(flatText(lastEdited(channel)).includes("打开页面"), "链接点不动也该让用户看见路径");
+});
+
+test("配置渲染器且回复含富围栏：自动渲染成 HTML 页并发文件消息", async () => {
+  const server = new FakeSessionServer();
+  const script = await makeRenderer(0);
+  server.defaultScript = textScript("来选一个。\n\n```a2ui\n" + JSON.stringify({
+    type: "choice",
+    question: "选哪个？",
+    options: [{ label: "甲", recommended: true }, { label: "乙" }],
+  }) + "\n```");
+  const channel = new FakeChannel();
+
+  try {
+    const report = await runOnce(server, channel, { htmlRenderScript: script });
+    assert.equal(report.status, "completed");
+
+    const files = channel.sent.filter((s) => s.message.kind === "file");
+    assert.equal(files.length, 1, "应发出一个自动渲染的页面");
+    const file = files[0]?.message;
+    assert.equal(file?.kind, "file");
+    if (file?.kind !== "file") return;
+    assert.match(file.path, /page\.html$/);
+    assert.equal(file.name, "page.html");
+    // 临时产物用后即删：文件与它所在的临时目录都不该残留
+    await waitFor(() => !existsSync(file.path));
+    assert.equal(existsSync(dirname(file.path)), false, "临时目录也该收掉");
+  } finally {
+    await rm(dirname(script), { recursive: true, force: true });
+  }
+});
+
+test("未配置渲染器：含富围栏也不渲染，不发文件消息", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = textScript("来选一个。\n\n```a2ui\n" + JSON.stringify({
+    type: "choice",
+    question: "选哪个？",
+    options: [{ label: "甲" }, { label: "乙" }],
+  }) + "\n```");
+  const channel = new FakeChannel();
+
+  await runOnce(server, channel, { htmlRenderScript: null });
+  assert.equal(channel.sent.filter((s) => s.message.kind === "file").length, 0);
+});
+
+test("渲染失败：不发文件消息，定稿卡照常发出", async () => {
+  const server = new FakeSessionServer();
+  const script = await makeRenderer(3);
+  server.defaultScript = textScript("来选一个。\n\n```a2ui\n" + JSON.stringify({
+    type: "choice",
+    question: "选哪个？",
+    options: [{ label: "甲" }, { label: "乙" }],
+  }) + "\n```");
+  const channel = new FakeChannel();
+
+  try {
+    const report = await runOnce(server, channel, { htmlRenderScript: script });
+    assert.equal(report.status, "completed");
+    assert.equal(channel.sent.filter((s) => s.message.kind === "file").length, 0);
+    assert.ok(flatText(lastEdited(channel)).includes("来选一个。"), "定稿卡不能受影响");
+  } finally {
+    await rm(dirname(script), { recursive: true, force: true });
+  }
+});
+
+test("Agent 已产出页面时不再自动渲染（不双发）", async () => {
+  const server = new FakeSessionServer();
+  const page = await makePage();
+  const script = await makeRenderer(0);
+  server.defaultScript = textScript(`结论如下。\n\n[打开页面](<${page.path}>)\n\n\`\`\`mermaid\nflowchart TD\n  A --> B\n\`\`\``);
+  const channel = new FakeChannel();
+
+  try {
+    await runOnce(server, channel, { htmlRenderScript: script });
+    const files = channel.sent.filter((s) => s.message.kind === "file");
+    assert.equal(files.length, 1, "只发 Agent 自己产出的那一页");
+    assert.deepEqual(files[0]?.message, { kind: "file", path: page.path, name: "page.html" });
+  } finally {
+    await rm(page.dir, { recursive: true, force: true });
+    await rm(dirname(script), { recursive: true, force: true });
+  }
+});
+
+test("文件消息发送失败：只记日志，定稿卡不受影响", async () => {
+  const server = new FakeSessionServer();
+  const page = await makePage();
+  server.defaultScript = textScript(`结论如下。\n\n[打开页面](<${page.path}>)`);
+  const channel = new FakeChannel();
+  channel.failSendKinds = ["file"];
+
+  try {
+    const report = await runOnce(server, channel);
+    assert.equal(report.status, "completed");
+    assert.ok(flatText(lastEdited(channel)).includes("结论如下。"));
+  } finally {
+    await rm(page.dir, { recursive: true, force: true });
+  }
 });

@@ -317,6 +317,144 @@ test("FeishuChannel 拿不到机器人身份时 start 失败（fail-fast）", as
   await assert.rejects(() => channel.start(() => {}), /open_id/);
 });
 
+// ---- T13：文件消息（ADR-0012 的 HTML 页面）----
+
+test("FeishuChannel.send 文件：先上传拿 file_key，再按 file 类型发出", async () => {
+  const fake = makeRecordingRun([
+    {
+      match: (args) => args[1] === "files",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: { file_key: "file_v3_x" } }), stderr: "" },
+    },
+    {
+      match: (args) => args[1] === "+messages-send",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: { message_id: "om_file" } }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: fake.run,
+  });
+
+  assert.equal(await channel.send("oc_chat", { kind: "file", path: "/tmp/report.html" }), "om_file");
+  assert.equal(fake.calls.length, 2, "文件消息是两条命令：上传 + 发送");
+
+  assert.deepEqual(fake.calls[0]?.args, [
+    "im",
+    "files",
+    "create",
+    "--as",
+    "bot",
+    "--data",
+    "-",
+    "--file",
+    "/tmp/report.html",
+  ]);
+  assert.equal(fake.calls[0]?.input, JSON.stringify({ file_type: "stream", file_name: "report.html" }));
+
+  assert.deepEqual(fake.calls[1]?.args, [
+    "im",
+    "+messages-send",
+    "--as",
+    "bot",
+    "--chat-id",
+    "oc_chat",
+    "--msg-type",
+    "file",
+    "--content",
+    "-",
+  ]);
+  assert.equal(fake.calls[1]?.input, JSON.stringify({ file_key: "file_v3_x" }));
+});
+
+test("FeishuChannel.send 文件：显式 name 覆盖 basename", async () => {
+  const fake = makeRecordingRun([
+    {
+      match: (args) => args[1] === "files",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: { file_key: "file_v3_x" } }), stderr: "" },
+    },
+    {
+      match: (args) => args[1] === "+messages-send",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: { message_id: "om_file" } }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: fake.run,
+  });
+
+  await channel.send("oc_chat", { kind: "file", path: "/tmp/report.html", name: "报告.html" });
+  assert.equal(fake.calls[0]?.input, JSON.stringify({ file_type: "stream", file_name: "报告.html" }));
+});
+
+test("FeishuChannel.send 文件：上传或发送任一失败都抛错，且不继续往下发", async () => {
+  const uploadFails = makeRecordingRun([
+    {
+      match: (args) => args[1] === "files",
+      result: { status: 1, stdout: JSON.stringify({ ok: false, error: { message: "file too large" } }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: uploadFails.run,
+  });
+  await assert.rejects(
+    () => channel.send("oc_chat", { kind: "file", path: "/tmp/report.html" }),
+    /上传文件消息失败（lark-cli exit=1）：file too large/,
+  );
+  assert.equal(uploadFails.calls.length, 1, "上传失败不该再发消息");
+
+  const sendFails = makeRecordingRun([
+    {
+      match: (args) => args[1] === "files",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: { file_key: "file_v3_x" } }), stderr: "" },
+    },
+    {
+      match: (args) => args[1] === "+messages-send",
+      result: { status: 1, stdout: JSON.stringify({ ok: false, error: { message: "bot not in chat" } }), stderr: "" },
+    },
+  ]);
+  const channel2 = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: sendFails.run,
+  });
+  await assert.rejects(
+    () => channel2.send("oc_chat", { kind: "file", path: "/tmp/report.html" }),
+    /发送文件消息失败（lark-cli exit=1）：bot not in chat/,
+  );
+});
+
+test("FeishuChannel.send 文件：上传没给 file_key 时抛错", async () => {
+  const fake = makeRecordingRun([
+    {
+      match: (args) => args[1] === "files",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: {} }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: fake.run,
+  });
+  await assert.rejects(
+    () => channel.send("oc_chat", { kind: "file", path: "/tmp/report.html" }),
+    /lark-cli 未返回 file_key/,
+  );
+});
+
 // ---- T9：事件流子进程守护 ----
 
 test("事件流子进程崩溃后自动重启，消息继续进 handler", async () => {

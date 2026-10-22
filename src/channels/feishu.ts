@@ -6,7 +6,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import type { ChannelAdapter, IncomingMessage, OutboundMessage } from "./types.js";
 import { runCommand, readLines, spawnManaged, type ManagedChild, type SpawnFn } from "../proc.js";
@@ -29,7 +29,7 @@ export interface FeishuChannelOptions {
 /** lark-cli 的输出信封。 */
 interface LarkEnvelope {
   ok?: boolean;
-  data?: { message_id?: string; saved_path?: string } & Record<string, unknown>;
+  data?: { message_id?: string; file_key?: string; saved_path?: string } & Record<string, unknown>;
   error?: { message?: string } & Record<string, unknown>;
 }
 
@@ -145,6 +145,15 @@ function messageIdOf(result: { data?: { message_id?: string } }): string {
   return messageId;
 }
 
+/** 从信封里取 file_key；缺失说明上传没成功，直接抛错。 */
+function fileKeyOf(result: { data?: { file_key?: string } }): string {
+  const fileKey = result.data?.file_key;
+  if (typeof fileKey !== "string" || fileKey === "") {
+    throw new Error("lark-cli 未返回 file_key，无法发送文件消息");
+  }
+  return fileKey;
+}
+
 export class FeishuChannel implements ChannelAdapter {
   /** 子进程退出后重启的初始退避；每次连续退出翻倍，封顶 MAX_BACKOFF_MS。 */
   private static readonly INITIAL_BACKOFF_MS = 1000;
@@ -246,6 +255,9 @@ export class FeishuChannel implements ChannelAdapter {
   }
 
   async send(chatId: string, message: OutboundMessage): Promise<string> {
+    if (message.kind === "file") {
+      return await this.sendFile(chatId, message.path, message.name);
+    }
     if (message.kind === "card") {
       const result = await this.runLark(
         ["im", "+messages-send", "--as", "bot", "--chat-id", chatId, "--msg-type", "interactive", "--content", "-"],
@@ -262,7 +274,29 @@ export class FeishuChannel implements ChannelAdapter {
     return messageIdOf(result);
   }
 
+  /**
+   * 发一个文件（ADR-0012 的 HTML 页面）：飞书要求先上传拿 file_key，再按 file 类型发消息，
+   * 所以是两条 lark-cli 命令。任一步失败都抛出——调用方（runner）记日志后继续，结果不丢。
+   */
+  private async sendFile(chatId: string, path: string, name?: string): Promise<string> {
+    const uploaded = await this.runLark(
+      ["im", "files", "create", "--as", "bot", "--data", "-", "--file", path],
+      JSON.stringify({ file_type: "stream", file_name: name ?? basename(path) }),
+      "上传文件",
+    );
+    const result = await this.runLark(
+      ["im", "+messages-send", "--as", "bot", "--chat-id", chatId, "--msg-type", "file", "--content", "-"],
+      JSON.stringify({ file_key: fileKeyOf(uploaded) }),
+      "发送文件",
+    );
+    return messageIdOf(result);
+  }
+
   async edit(messageId: string, message: OutboundMessage): Promise<void> {
+    // 文件消息发出去就改不了：没有对应的 lark-cli 写操作，也不该悄悄假装成功。
+    if (message.kind === "file") {
+      throw new Error("文件消息不支持编辑");
+    }
     if (message.kind === "card") {
       await this.runLark(
         ["im", "messages", "patch", "--as", "bot", "--message-id", messageId, "--data", "-"],
@@ -284,7 +318,7 @@ export class FeishuChannel implements ChannelAdapter {
     args: string[],
     input: string,
     what: string,
-  ): Promise<{ data?: { message_id?: string } }> {
+  ): Promise<{ data?: LarkEnvelope["data"] }> {
     const result = await this.run(this.bin, args, { input });
     const envelope = parseEnvelope(result.stdout);
     if (result.status !== 0 || envelope?.ok !== true) {

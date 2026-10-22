@@ -23,7 +23,7 @@ export class FakeChannel implements ChannelAdapter {
   /** 每个 messageId 发出时的载体 kind：edit 时校验（平台不允许文本消息被 patch 成卡片，反之亦然）。 */
   private readonly kinds = new Map<string, OutboundMessage["kind"]>();
   /** 让这些 kind 的 send 抛出（模拟飞书发送失败）。 */
-  failSendKinds: Array<"text" | "card"> = [];
+  failSendKinds: Array<"text" | "card" | "file"> = [];
   /** 让这些 kind 的 edit 抛出（模拟飞书编辑频率限制）。 */
   failEditKinds: Array<"text" | "card"> = [];
   /** 单条消息允许的编辑次数上限（模拟飞书 230072）；null = 不限。 */
@@ -61,7 +61,8 @@ export class FakeChannel implements ChannelAdapter {
     if (kind !== undefined && kind !== message.kind) {
       throw new Error(`cannot edit a ${kind} message with a ${message.kind} (${messageId})`);
     }
-    if (this.failEditKinds.includes(message.kind)) {
+    // 文件消息（ADR-0012）没有可编辑的载体，跳过编辑失败注入
+    if (message.kind !== "file" && this.failEditKinds.includes(message.kind)) {
       throw new Error(`FakeChannel: edit(${message.kind}) failed`);
     }
     const count = (this.editCounts.get(messageId) ?? 0) + 1;
