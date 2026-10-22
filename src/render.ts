@@ -4,6 +4,7 @@
 
 import type { RunEvent } from "./run-event.js";
 
+import { fitMiddleDropping } from "./budget.js";
 import { redact } from "./logger.js";
 
 export interface PreviewOptions {
@@ -192,19 +193,10 @@ function renderParts(parts: PreviewPart[], maxChars: number, mode: RenderMode): 
 
 /** 拼接后仍超预算：优先保头尾各若干段，从最中间开始整块丢弃，丢弃处标注省略了几个分区。 */
 function fitBudget(blocks: string[], maxChars: number): string {
-  if (blocks.join("\n\n").length <= maxChars) return blocks.join("\n\n");
   const marker = (dropped: number): string => `……（中间省略 ${dropped} 个分区）……`;
-  // 保留的分区数从多到少试，头尾均分；第一个放得下的就是答案。
-  for (let kept = blocks.length - 1; kept >= 2; kept--) {
-    const head = Math.ceil(kept / 2);
-    const tail = kept - head;
-    const candidate = [
-      ...blocks.slice(0, head),
-      marker(blocks.length - kept),
-      ...blocks.slice(blocks.length - tail),
-    ].join("\n\n");
-    if (candidate.length <= maxChars) return candidate;
-  }
+  // 丢分区循环与 card.ts 同构，共用 budget.ts 的内核；放不下头尾两个分区时返回 null。
+  const kept = fitMiddleDropping(blocks, (candidate) => candidate.join("\n\n").length <= maxChars, marker);
+  if (kept !== null) return kept.join("\n\n");
   // 展不开两个分区：开头分区最多拿一半预算（信息量最高），剩下的都给结尾分区段内截断——
   // 最后一个分区通常是最终答案，永远不被整块丢弃；单分区状态下它就是全部内容。
   if (blocks.length === 1) return capBlock(blocks[0] ?? "", maxChars);
@@ -233,7 +225,7 @@ function renderPart(part: PreviewPart, mode: RenderMode): string {
     case "text":
       return part.text;
     case "thought":
-      return renderThought(part, mode);
+      return thoughtLabel(part, mode);
     case "tool":
       return renderTool(part);
     case "notice":
@@ -249,10 +241,6 @@ export function thoughtLabel(part: ThoughtPart, mode: RenderMode): string {
   }
   const seconds = (Date.parse(part.endedAt) - Date.parse(part.startedAt)) / 1000;
   return `**🧠 思考 · ${part.chars} 字 · ${seconds.toFixed(1)}s**`;
-}
-
-function renderThought(part: ThoughtPart, mode: RenderMode): string {
-  return thoughtLabel(part, mode);
 }
 
 function renderTool(part: ToolPart): string {
@@ -350,16 +338,16 @@ function formatUsage(usage: { total: number } | null): string {
   return `用量 ${usage.total} tokens`;
 }
 
+/** 一次 Run 的结局：formatFinalText 与 card.ts 的 buildRunCard 共用的入参形状（载体不同，口径一致）。 */
+export interface FinalOutcome {
+  status: string;
+  text: string;
+  error?: { code: string; message: string };
+  usage: { total: number } | null;
+}
+
 /** 一次 Run 结束后发给聊天的最终文本。 */
-export function formatFinalText(
-  outcome: {
-    status: string;
-    text: string;
-    error?: { code: string; message: string };
-    usage: { total: number } | null;
-  },
-  state: PreviewState,
-): string {
+export function formatFinalText(outcome: FinalOutcome, state: PreviewState): string {
   const body = renderFinal({ parts: finalParts(outcome, state) });
   if (outcome.status === "completed") {
     return `${body}\n\n---\n${formatUsage(outcome.usage)}`;

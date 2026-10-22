@@ -490,6 +490,9 @@ test("流式预览：编辑次数反复用尽时持续换新消息，定稿落�
   const server = new FakeSessionServer();
   const channel = new FakeChannel();
   channel.editLimitPerMessage = 1;
+  // 换消息续接是文本载体独有的行为（ADR-0006：卡片载体 patch 失败即放弃预览）：
+  // 让占位卡片发不出去，整条 Run 走文本链路，专门覆盖续接逻辑。
+  channel.failSendKinds = ["card"];
   const report = startRun(server, channel);
   const sessionId = await startedSession(server);
   server.pushLive(sessionId, frame.taskState("running"));
@@ -539,6 +542,8 @@ test("流式预览：单条消息编辑次数用尽后换新消息继续，定�
   const server = new FakeSessionServer();
   const channel = new FakeChannel();
   channel.editLimitPerMessage = 3;
+  // 同上：换消息续接只属于文本载体，这里让占位卡片发不出去，专测文本链路。
+  channel.failSendKinds = ["card"];
   const report = startRun(server, channel);
   const sessionId = await startedSession(server);
   server.pushLive(sessionId, frame.taskState("running"));

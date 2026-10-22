@@ -5,13 +5,14 @@ import {
   CARD_BUDGET_CHARS,
   buildPreviewCard,
   buildRunCard,
+  busyCard,
   errorCard,
   placeholderCard,
-  type CollapsiblePanelElement,
   type RunCard,
 } from "../src/card.js";
-import { applyEvent, emptyPreview, formatFinalText } from "../src/render.js";
+import { BUSY_HINT, applyEvent, emptyPreview, formatFinalText } from "../src/render.js";
 import type { RunEvent } from "../src/run-event.js";
+import { footerOf, hasText, markdownAt, panelAt } from "./helpers/card-shape.js";
 
 // 单元测试用的事件构造器（与 render.test.ts 同款形态）。
 const textDelta = (text: string): RunEvent => ({ type: "text.delta", role: "assistant", text });
@@ -33,35 +34,6 @@ const toolResultDone = (id: string, output: string): RunEvent => ({
 /** 连续 text.delta + text.done 落一个已收尾的正文分区。 */
 function appendText(state: ReturnType<typeof emptyPreview>, text: string): ReturnType<typeof emptyPreview> {
   return applyEvent(applyEvent(state, textDelta(text)), textDone(text));
-}
-
-/** 取出指定下标的 markdown 元素（正文/标签/页脚断言用）。 */
-function markdownAt(card: RunCard, index: number): string {
-  const element = card.body.elements[index];
-  if (element?.tag !== "markdown") {
-    throw new Error(`第 ${index} 个元素不是 markdown：${JSON.stringify(element)}`);
-  }
-  return element.content;
-}
-
-/** 页脚（hr 后面的那行小字）。 */
-function footerContent(card: RunCard): string {
-  return markdownAt(card, card.body.elements.length - 1);
-}
-
-/** 取出第 index 个折叠面板。 */
-function panelAt(card: RunCard, index = 0): CollapsiblePanelElement {
-  const panels = card.body.elements.filter(
-    (element): element is CollapsiblePanelElement => element.tag === "collapsible_panel",
-  );
-  const panel = panels[index];
-  if (panel === undefined) throw new Error(`第 ${index} 个折叠面板不存在，共 ${panels.length} 个`);
-  return panel;
-}
-
-/** body.elements 里是否已有 content 等于 text 的 markdown 元素。 */
-function hasText(card: RunCard, text: string): boolean {
-  return card.body.elements.some((element) => element.tag === "markdown" && element.content === text);
 }
 
 test("card：占位卡是蓝色「思考中」，正文为空", () => {
@@ -91,16 +63,29 @@ test("card：错误文本为空字符串时正文用占位文案", () => {
   assert.deepEqual(card.body.elements, [{ tag: "markdown", content: "（无错误信息）" }]);
 });
 
+test("card：忙卡是蓝色「⏳ 请稍候」，正文原样携带 BUSY_HINT", () => {
+  const card = busyCard(BUSY_HINT);
+  assert.deepEqual(card.header, { title: { tag: "plain_text", content: "⏳ 请稍候" }, template: "blue" });
+  assert.deepEqual(card.body.elements, [{ tag: "markdown", content: BUSY_HINT }]);
+  assert.deepEqual(card.config, { update_multi: true, width_mode: "default" }, "卡片外壳与其它卡一致");
+});
+
+test("card：忙提示为空字符串时正文用占位文案", () => {
+  const card = busyCard("");
+  assert.deepEqual(card.header, { title: { tag: "plain_text", content: "⏳ 请稍候" }, template: "blue" });
+  assert.deepEqual(card.body.elements, [{ tag: "markdown", content: "（无提示内容）" }]);
+});
+
 test("card：定稿完成卡是绿色「✅ 完成」，页脚是 hr 加用量行", () => {
   const card = buildRunCard({ status: "completed", text: "答完了", usage: { total: 42 } }, appendText(emptyPreview(), "答完了"));
   assert.deepEqual(card.header, { title: { tag: "plain_text", content: "✅ 完成" }, template: "green" });
   assert.equal(card.body.elements.at(-2)?.tag, "hr", "用量行前面必须有一条 hr");
-  assert.equal(footerContent(card), "用量 42 tokens");
+  assert.equal(footerOf(card), "用量 42 tokens");
 });
 
 test("card：定稿完成但 usage 为 null 时页脚是「用量未知」", () => {
   const card = buildRunCard({ status: "completed", text: "答完了", usage: null }, appendText(emptyPreview(), "答完了"));
-  assert.equal(footerContent(card), "用量未知");
+  assert.equal(footerOf(card), "用量未知");
 });
 
 test("card：定稿失败卡是红色「❌ 未正常完成」，页脚文案与 formatFinalText 一致", () => {
@@ -114,15 +99,15 @@ test("card：定稿失败卡是红色「❌ 未正常完成」，页脚文案与
   assert.deepEqual(card.header, { title: { tag: "plain_text", content: "❌ 未正常完成" }, template: "red" });
   // 文本定稿里 "---" 之后的部分就是卡片页脚的 content：载体不同，文案一致。
   const textFooter = formatFinalText(outcome, appendText(emptyPreview(), "做到一半")).split("\n\n---\n").at(-1);
-  assert.equal(footerContent(card), textFooter);
-  assert.equal(footerContent(card), "未正常完成（aborted）：用户中断\n用量 7 tokens");
+  assert.equal(footerOf(card), textFooter);
+  assert.equal(footerOf(card), "未正常完成（aborted）：用户中断\n用量 7 tokens");
   assert.equal(card.body.elements.at(-2)?.tag, "hr");
 });
 
 test("card：定稿失败且没有 error 时页脚退到 status", () => {
   const outcome = { status: "fatal", text: "半途而废", usage: null };
   const card = buildRunCard(outcome, appendText(emptyPreview(), "半途而废"));
-  assert.equal(footerContent(card), "未正常完成（fatal）：fatal\n用量未知");
+  assert.equal(footerOf(card), "未正常完成（fatal）：fatal\n用量未知");
 });
 
 test("card：思考渲染成一行 notation 小字标签", () => {
@@ -247,7 +232,7 @@ test("card：定稿分区与文本定稿同源，答案不丢", () => {
   );
   assert.equal(markdownAt(card, 1), "第一部");
   assert.equal(markdownAt(card, 3), "全部完成");
-  assert.equal(footerContent(card), "用量 42 tokens");
+  assert.equal(footerOf(card), "用量 42 tokens");
 });
 
 test("card：定稿改用 outcome 的权威全文时，旧正文分区被换成新的一段", () => {
@@ -262,7 +247,7 @@ test("card：outcome 没有正文且没有流式正文时给出占位说明", ()
   const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command"));
   const card = buildRunCard({ status: "completed", text: "   ", usage: null }, state);
   assert.ok(hasText(card, "（本轮没有文本输出）"), "应有占位说明");
-  assert.equal(footerContent(card), "用量未知");
+  assert.equal(footerOf(card), "用量未知");
 });
 
 test("card：多个分区合计超预算时从最中间整块丢弃并标注，最后一个分区保留", () => {
