@@ -82,6 +82,10 @@ _Avoid_: 消息板块、三段式
 lark-cli 把入站消息预渲染成可读文本时，图片呈现成的标记，两种形状均已实测：富文本（post）内嵌图片是 `![Image](img_xxx)`，纯图片（image）消息是 `[Image: img_xxx]`。真正的二进制要用 `im +messages-resources-download` 另取。Bridge 解码时把占位符提取成图片 key、从文本中移除，下载后以 `image_url` part 投给 Agent（见 ADR-0009）。
 _Avoid_: 图片标记、image tag
 
+**HTML 页**:
+远程 Agent 用 answer-me-with-html 插件（技能 + 内置 am.mjs 渲染器）把复杂回复渲染成的单文件离线 HTML 页面。Bridge 把它作为文件消息发进聊天：默认转发 Agent 产出的页面（定稿文本里的 `.html` 绝对路径链接，转发前把死链从卡片文本剥掉）；配置 `AMWH_RENDER_SCRIPT` 后，含 a2ui / mermaid 围栏的回复还会被 Bridge 自动转换成 amwh 草稿渲染成页。a2ui 的交互能力在文件里必然丢失，只做静态展示（见 ADR-0012）。
+_Avoid_: 网页、H5
+
 **审批**:
 工具执行前请求人类决策的机制；v1 运行在 allow-all 模式，不产生审批请求（见 ADR-0004）。
 _Avoid_: 确认（confirm）、授权
