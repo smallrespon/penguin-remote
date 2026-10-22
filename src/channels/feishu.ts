@@ -3,6 +3,11 @@
 // 出：`im +messages-send` / `im +messages-edit`（文本），
 //     `im +messages-send --msg-type interactive` / `im messages patch`（交互卡片）。
 
+import { randomUUID } from "node:crypto";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type { ChannelAdapter, IncomingMessage, OutboundMessage } from "./types.js";
 import { runCommand, readLines, spawnManaged, type ManagedChild, type SpawnFn } from "../proc.js";
 import type { Logger } from "../logger.js";
@@ -23,11 +28,13 @@ export interface FeishuChannelOptions {
 /** lark-cli 的输出信封。 */
 interface LarkEnvelope {
   ok?: boolean;
-  data?: { message_id?: string } & Record<string, unknown>;
+  data?: { message_id?: string; saved_path?: string } & Record<string, unknown>;
   error?: { message?: string } & Record<string, unknown>;
 }
 
 const MENTION_PLACEHOLDER = /@_user_\d+/g;
+/** lark-cli 预渲染文本里的图片占位符：`![Image](img_v3_xxx)`（前导 `!` 可有可无）。 */
+const IMAGE_PLACEHOLDER = /!?\[Image\]\(([^)\s]+)\)/g;
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -47,6 +54,19 @@ export function stripMentions(text: string, mentionNames: readonly string[] = []
   return out.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * 从 lark-cli 预渲染文本里提取图片 key（`![Image](img_xxx)`），并把占位符从文本中移除。
+ * 先提取再剥离 @：key 取自原文，mention 的剥离逻辑与顺序都保持原样。
+ */
+export function extractImageKeys(text: string): { keys: string[]; text: string } {
+  const keys: string[] = [];
+  const stripped = text.replace(IMAGE_PLACEHOLDER, (_match: string, key: string) => {
+    keys.push(key);
+    return " ";
+  });
+  return { keys, text: stripped };
+}
+
 /** content 可能是预渲染文本，也可能是 `{"text":"..."}` 原文；两者都取到可读文本。 */
 function readContent(raw: unknown): string {
   if (typeof raw !== "string") return "";
@@ -64,7 +84,7 @@ function readContent(raw: unknown): string {
 
 /**
  * 把一条 `im.message.receive_v1` 事件解码成统一消息；不该响应的返回 null：
- * 非消息事件、机器人自己发的、非文本/富文本类型、群聊里没被 @、剥离后空文本。
+ * 非消息事件、机器人自己发的、非文本/富文本/图片类型、群聊里没被 @、剥离后既无文本也无图片。
  */
 export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMessage | null {
   const event = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
@@ -82,7 +102,8 @@ export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMes
   if (payload.sender_type === "bot") return null;
 
   const messageType = str(payload.message_type);
-  if (messageType !== "" && messageType !== "text" && messageType !== "post") return null;
+  // 纯图片消息（image）同样只带图片占位符；文件/音频/视频/表情等仍不响应。
+  if (messageType !== "" && messageType !== "text" && messageType !== "post" && messageType !== "image") return null;
 
   const mentions = Array.isArray(payload.mentions) ? payload.mentions : [];
   if (chatType === "group") {
@@ -95,9 +116,11 @@ export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMes
     .map((m) => (typeof m === "object" && m !== null ? str((m as { name?: unknown }).name) : ""))
     .filter((name) => name !== "");
 
-  const text = stripMentions(readContent(payload.content), mentionNames);
-  if (text === "") return null;
-  return { chatId, chatType, messageId, senderId, text };
+  const { keys, text: withoutImages } = extractImageKeys(readContent(payload.content));
+  const text = stripMentions(withoutImages, mentionNames);
+  // 纯图片消息：文本为空但有图片，仍是合法消息。
+  if (text === "" && keys.length === 0) return null;
+  return { chatId, chatType, messageId, senderId, text, images: keys };
 }
 
 function str(value: unknown): string {
@@ -284,6 +307,47 @@ export class FeishuChannel implements ChannelAdapter {
       );
     }
     return { data: envelope.data };
+  }
+
+  /**
+   * 下载一条入站消息里的图片：lark-cli 把二进制落到临时文件，读进内存后**立刻删除**（成功与失败都删）。
+   * 临时文件落在 `os.tmpdir()`（lark-cli 的 --output 只接受允许目录内的路径）。
+   */
+  async downloadImage(messageId: string, fileKey: string): Promise<Buffer> {
+    const tmpPath = join(tmpdir(), `penguin-remote-image-${randomUUID()}`);
+    try {
+      const result = await this.run(this.bin, [
+        "im",
+        "+messages-resources-download",
+        "--as",
+        "bot",
+        "--message-id",
+        messageId,
+        "--file-key",
+        fileKey,
+        "--type",
+        "image",
+        "--output",
+        tmpPath,
+      ]);
+      const envelope = parseEnvelope(result.stdout);
+      if (result.status !== 0 || envelope?.ok !== true) {
+        throw new Error(
+          `下载图片失败（lark-cli exit=${result.status}）：${redact(envelope?.error?.message ?? result.stderr.trim())}`,
+        );
+      }
+      const savedPath = envelope.data?.saved_path;
+      if (savedPath === undefined || savedPath === "") {
+        throw new Error("lark-cli 未返回 saved_path，无法读取下载的图片");
+      }
+      return await readFile(savedPath);
+    } finally {
+      try {
+        await rm(tmpPath, { force: true });
+      } catch {
+        // 临时文件清理失败不影响结果：文件本来就是要丢的
+      }
+    }
   }
 
   async stop(): Promise<void> {
