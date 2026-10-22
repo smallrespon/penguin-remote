@@ -73,16 +73,33 @@ test("render：thinking.delta 累加进同一个思考分区，done 用事件时
   state = applyEvent(state, thinkingDelta("一下", "2026-10-21T10:00:01.000Z"));
   state = applyEvent(state, thinkingDone("先想一下", "2026-10-21T10:00:04.230Z"));
   assert.deepEqual(state.parts, [
-    { kind: "thought", chars: 4, startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:04.230Z" },
+    {
+      kind: "thought",
+      chars: 4,
+      text: "先想一下",
+      startedAt: "2026-10-21T10:00:00.000Z",
+      endedAt: "2026-10-21T10:00:04.230Z",
+    },
   ]);
 });
 
-test("render：thinking.done 的 thinking 为空时保留累加的字符数", () => {
+test("render：thinking.done 带非空全文时替换掉 delta 累积的文本", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDone("先想一下，再试一次", "2026-10-21T10:00:04.230Z"));
+  const part = state.parts.at(-1);
+  assert.equal(part?.kind, "thought");
+  if (part?.kind !== "thought") return;
+  assert.equal(part.text, "先想一下，再试一次");
+  assert.equal(part.chars, 9);
+});
+
+test("render：thinking.done 的 thinking 为空时保留累加的字符数与文本", () => {
   let state = emptyPreview();
   state = applyEvent(state, thinkingDelta("想", "2026-10-21T10:00:00.000Z"));
   state = applyEvent(state, thinkingDone("", "2026-10-21T10:00:02.000Z"));
   assert.deepEqual(state.parts, [
-    { kind: "thought", chars: 1, startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:02.000Z" },
+    { kind: "thought", chars: 1, text: "想", startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:02.000Z" },
   ]);
 });
 
@@ -92,8 +109,8 @@ test("render：思考分区已闭合后新的思考另起一个分区", () => {
   state = applyEvent(state, thinkingDone("甲", "2026-10-21T10:00:01.000Z"));
   state = applyEvent(state, thinkingDelta("乙", "2026-10-21T10:00:02.000Z"));
   assert.deepEqual(state.parts, [
-    { kind: "thought", chars: 1, startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:01.000Z" },
-    { kind: "thought", chars: 1, startedAt: "2026-10-21T10:00:02.000Z" },
+    { kind: "thought", chars: 1, text: "甲", startedAt: "2026-10-21T10:00:00.000Z", endedAt: "2026-10-21T10:00:01.000Z" },
+    { kind: "thought", chars: 1, text: "乙", startedAt: "2026-10-21T10:00:02.000Z" },
   ]);
 });
 
@@ -103,6 +120,7 @@ test("render：没有未闭合思考分区时 thinking.done 追加一个零耗�
     {
       kind: "thought",
       chars: 4,
+      text: "整段思考",
       startedAt: "2026-10-21T10:00:03.000Z",
       endedAt: "2026-10-21T10:00:03.000Z",
     },
@@ -214,7 +232,7 @@ test("render：回复分区按 Run 真实时序渲染，工具可夹在两段正
   assert.ok(at("exec_command") < at("再跑测试"), "工具调用夹在两段正文之间");
 });
 
-test("render：思考分区流式显示「思考中」，定稿显示耗时（毫秒精度）", () => {
+test("render：文本兜底路径的思考标签保持旧样式，状态词只出现在卡片路径", () => {
   let state = emptyPreview();
   state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
   assert.match(renderPreview(state, OPTIONS), /^\*\*🧠 思考中…（4 字）\*\*$/m);
@@ -445,9 +463,9 @@ test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一�
   assert.ok(channel.edited.length >= 4, `应有多次增量编辑，实际 ${channel.edited.length}`);
   assert.match(flatText(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /全部完成/);
   assert.match(flatText(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
-  // 中间某次编辑应包含思考行与工具行
-  assert.ok(channel.edited.some((e) => /\*\*🧠 思考中…（4 字）\*\*/.test(flatText(e.message))));
-  assert.ok(channel.edited.some((e) => /\*\*🔧 exec_command\*\*/.test(flatText(e.message))));
+  // 中间某次编辑应包含思考面板标题与工具面板标题（该用例走卡片链路）
+  assert.ok(channel.edited.some((e) => /\*\*🧠 思考 · 运行中… · 4 字\*\*/.test(flatText(e.message))));
+  assert.ok(channel.edited.some((e) => /\*\*🔧 exec_command · 运行/.test(flatText(e.message))));
 });
 
 /**

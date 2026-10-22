@@ -44,6 +44,7 @@ function happyScript(): Array<string | { hang: true }> {
     frame.event({ type: "request_begin" }),
     frame.omni({ type: "partial_text", role: "assistant", event_type: "delta", text: "让" }),
     frame.omni({ type: "partial_thinking", role: "assistant", event_type: "delta", thinking: "想" }),
+    frame.omni({ type: "thinking", role: "assistant", thinking: "想" }),
     frame.taskState("running"),
     frame.omni({ type: "tool_call", role: "assistant", name: "exec_command", arguments: '{"cmd":"date"}', tool_call_id: "tc1" }),
     frame.omni({ type: "tool_call_output", role: "user", output: "Tue Oct 21", tool_call_id: "tc1" }),
@@ -106,16 +107,20 @@ test("新建会话：档位下发 + thinking PATCH + 定稿卡片含分区与用
     "预览期间卡片 header 应是「执行中」",
   );
 
-  // 定稿卡：绿色「✅ 完成」，思考标签行、工具折叠面板、正文、用量页脚齐全
+  // 定稿卡：绿色「✅ 完成」，思考折叠面板、工具折叠面板、正文、用量页脚齐全
   const final = cardOf(lastEdited(channel));
   assert.equal(final.header.title.content, "✅ 完成");
   assert.equal(final.header.template, "green");
-  assert.match(flatText(lastEdited(channel)), /🧠 思考 · 1 字/);
-  const panel = panelsOf(final)[0];
+  assert.match(flatText(lastEdited(channel)), /🧠 思考 · 运行完毕 · 1 字/);
+  const thoughtPanel = panelsOf(final).find((p) => p.header.title.content.includes("🧠"));
+  assert.ok(thoughtPanel !== undefined, "思考应收进折叠面板");
+  assert.equal(thoughtPanel?.expanded, false, "思考面板默认收起");
+  const panel = panelsOf(final).find((p) => p.header.title.content.includes("exec_command"));
   assert.ok(panel !== undefined, "工具调用应收进折叠面板");
   assert.equal(panel?.expanded, false, "工具面板默认收起");
   assert.match(panel?.header.title.content ?? "", /exec_command/);
   assert.match(panel?.header.title.content ?? "", /"cmd":"date"/);
+  assert.match(panel?.header.title.content ?? "", /运行完毕/);
   assert.ok(flatText(lastEdited(channel)).includes("今天 21 号"), "正文要在");
   assert.equal(footerOf(final), "用量 42 tokens");
 
