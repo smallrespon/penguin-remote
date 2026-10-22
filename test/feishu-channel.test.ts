@@ -353,16 +353,28 @@ test("stop 之后子进程退出不再重启", async () => {
 
 // ---- T11：图片入站（占位符提取 + downloadImage） ----
 
-test("decodeMessageEvent：单张图片——message_type=image，占位符被提成 key、文本为空仍是合法消息", () => {
-  const message = decodeMessageEvent(p2pEvent("![Image](img_v3_0216n_abc)", { message_type: "image" }), BOT);
+test("decodeMessageEvent：单张图片——message_type=image，[Image: key] 占位符被提成 key、文本为空仍是合法消息", () => {
+  // 真机实测（2026-10-22）：纯图片消息的预渲染形状是 `[Image: img_key]`，不是 `![Image](key)`
+  const message = decodeMessageEvent(p2pEvent("[Image: img_v3_0216n_94fbcfec-1892-4410-b5c8-c94d638071cg]", { message_type: "image" }), BOT);
   assert.deepEqual(message, {
     chatId: "oc_chat",
     chatType: "p2p",
     messageId: "om_msg",
     senderId: "ou_user",
     text: "",
-    images: ["img_v3_0216n_abc"],
+    images: ["img_v3_0216n_94fbcfec-1892-4410-b5c8-c94d638071cg"],
   });
+});
+
+test("decodeMessageEvent：富文本内嵌图片——![Image](key) 形状（2026-10-22 真机实测）", () => {
+  const message = decodeMessageEvent(
+    p2pEvent("![Image](img_v3_0216n_e3a290a7-6605-482d-a377-8d5a767dabag)\n这种类似的问题有很多解决一下", {
+      message_type: "post",
+    }),
+    BOT,
+  );
+  assert.deepEqual(message?.images, ["img_v3_0216n_e3a290a7-6605-482d-a377-8d5a767dabag"]);
+  assert.equal(message?.text, "这种类似的问题有很多解决一下");
 });
 
 test("decodeMessageEvent：多张图片——key 按出现顺序全部提取", () => {

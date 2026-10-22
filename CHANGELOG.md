@@ -19,10 +19,11 @@
 - **占位符正则收敛单一出处**：`IMAGE_PLACEHOLDER` 与提取逻辑从 `channels/feishu.ts` 移到 `src/images.ts`（GLOSSARY 领域概念的单一出处），gateway 的标题清洗改导入 `stripImagePlaceholders`，消除两处重复定义。
 - **空列表文案区分来源**：实时列表为空提示「当前 Project/Agent 下没有未归档的会话」，本地兜底为空才提示「还没有历史会话」——避免混淆两个词汇。
 - **标题函数统一**：`flattenTitle(title, emptyLabel)` 同时服务会话行与本地历史标题；兜底注明提取为 `withFallbackNote`。
+- **纯图片消息占位符形状实测修正**：真机验收发现 lark-cli 对纯图片（`message_type=image`）消息渲染成 `[Image: img_key]`（带冒号），而非富文本内嵌的 `![Image](img_key)`——旧正则漏掉这种形状，纯图片消息的 key 提取不到。`IMAGE_PLACEHOLDER` 改为双形状匹配（`matchAll` 双组取值），GLOSSARY 与 ADR-0009 同步记录两种形状，各补测试。修后纯图片消息真机复测通过（模型正确读到图内表格，输入文本干净）。
 
 ### 工程
 
-- 测试 197 → 235 个全绿，`pnpm typecheck` / `pnpm build` 通过。
+- 测试 197 → 237 个全绿，`pnpm typecheck` / `pnpm build` 通过。
 - 双轴评审（Standards + Spec，固定点 v1.3 合并点 `6abff9a`）后落实上述整改。
 
 ## [1.3.0] - 未发布

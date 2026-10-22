@@ -8,7 +8,7 @@
 
 **决策**：
 
-- 解码即提取：`decodeMessageEvent` 从预渲染文本中提取 `!?\[Image\]\(([^)\s]+)\)` 匹配出的图片 key，收进 `IncomingMessage.images`，并把占位符从文本中移除（Agent 收到的是干净文本，不是占位符）；`message_type` 白名单从 text/post 扩到含 `image`（纯图片消息的渲染同样带占位符）。文本为空但有图片 = 合法消息（按用户拍板：只投递图片，不注入占位文本）。
+- 解码即提取：`decodeMessageEvent` 从预渲染文本中提取图片占位符（两种形状，均已实测：富文本内嵌 `![Image](img_key)`、纯图片消息 `[Image: img_key]`），收进 `IncomingMessage.images`，并把占位符从文本中移除（Agent 收到的是干净文本，不是占位符）；`message_type` 白名单从 text/post 扩到含 `image`（纯图片消息同样只带图片占位符）。文本为空但有图片 = 合法消息（按用户拍板：只投递图片，不注入占位文本）。
 - 下载经 Channel 适配器：接口新增 `downloadImage(messageId, fileKey)`，由 Feishu 适配器用 `im +messages-resources-download` 落临时文件（`os.tmpdir()` 下唯一文件名）、读字节、删临时文件后返回二进制；临时文件即用即删，失败也清理。
 - 转换在纯函数模块 `src/images.ts`：按魔数嗅探 mime（JPEG/PNG/GIF/WebP），拼 `data:<mime>;base64,...` data URL；字节数超过服务端 20MB inline 上限的图片**跳过**，并在输入文本里注明「（有图片超过 20MB 上限，未发送）」——按用户拍板的降级策略，不因单张大图让整个任务失败；嗅探不出 mime 的同样跳过并注明。
 - 投递即拼装：`RunSpec` 增加 `images: string[]`（data URL 数组）；`SessionClient.startTask` 的入参从纯字符串扩为「字符串或 part 数组」——有图片时发 `[{type:"text"},…{type:"image_url"}]`，无图片时行为与现在逐字一致（单 text part）。纯图片消息（文本为空）只投 image_url parts。

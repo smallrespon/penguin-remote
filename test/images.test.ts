@@ -85,7 +85,19 @@ test("extractImageKeys：提取 key 并把占位符换成空格", () => {
   assert.deepEqual(extractImageKeys("![Image](img_only)"), { keys: ["img_only"], text: " " });
 });
 
+test("extractImageKeys：纯图片消息的 [Image: key] 形状（2026-10-22 真机实测）", () => {
+  assert.deepEqual(extractImageKeys("[Image: img_v3_0216n_94fbcfec-1892-4410-b5c8-c94d638071cg]"), {
+    keys: ["img_v3_0216n_94fbcfec-1892-4410-b5c8-c94d638071cg"],
+    text: " ",
+  });
+  // 冒号后无空格也认；两种形状可混排
+  assert.deepEqual(extractImageKeys("[Image:img_a]和![Image](img_b)"), {
+    keys: ["img_a", "img_b"],
+    text: " 和 ",
+  });
+});
+
 test("stripImagePlaceholders：只清占位符不提 key（标题清洗用）", () => {
   assert.equal(stripImagePlaceholders("![Image](img_a) 题目"), "  题目");
-  assert.equal(stripImagePlaceholders("![Image](img_a)").replace(/\s+/g, " ").trim(), "");
+  assert.equal(stripImagePlaceholders("[Image: img_a]").replace(/\s+/g, " ").trim(), "");
 });
