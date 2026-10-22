@@ -54,6 +54,14 @@ export function placeholderCard(): RunCard {
   return card("🦐 思考中…", "blue", []);
 }
 
+/** 错误卡：会话准备失败、断流等定稿前的失败，把脱敏后的错误文本 patch 进占位卡。 */
+export function errorCard(text: string): RunCard {
+  // 错误文本由调用方脱敏后传入，原样呈现（普通 markdown 元素，不做行内代码那样的反引号替换）；
+  // 不走预算装配——错误文本短，且这是失败路径，不需要再丢分区。
+  const content = text === "" ? "（无错误信息）" : text;
+  return card("❌ 未正常完成", "red", [{ tag: "markdown", content }]);
+}
+
 /** 预览卡：Run 进行中，按当前分区渲染（思考一行标签、工具收进面板、正文展开）。 */
 export function buildPreviewCard(state: PreviewState): RunCard {
   return assemble("🦐 执行中…", "blue", state.parts, "preview", []);

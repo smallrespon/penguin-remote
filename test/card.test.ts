@@ -5,6 +5,7 @@ import {
   CARD_BUDGET_CHARS,
   buildPreviewCard,
   buildRunCard,
+  errorCard,
   placeholderCard,
   type CollapsiblePanelElement,
   type RunCard,
@@ -75,6 +76,19 @@ test("card：预览卡是蓝色「执行中」", () => {
   const card = buildPreviewCard(emptyPreview());
   assert.deepEqual(card.header, { title: { tag: "plain_text", content: "🦐 执行中…" }, template: "blue" });
   assert.deepEqual(card.body.elements, []);
+});
+
+test("card：错误卡是红色「❌ 未正常完成」，正文原样携带脱敏后的错误文本", () => {
+  const card = errorCard("执行失败：`lark-cli` 不见了");
+  assert.deepEqual(card.header, { title: { tag: "plain_text", content: "❌ 未正常完成" }, template: "red" });
+  assert.deepEqual(card.body.elements, [{ tag: "markdown", content: "执行失败：`lark-cli` 不见了" }]);
+  assert.deepEqual(card.config, { update_multi: true, width_mode: "default" }, "卡片外壳与其它卡一致");
+});
+
+test("card：错误文本为空字符串时正文用占位文案", () => {
+  const card = errorCard("");
+  assert.deepEqual(card.header, { title: { tag: "plain_text", content: "❌ 未正常完成" }, template: "red" });
+  assert.deepEqual(card.body.elements, [{ tag: "markdown", content: "（无错误信息）" }]);
 });
 
 test("card：定稿完成卡是绿色「✅ 完成」，页脚是 hr 加用量行", () => {
@@ -292,7 +306,7 @@ test("card：分区数超过飞书单卡 200 元素上限时继续丢分区", ()
   );
 });
 
-test("card：四种卡片都能 JSON.stringify 往返", () => {
+test("card：五种卡片都能 JSON.stringify 往返", () => {
   let state = emptyPreview();
   state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
   state = appendText(state, "正文");
@@ -306,6 +320,7 @@ test("card：四种卡片都能 JSON.stringify 往返", () => {
       { status: "aborted", text: "正文", error: { code: "user_abort", message: "用户中断" }, usage: null },
       state,
     ),
+    errorCard("执行失败：会话准备失败"),
   ];
   for (const card of cards) {
     assert.deepEqual(JSON.parse(JSON.stringify(card)), card, "序列化往返应保持一致");
