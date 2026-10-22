@@ -2,6 +2,32 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.5.0] - 2026-10-22
+
+步骤分组折叠 + /sessions 全量 + HTML 页交付（ADR-0010 / ADR-0011 / ADR-0012）。用户原话：「思考和工具调用等等能被折叠在一起形如图片所示，运行完毕那两步可以被折叠」「我要支持的 /sessions 能展示当前工作区未归档的所有对话，然后 use 支持跳换到那次对话」「要支持对 a2ui 的 ui 图的渲染在飞书中，或者找类似的解决方法，或者可以用 answermewithhtml 找办法」。
+
+### 变更
+
+- **步骤分组折叠**（ADR-0010）：连续的思考与工具调用分区合并为一个默认收起的 `collapsible_panel`，标题「🧰 运行完毕 · N 步 · X.Xs」（流式「🧰 运行中… · N 步」；定稿有步未闭合时只标「🧰 N 步」——拿不到终态不谎报完毕）；组内每步一个嵌套折叠面板（工具「🔧 名称 · 状态 · 耗时 · `参数`」、思考沿用 ADR-0007 标题），正文与提示行打断分组。`tool_call` / `tool_result` 事件补 `at` 时间戳（omni.ts 从 OmniMessage.timestamp 带出），组耗时与步耗时都按事件时间戳真实计算。超 20KB 预算时**整组丢弃**（靠中间的优先）并标注真实省略的分区数。单步不成组。文本兜底路径不变。
+- **/sessions 全量**（ADR-0011）：`listSessions` 去掉 10 条截断，返回当前 Project/Agent 下全部未归档会话（仍按 `lastActiveAt` 倒序）；展示层截断到 50 条，头部注明「共 N 个未归档会话」，超 50 注明「显示最近 50 个，更早的会话未列出、暂不可 `/use` 跳转」；`/use` 序号口径不变。本地 Registry 兜底保持 `HISTORY_LIMIT=10`，头部用「本地历史会话」口径，不冒充全量。
+- **HTML 页交付**（ADR-0012）：Run 定稿后从定稿文本提取 `.html` 绝对路径链接（amwh 尾链 / `file://` URL / `-o` 自定义路径），校验存在、是文件、扩展名、大小 ≤ 20MB 后，经 `im files create` 拿 file_key → `im +messages-send --msg-type file` 发文件消息；被转发的链接在定稿前剥掉（对 `outcome.text` 与流式正文分区同构应用，`finalParts` 比较口径不被破坏）。配置 `AMWH_RENDER_SCRIPT` 指向 answer-me-with-html 渲染器时，含 ` ```a2ui ` / ` ```mermaid ` 围栏且无自产页面的回复自动渲染成单文件 HTML 一并发出：a2ui → ask（`*` 标推荐项）/ 表格 / 编号列表 / callout / kv 映射，mermaid 仅保守转换可无损解析的简单 flowchart / sequenceDiagram，其余保留代码围栏（宁可留源码，不产出错图）。渲染器不 vendor 进仓库，由 `@ported/answer-me-with-html` 插件分发。提取不到 / 校验不过 / 发送失败都只记日志，不影响卡片定稿。
+- **新增 ADR**：`docs/adr/0010-step-grouping.md`、`docs/adr/0011-sessions-full-list.md`、`docs/adr/0012-html-page-delivery.md`；PLAN §18 与 GLOSSARY「步骤分组 / HTML 页」词条同步。
+
+### 评审整改
+
+- **兜底列表头部口径诚实化**：`/sessions` 兜底路径头部从「未归档会话」改为「本地历史会话」——本地 Registry 历史不保证未归档，两来源词汇区分落到头部（v1.4 评审整改只区分了空列表文案）。
+- **README 与代码对齐**：`/sessions` 行改「全部未归档 + 50 条截断」口径；回复示例与两处描述改步骤分组形态。
+- **ADR 勘误**：ADR-0012 的 callout tone 映射按 amwh 实际四档（info/ok/warn/err）改写；剥链范围限定为链接形态（正文裸路径原样保留，文件消息已把内容带进聊天）。
+- **消重**：`escapeRegExp` 收敛到 `src/text.ts` 单一实现（原 feishu / htmlpage / test 三份拷贝）；组耗时与步耗时统一为 `spanLabel`（`thoughtPanelTitle` 不再可能出现 `NaNs` / 负耗时）；`sessionListFor` 两分支共用 `capEntries` 截断；删除无人使用的 `RenderPageOptions.nodeBin`；`discardArtifact` 的 `ours` 改名 `weOwnParentDir`。
+- **PLAN §8 目录树补齐**缺失的 9 个源文件（budget/card/htmlpage/images/logger/proc/runlog/tiers/text）。
+
+### 工程
+
+- 测试 237 → 295 个全绿，`pnpm typecheck` / `pnpm build` 通过。
+- 双轴评审（Standards + Spec，固定点 v1.4 合并点 `fd8d66b`）后落实上述整改。
+- 真机验收通过：分组折叠卡（「🧰 运行完毕 · 2 步 · 17.5s」，组内思考/工具嵌套面板、正文打断分组）；`/sessions` 72 个未归档会话截断展示 50 条并注明总数；mermaid + a2ui 回复自动渲染成 `page.html` 文件消息端到端送达（下载验证：流程图与带「建议」标记的选择面板均正确渲染），临时产物发后即删。
+- SEA 单文件二进制本次构建成功（`releases/penguin-remote-linux-x64`，118MB；无配置 fail-fast、有配置正常启动并优雅退出，均已冒烟验证）。
+
 ## [1.4.0] - 2026-10-22
 
 会话列表实时化 + 飞书图片入站（ADR-0008 / ADR-0009）。用户原话：「我发现你换对话时不能实时监测当前工作区未归档的对话，这样的话我也不能直接跳转到在远程新添加的对话」「llm-homework 这个工作区的最新的对话发送不了图片」
