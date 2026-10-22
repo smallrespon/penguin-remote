@@ -5,16 +5,17 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 /** 命令清单：帮助文本的唯一事实来源。 */
 const COMMANDS: ReadonlyArray<{ usage: string; summary: string }> = [
+  { usage: "/help", summary: "显示本帮助" },
   { usage: "/new", summary: "新开会话（上下文干净）" },
-  { usage: "/sessions", summary: "实时列出当前工作区未归档的会话（最近 50 条，注明总数）" },
-  { usage: "/use <序号>", summary: "切回某个旧会话续聊" },
-  { usage: "/project", summary: "列出 / 切换 Project（`/project <名字>`）" },
-  { usage: "/agent", summary: "列出 / 切换 Agent（`/agent <名字>`）" },
-  { usage: "/model <名字>", summary: "切换模型（`/model` 列出可用模型）" },
-  { usage: "/thinking low|medium|high|xhigh|max", summary: "切换思考档位" },
-  { usage: "/workspace <路径>", summary: "切换工作区" },
+  { usage: "/sessions", summary: "实时列出当前工作区未归档的会话（显示最近 50 条并注明总数；没设 `/workspace` 的聊天不限定工作区并注明）" },
+  { usage: "/use <序号>", summary: "切回 `/sessions` 列表里的第 n 个会话续聊" },
+  { usage: "/project", summary: "列出 / 切换 Project（`/project <名字>`，换 Project = 换 Agent）" },
+  { usage: "/agent", summary: "列出 / 切换 Agent（`/agent <名字>`，换 Agent = 换对话）" },
+  { usage: "/model <名字>", summary: "切换模型（`/model` 列出前 30 个可用模型并注明总数；下一新会话生效）" },
+  { usage: "/thinking low|medium|high|xhigh|max", summary: "切换思考档位（下一新会话生效）" },
+  { usage: "/workspace <路径>", summary: "切换工作区（下一新会话生效）" },
   { usage: "/skill <名字>", summary: "一次性使用 Skill；`/skill <名字> on` 粘滞；`/skill off` 关闭" },
-  { usage: "/status", summary: "当前绑定与会话状态" },
+  { usage: "/status", summary: "当前绑定、会话状态与上次 Run 用量" },
   { usage: "/stop", summary: "中断正在执行的任务" },
 ];
 
@@ -116,7 +117,7 @@ export function helpText(): string {
   const lines = ["**命令列表**", ...COMMANDS.map((c) => `- \`${c.usage}\` ${c.summary}`)];
   lines.push(
     "",
-    "不带命令的文本会直接派给 Agent 执行。",
+    "不带命令的文本会直接派给 Agent 执行（可带图片，超过 20MB 的图会跳过并注明）。",
     "",
     "⚠️ 风险提示：任何能给这个机器人发消息的人，都能全权限驱动它背后的 Agent（allow-all 审批、无 allowlist）。请在受控聊天中使用。",
   );

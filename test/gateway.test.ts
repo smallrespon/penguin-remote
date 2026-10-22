@@ -678,10 +678,12 @@ test("/help 含全部命令与风险提示；未知命令与非法参数有明�
 
   await channel.receive("/help");
   const help = channel.lastSent();
-  for (const command of ["/new", "/sessions", "/use", "/project", "/agent", "/model", "/thinking", "/workspace", "/skill", "/status", "/stop"]) {
+  for (const command of ["/help", "/new", "/sessions", "/use", "/project", "/agent", "/model", "/thinking", "/workspace", "/skill", "/status", "/stop"]) {
     assert.ok(help.includes(command), `help 缺少 ${command}`);
   }
   assert.match(help, /风险提示/);
+  assert.match(help, /当前工作区未归档/);
+  assert.match(help, /不限定工作区/);
 
   await channel.receive("/nope");
   assert.match(channel.lastSent(), /未知命令/);
