@@ -1,8 +1,9 @@
 // Feishu 适配器：基于 lark-cli 子进程的 Channel 适配器实现。
 // 入：`event consume im.message.receive_v1 --as bot` 的 NDJSON 事件流；
-// 出：`im +messages-send` / `im +messages-edit`（bot only）。
+// 出：`im +messages-send` / `im +messages-edit`（文本），
+//     `im +messages-send --msg-type interactive` / `im messages patch`（交互卡片）。
 
-import type { ChannelAdapter, IncomingMessage } from "./types.js";
+import type { ChannelAdapter, IncomingMessage, OutboundMessage } from "./types.js";
 import { runCommand, readLines, spawnManaged, type ManagedChild, type SpawnFn } from "../proc.js";
 import type { Logger } from "../logger.js";
 import { redact } from "../logger.js";
@@ -128,6 +129,13 @@ function parseEnvelope(stdout: string): LarkEnvelope | null {
   }
 }
 
+/** 从信封里取 message_id；缺失说明 lark-cli 行为不符合预期，直接抛错。 */
+function messageIdOf(result: { data?: { message_id?: string } }): string {
+  const messageId = result.data?.message_id;
+  if (typeof messageId !== "string") throw new Error("lark-cli 未返回 message_id");
+  return messageId;
+}
+
 export class FeishuChannel implements ChannelAdapter {
   /** 子进程退出后重启的初始退避；每次连续退出翻倍，封顶 MAX_BACKOFF_MS。 */
   private static readonly INITIAL_BACKOFF_MS = 1000;
@@ -228,22 +236,37 @@ export class FeishuChannel implements ChannelAdapter {
     }
   }
 
-  async send(chatId: string, markdown: string): Promise<string> {
+  async send(chatId: string, message: OutboundMessage): Promise<string> {
+    if (message.kind === "card") {
+      const result = await this.runLark(
+        ["im", "+messages-send", "--as", "bot", "--chat-id", chatId, "--msg-type", "interactive", "--content", "-"],
+        JSON.stringify(message.card),
+        "发送卡片",
+      );
+      return messageIdOf(result);
+    }
     const result = await this.runLark(
       ["im", "+messages-send", "--as", "bot", "--chat-id", chatId, "--markdown", "-"],
-      markdown,
-      "发送",
+      message.text,
+      "发送文本",
     );
-    const messageId = result.data?.message_id;
-    if (typeof messageId !== "string") throw new Error("lark-cli 未返回 message_id");
-    return messageId;
+    return messageIdOf(result);
   }
 
-  async edit(messageId: string, markdown: string): Promise<void> {
+  async edit(messageId: string, message: OutboundMessage): Promise<void> {
+    if (message.kind === "card") {
+      await this.runLark(
+        ["im", "messages", "patch", "--as", "bot", "--message-id", messageId, "--data", "-"],
+        // patch 的 content 要的是 JSON 序列化后的字符串，所以是双层转义。
+        JSON.stringify({ content: JSON.stringify(message.card) }),
+        "更新卡片",
+      );
+      return;
+    }
     await this.runLark(
       ["im", "+messages-edit", "--as", "bot", "--message-id", messageId, "--markdown", "-"],
-      markdown,
-      "编辑",
+      message.text,
+      "编辑文本",
     );
   }
 

@@ -79,7 +79,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   logger.info(`发起 Run：${spec.input.slice(0, 80)}`);
 
   // 先发占位消息，拿到 message_id 后再开跑：事件到达时已有可编辑的消息。
-  const placeholderId = await deps.channel.send(spec.chatId, PLACEHOLDER_TEXT);
+  const placeholderId = await deps.channel.send(spec.chatId, { kind: "text", text: PLACEHOLDER_TEXT });
 
   let degraded = false;
   /** 已换过几条新消息继续预览（飞书单条消息最多编辑 20 次，实测）。 */
@@ -105,7 +105,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     if (finished) return;
     const markdown = preview.markdown();
     try {
-      await deps.channel.edit(liveMessageId, markdown);
+      await deps.channel.edit(liveMessageId, { kind: "text", text: markdown });
       editsOnCurrent += 1;
       return;
     } catch (error: unknown) {
@@ -120,7 +120,7 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     // 飞书对单条消息的编辑次数有上限（实测 20 次，错误码 230072）。
     // 长任务的后半程不能因此没有进度可见：换一条新消息继续承载预览。
     try {
-      liveMessageId = await deps.channel.send(spec.chatId, markdown);
+      liveMessageId = await deps.channel.send(spec.chatId, { kind: "text", text: markdown });
       chains += 1;
       editsOnCurrent = 0;
       logger.info(`预览消息编辑次数已用尽，换用新消息继续（第 ${chains} 次续接）`);
@@ -314,7 +314,7 @@ async function deliverFinal(
 ): Promise<void> {
   if (!degraded) {
     try {
-      await deps.channel.edit(placeholderId, finalText);
+      await deps.channel.edit(placeholderId, { kind: "text", text: finalText });
       return;
     } catch (error: unknown) {
       deps.logger.warn(
@@ -322,5 +322,5 @@ async function deliverFinal(
       );
     }
   }
-  await deps.channel.send(chatId, finalText);
+  await deps.channel.send(chatId, { kind: "text", text: finalText });
 }

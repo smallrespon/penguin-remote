@@ -64,7 +64,7 @@ export class Gateway {
 
   /** 供命令处理器复用：回复一个聊天。 */
   async reply(chatId: string, markdown: string): Promise<void> {
-    await this.deps.channel.send(chatId, markdown);
+    await this.deps.channel.send(chatId, { kind: "text", text: markdown });
   }
 
   async handleMessage(message: IncomingMessage): Promise<void> {
