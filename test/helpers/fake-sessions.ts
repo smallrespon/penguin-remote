@@ -1,7 +1,7 @@
 // 测试用假会话 API 服务器：以 AuthedFetch 形态注入，覆盖建会话 / 会话列表 / PATCH / tasks /
 // abort / approvals / SSE 订阅。帧用真实 ReadableStream 推送，走真实 SSE 解析路径。
 
-import type { AuthedFetch } from "../../src/penguin/sessions.js";
+import type { AuthedFetch, TaskInputPart } from "../../src/penguin/sessions.js";
 import { SessionClient } from "../../src/penguin/sessions.js";
 import { waitFor } from "./wait.js";
 
@@ -73,6 +73,17 @@ export class FakeSessionServer {
   /** 所有 tasks 投递请求（按时间序）。 */
   taskPosts(): FakeRequest[] {
     return this.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
+  }
+
+  /**
+   * 第 index 次（缺省最近一次）tasks 投递的 input parts（服务端契约形状）：
+   * `[{type:"text",text},…{type:"image_url",imageUrl}]`；没有投递时为空数组。
+   */
+  taskInputParts(index = -1): TaskInputPart[] {
+    const posts = this.taskPosts();
+    const post = index === -1 ? posts.at(-1) : posts[index];
+    const body = post?.body as { input?: unknown } | undefined;
+    return Array.isArray(body?.input) ? (body.input as TaskInputPart[]) : [];
   }
 
   /** 往一条仍在订阅中的事件流补发一帧（模拟 Run 进行中的事件）。 */

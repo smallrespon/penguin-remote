@@ -19,7 +19,7 @@ import {
   formatRunFailure,
   type PreviewOptions,
 } from "../render.js";
-import type { AgentRef, ModelRef, SessionClient } from "./sessions.js";
+import type { AgentRef, ModelRef, SessionClient, TaskInputPart } from "./sessions.js";
 import { SessionBusyError } from "./sessions.js";
 import { RunTracker, isApprovalRequest, isTaskState } from "./omni.js";
 
@@ -39,6 +39,8 @@ export interface SessionSettings {
 export interface RunSpec {
   chatId: string;
   input: string;
+  /** 随任务投递的图片（data URL 数组，ADR-0009）；缺省 / 空数组 = 纯文本投递。 */
+  images?: string[];
   /** 目标 Agent（Project + Agent）。 */
   agent: AgentRef;
   /** 续接的会话；null = 用 settings 新建。 */
@@ -246,7 +248,13 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     let stream = await spec.client.stream(sessionId);
     await stream.ready();
 
-    const started = await spec.client.startTask(sessionId, spec.input);
+    // 图片 parts（ADR-0009）：文本非空时 text part 在前，data URL 按序随后；
+    // 无图片时把原字符串原样交给 startTask，与旧行为逐字一致。
+    const images = spec.images ?? [];
+    const started =
+      images.length === 0
+        ? await spec.client.startTask(sessionId, spec.input)
+        : await spec.client.startTask(sessionId, inputParts(spec.input, images));
     if (started.sessionId !== sessionId) {
       // 服务端把会话自愈成了新 id：旧订阅作废，改订阅新 id 再继续。
       logger.info(`会话自愈：${sessionId} → ${started.sessionId}`);
@@ -325,6 +333,17 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     durationMs: Date.now() - startedAt,
     modelId,
   };
+}
+
+/**
+ * 文本 + 图片 data URL → input parts（ADR-0009）：文本非空时 text part 在前，
+ * 图片按序随后；纯图片消息（文本为空）只投 image_url parts，不注入占位文本。
+ */
+function inputParts(input: string, images: readonly string[]): TaskInputPart[] {
+  const parts: TaskInputPart[] = [];
+  if (input !== "") parts.push({ type: "text", text: input });
+  for (const imageUrl of images) parts.push({ type: "image_url", imageUrl });
+  return parts;
 }
 
 function failedReport(chatId: string, sessionId: string | null, message: string, startedAt: number): RunReport {

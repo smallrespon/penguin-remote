@@ -62,6 +62,14 @@ export interface TaskStartResult {
   queued: boolean;
 }
 
+/**
+ * 任务投递的一个 input part（服务端 parseTaskInput 契约）：文本或图片。
+ * 图片 part 的 type 是 `image_url`，但字段名是驼峰 `imageUrl`（2026-10-22 实测）。
+ */
+export type TaskInputPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; imageUrl: string };
+
 /** 带 cookie 的请求函数（OwnerSession.fetchAuthed），401 自动重铸重试。 */
 export type AuthedFetch = (path: string, init?: RequestInit) => Promise<Response>;
 
@@ -287,14 +295,19 @@ export class SessionClient {
     return items.slice(0, SESSION_LIST_LIMIT);
   }
 
-  /** 投递一条任务；返回实际会话 id（可能因自愈而变）与是否入队。 */
-  async startTask(sessionId: string, input: string): Promise<TaskStartResult> {
+  /**
+   * 投递一条任务；返回实际会话 id（可能因自愈而变）与是否入队。
+   * input 传字符串时投单个 text part（与旧行为逐字一致）；传 part 数组时按序投递
+   * （ADR-0009：图片走 `{type:"image_url", imageUrl}`，字段名是驼峰）。
+   */
+  async startTask(sessionId: string, input: string | TaskInputPart[]): Promise<TaskStartResult> {
+    const parts: TaskInputPart[] = typeof input === "string" ? [{ type: "text", text: input }] : input;
     let response: Response;
     try {
       response = await this.fetchAuthed(`/sessions/${encodeURIComponent(sessionId)}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: [{ type: "text", text: input }] }),
+        body: JSON.stringify({ input: parts }),
       });
     } catch (error: unknown) {
       throw new SessionApiError(`投递任务失败：${error instanceof Error ? error.message : String(error)}`);
