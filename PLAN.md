@@ -162,7 +162,7 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 - 每条 Run 开始：发一张占位交互卡片（Card 2.0，header 状态「🦐 思考中…」），拿到 `message_id`；预览与定稿都 patch 这一张卡（承载形态见 §13 / ADR-0006）。
 - **订阅先于投递**：先连 `GET /api/sessions/:id/stream`（SSE，首事件是 `task_state` 快照），再 `POST .../tasks`，保证不丢事件。
-- 事件映射（OmniMessage → 回复分区，格式细节见 §13）：`partial_text` 增量累积正文分区，完整的 assistant `text` 消息收尾；`partial_thinking`/`thinking` 折叠成思考标签行「🧠 思考中…（n 字）」；`tool_call` 追加「🔧 工具名」+ 一行截断到 80 字的参数（先 redact 后截断）；`tool_call_output` 回填 `output:` 围栏代码块（末尾 8 行、每行 ≤100 字符）；`compaction_begin` 记一条「🗜️ 正在压缩上下文…」提示分区。
+- 事件映射（OmniMessage → 回复分区，格式细节见 §13 / §16）：`partial_text` 增量累积正文分区，完整的 assistant `text` 消息收尾；`partial_thinking`/`thinking` 累积成思考分区，收进默认收起的折叠面板——面板内是完整思考全文（先脱敏后截断，每面板 2000 字上限），标题带运行状态「🧠 思考 · 运行中… · N 字」/「🧠 思考 · 运行完毕 · N 字 · X.Xs」（ADR-0007）；`tool_call` 追加「🔧 工具名」+ 一行截断到 80 字的参数（先 redact 后截断），标题带「运行中… / 运行完毕」状态；`tool_call_output` 回填 `output:` 围栏代码块（末尾 8 行、每行 ≤100 字符）；`compaction_begin` 记一条「🗜️ 正在压缩上下文…」提示分区。
 - 终局判定：`task_state` 从 running 回 idle 即 Run 结束；`request_end` 的 status（completed / aborted / fatal / retryable）与 `abort` 事件的 error_code 决定结局文案；用量按请求累计（每个 `request_begin` 配对的 `token_usage.request.total` 求和，压缩期间的用量也计入；一个请求都没跑过则没有用量页脚），与 v1.0 AMSP 客户端口径一致。
 - 节流：每 ≥1.5s 或累积 ≥300 字符才 `im messages patch` 一次；最终定稿一次。patch 实测没有单条消息的编辑次数上限（连打 27 次全过），不再需要换新消息续接预览；patch 失败（频控 / 超限）即放弃预览，定稿仍会新发一张卡片（结果不丢）；卡片发送失败则整体退回文本降级链路（换消息续接只属于这条文本兜底路径）。
 - 断流处置：SSE 中途断开不会让服务端停止任务，Bridge 显式 `POST .../abort` 中止并把该 Run 记为失败，避免僵尸任务占住会话。
@@ -441,3 +441,15 @@ v1.0.0 发布清单与唯一剩余步骤。
 | 7 | 真实验收后清理服务端两个遗留 `feishu_*` Agent 与 key，重启 Bridge | 运维动作 |
 
 **验收标准**：飞书发消息 → PenguinHarness 侧新建会话 `source: "user"`、`archived: false`（`penguin session ls` 不加 `-a` 可见）；服务端不再新增任何 Agent；两个聊天各自 `/workspace`、`/model` 互不影响；`/status` 显示本聊天档位；旧会话仍可 `/use` 续接。
+
+---
+
+## 16. v1.3：思考折叠 + 状态标识（2026-10-22，ADR-0007）
+
+**动因（用户原话）**：「再修改一下，我发现你的回复中有部分思考和工具可以折叠，标识好像是运行完毕，主要在正文之间，这个能不能做」——对照 PenguinHarness app：ThinkingBlock / ToolCallCard 都是默认收起的折叠块，标题带运行状态，思考点开有全文。这逆转了 ADR-0006「思考不存全文、不进面板」：那一条的理由「避免刷屏」由折叠机制本身满足（收起态只占标题一行），而用户明确要「可以折叠、点开能看」。
+
+1. **数据模型不变**：仍是单一有序 parts 流（思考 / 工具调用 / 正文按 Run 真实时序排列，§13 的口径沿用）；`ThoughtPart` 多记一个 `text` 全文字段，只驻 `PreviewState`——`runs.jsonl` 仍只记 RunReport（chat/session/状态/用量/耗时），不落分区内容，日志不打印思考。
+2. **承载变化：思考进面板**：思考分区渲染成一个默认收起的 `collapsible_panel`，标题是思考标签（带运行状态），面板内是完整思考全文——先 `redact()` 脱敏再按 2000 字上限头尾对半砍、中间标注省略字数，围栏代码块保真（思考文本可能含 markdown 记号与 ```）；预览与定稿都默认收起，预览期面板同样放累积全文（同一 2000 字上限），随节流 patch 增长。脱敏时机从「累积时」移到「渲染时」：工具参数在 `tool_call.done` 一次性拿到完整字符串，可以累积时脱敏；思考只有渲染时才能拿到全文，跨 delta 的密钥只有在完整文本上才能被正则命中。
+3. **承载变化：折叠块状态标识**：思考标题「🧠 思考 · 运行中… · N 字」（流式）/「🧠 思考 · 运行完毕 · N 字 · X.Xs」（定稿，耗时按事件时间戳真实计算）；工具标题「🔧 名称 · 运行完毕 · 参数」（收到 output）/「🔧 名称 · 运行中… · 参数」（未收到 output），状态紧跟工具名，与思考标题「名称 · 状态 · 详情」语序一致。
+4. **预算优先级**：超预算时先把思考面板当丢弃首选（靠中间的优先），保住工具轨迹与正文答案；思考丢光仍超预算，再按现有规则从中间丢其他分区。文本兜底路径的预算口径不变（`render.ts` 的 `fitMiddleDropping` 原样保留）。
+5. **边界**：定稿时仍未闭合的思考段（始终没等到 `thinking.done`）标题不带状态词，沿用「🧠 思考 · N 字」——拿不到终态，不谎报「完毕」；文本兜底路径里思考仍是一行标签（文本消息没有折叠载体），「运行完毕」等状态词只出现在卡片路径。
