@@ -1,14 +1,18 @@
 // 飞书交互卡片（Card 2.0）构建：Run 回复的卡片版渲染器。
 // 与 render.ts 的文本版同源——同一批分区（定稿走 finalParts，保证答案不丢）、
 // 同一套预算装配思路（超预算先整块丢中间分区，展不开再段内截断），只是载体不同。
-// 结构按 lark-cli 实测可发送、可 patch 的形态组织：工具调用放进默认收起的折叠面板。
+// 结构按 lark-cli 实测可发送、可 patch 的形态组织：思考与工具调用都放进默认收起的折叠面板。
 
-import type { FinalOutcome, PreviewPart, PreviewState, ToolPart } from "./render.js";
-import { finalParts, fencedOutput, thoughtLabel } from "./render.js";
-import { fitMiddleDropping } from "./budget.js";
+import type { FinalOutcome, PreviewPart, PreviewState, ThoughtPart, ToolPart } from "./render.js";
+import { fenceFor, finalParts, fencedOutput, thoughtPanelTitle } from "./render.js";
+import { fitMiddleDroppingPreferred } from "./budget.js";
+import { redact } from "./logger.js";
 
 /** 整卡 JSON.stringify 后的字符预算：飞书 patch 上限 30KB，留余量。 */
 export const CARD_BUDGET_CHARS = 20000;
+
+/** 思考折叠面板里思考全文的字符上限：超了头尾对半砍、中间标注省略字数（ADR-0007）。 */
+export const THOUGHT_PANEL_LIMIT = 2000;
 
 /** 飞书单卡元素个数硬上限（折叠面板内部元素也计数）；丢分区的逻辑顺带覆盖，这里兜底。 */
 const MAX_ELEMENTS = 200;
@@ -80,6 +84,12 @@ export function buildRunCard(outcome: FinalOutcome, state: PreviewState): RunCar
   );
 }
 
+/** 装配槽：一个分区对应一个元素；droppableFirst 标记预算紧张时优先整块丢弃的分区（思考，ADR-0007）。 */
+interface Slot {
+  element: CardElement;
+  droppableFirst: boolean;
+}
+
 /** 装配：分区 → 元素，过预算装配，再套上卡片外壳。 */
 function assemble(
   title: string,
@@ -88,24 +98,33 @@ function assemble(
   mode: "preview" | "final",
   footer: CardElement[],
 ): RunCard {
-  // 一个分区恰好渲染成一个元素（工具是折叠面板），所以「丢分区」就是丢元素。
-  const elements = parts.map((part) => partElement(part, mode));
-  const fits = (candidate: CardElement[]): boolean =>
-    JSON.stringify(card(title, template, [...candidate, ...footer])).length <= CARD_BUDGET_CHARS &&
-    countElements([...candidate, ...footer]) <= MAX_ELEMENTS;
-  // 丢分区循环与 render.ts 同构，共用 budget.ts 的内核；连头尾两个分区都放不下时返回 null，
-  // 走卡片刻的段内截断（capElements）。
-  const kept = fitMiddleDropping(elements, fits, dropNotice);
-  return card(title, template, [...(kept ?? capElements(elements, fits)), ...footer]);
+  // 一个分区恰好渲染成一个元素（思考与工具都是折叠面板），所以「丢分区」就是丢元素。
+  const slots: Slot[] = parts.map((part) => ({
+    element: partElement(part, mode),
+    droppableFirst: part.kind === "thought",
+  }));
+  const elementsOf = (candidate: Slot[]): CardElement[] => [...candidate.map((slot) => slot.element), ...footer];
+  const fits = (candidate: Slot[]): boolean =>
+    JSON.stringify(card(title, template, elementsOf(candidate))).length <= CARD_BUDGET_CHARS &&
+    countElements(elementsOf(candidate)) <= MAX_ELEMENTS;
+  // 丢分区循环与 render.ts 同构，共用 budget.ts 的内核；思考面板优先丢（ADR-0007）。
+  // 连头尾两个分区都放不下时返回 null，走卡片刻的段内截断（capSlots）。
+  const kept = fitMiddleDroppingPreferred(
+    slots,
+    fits,
+    (dropped): Slot => ({ element: dropNotice(dropped), droppableFirst: false }),
+    (slot) => slot.droppableFirst,
+  );
+  return card(title, template, elementsOf(kept ?? capSlots(slots, fits)));
 }
 
-/** 分区 → 元素：正文与提示原样展开；思考是一行小字标签；工具进默认收起的折叠面板。 */
+/** 分区 → 元素：正文与提示原样展开；思考与工具进默认收起的折叠面板。 */
 function partElement(part: PreviewPart, mode: "preview" | "final"): CardElement {
   switch (part.kind) {
     case "text":
       return { tag: "markdown", content: part.text };
     case "thought":
-      return { tag: "markdown", content: thoughtLabel(part, mode), text_size: "notation" };
+      return thoughtPanel(part, mode);
     case "notice":
       return { tag: "markdown", content: part.text };
     case "tool":
@@ -113,14 +132,42 @@ function partElement(part: PreviewPart, mode: "preview" | "final"): CardElement 
   }
 }
 
-/** 工具分区 → 折叠面板：标题「**🔧 名称** · `参数`」，面板里是参数与输出的围栏块。 */
+/** 思考分区 → 折叠面板：标题是思考标签（带运行状态），面板里是完整思考全文（ADR-0007）。 */
+function thoughtPanel(part: ThoughtPart, mode: "preview" | "final"): CollapsiblePanelElement {
+  return {
+    tag: "collapsible_panel",
+    expanded: false,
+    header: { title: { tag: "markdown", content: thoughtPanelTitle(part, mode) } },
+    elements: [{ tag: "markdown", content: thinkingBody(part), text_size: "notation" }],
+  };
+}
+
+/**
+ * 思考面板内容：完整思考全文，先脱敏再按上限头尾截断，围栏代码块保真。
+ * 上限按脱敏后的全文计（省略标注计入这 2000 字，围栏另加约 8 字符）；
+ * 思考文本为空时给占位说明（与工具面板的「（无详情）」同一套路）。
+ * 脱敏放在渲染时：思考经多个 delta 累积，只有拿全全文才能命中跨 delta 拼出来的密钥
+ * （工具参数在 tool_call.done 就拿到完整字符串，所以才在累积时脱敏）。
+ */
+function thinkingBody(part: ThoughtPart): string {
+  const text = redact(part.text);
+  if (text === "") return "（无思考内容）";
+  const fence = fenceFor(text);
+  return `${fence}\n${capContent(text, THOUGHT_PANEL_LIMIT)}\n${fence}`;
+}
+
+/** 工具分区 → 折叠面板：标题「🔧 名称 · 状态 · 参数」，面板里是参数与输出的围栏块。 */
 function toolPanel(part: ToolPart): CollapsiblePanelElement {
   const args = part.args === undefined || part.args === "" ? undefined : part.args;
   const output = part.output === undefined || part.output === "" ? undefined : part.output;
+  // 状态只看 output 到没到：没到就是运行中，到了（含空串）就是运行完毕（ADR-0007）。
+  const state = part.output === undefined ? "运行中…" : "运行完毕";
   // 反引号会撑破标题里的行内代码与面板里的围栏，先换成单引号（与 render.ts 的 renderTool 一致）。
   const shownArgs = args === undefined ? undefined : args.replace(/`/g, "'");
   const title =
-    shownArgs === undefined ? `**🔧 ${part.name}**` : `**🔧 ${part.name}** · \`${shownArgs}\``;
+    shownArgs === undefined
+      ? `**🔧 ${part.name} · ${state}**`
+      : `**🔧 ${part.name} · ${state}** · \`${shownArgs}\``;
   const blocks: string[] = [];
   if (shownArgs !== undefined) blocks.push(`\`\`\`json\n${shownArgs}\n\`\`\``);
   if (output !== undefined) blocks.push(fencedOutput(output));
@@ -162,21 +209,21 @@ function countElements(elements: CardElement[]): number {
  * 剩余给结尾元素；单分区时全部预算给它。JSON 转义会让字符数膨胀，
  * 按原始字符预算砍完重测，仍超预算就整体对半收紧，直到放得下。
  */
-function capElements(elements: CardElement[], fits: (candidate: CardElement[]) => boolean): CardElement[] {
-  const first = elements[0];
-  if (first === undefined) return elements;
-  const last = elements.at(-1) ?? first;
-  const single = elements.length === 1;
-  const dropped = elements.length - 2;
-  const middle = dropped > 0 ? [dropNotice(dropped)] : [];
+function capSlots(slots: Slot[], fits: (candidate: Slot[]) => boolean): Slot[] {
+  const first = slots[0];
+  if (first === undefined) return slots;
+  const last = slots.at(-1) ?? first;
+  const single = slots.length === 1;
+  const dropped = slots.length - 2;
+  const middle = dropped > 0 ? [{ element: dropNotice(dropped), droppableFirst: false } satisfies Slot] : [];
   for (let budget = CARD_BUDGET_CHARS; budget > 0; budget = Math.floor(budget / 2)) {
-    const cappedFirst = capElement(first, single ? budget : Math.floor(budget / 2));
-    const tailBudget = budget - contentLength(cappedFirst);
-    const candidate = single ? [cappedFirst] : [cappedFirst, ...middle, capElement(last, tailBudget)];
+    const cappedFirst = capSlot(first, single ? budget : Math.floor(budget / 2));
+    const tailBudget = budget - contentLength(cappedFirst.element);
+    const candidate = single ? [cappedFirst] : [cappedFirst, ...middle, capSlot(last, tailBudget)];
     if (fits(candidate)) return candidate;
   }
   // 防御：空内容的骨架卡片本身远小于预算，理论上到不了这里。
-  return single ? [capElement(first, 0)] : [capElement(first, 0), ...middle, capElement(last, 0)];
+  return single ? [capSlot(first, 0)] : [capSlot(first, 0), ...middle, capSlot(last, 0)];
 }
 
 /** 元素的原始内容字符数（JSON 测长前的口径）：markdown 看 content，折叠面板看面板内容。 */
@@ -198,6 +245,11 @@ function capElement(element: CardElement, budget: number): CardElement {
     };
   }
   return element;
+}
+
+/** 槽位版段内截断：元素换掉，优先丢弃标记不动。 */
+function capSlot(slot: Slot, budget: number): Slot {
+  return { ...slot, element: capElement(slot.element, budget) };
 }
 
 /** 内容超预算：首尾对半砍、中间标注省略字数；结果保证不超过预算。 */

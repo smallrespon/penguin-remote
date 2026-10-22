@@ -12,7 +12,7 @@ import {
 } from "../src/card.js";
 import { BUSY_HINT, applyEvent, emptyPreview, formatFinalText } from "../src/render.js";
 import type { RunEvent } from "../src/run-event.js";
-import { footerOf, hasText, markdownAt, panelAt } from "./helpers/card-shape.js";
+import { footerOf, hasText, markdownAt, panelAt, panelsOf } from "./helpers/card-shape.js";
 
 // 单元测试用的事件构造器（与 render.test.ts 同款形态）。
 const textDelta = (text: string): RunEvent => ({ type: "text.delta", role: "assistant", text });
@@ -110,27 +110,59 @@ test("card：定稿失败且没有 error 时页脚退到 status", () => {
   assert.equal(footerOf(card), "未正常完成（fatal）：fatal\n用量未知");
 });
 
-test("card：思考渲染成一行 notation 小字标签", () => {
+test("card：思考渲染成默认收起的折叠面板，标题带「运行完毕」，面板是完整思考全文", () => {
   const state = applyEvent(
     applyEvent(emptyPreview(), thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z")),
     thinkingDone("先想一下", "2026-10-21T10:00:04.230Z"),
   );
   const card = buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state);
-  assert.deepEqual(card.body.elements[0], {
-    tag: "markdown",
-    content: "**🧠 思考 · 4 字 · 4.2s**",
-    text_size: "notation",
-  });
+  const panel = panelAt(card);
+  assert.equal(panel.expanded, false, "默认收起");
+  assert.equal(panel.header.title.content, "**🧠 思考 · 运行完毕 · 4 字 · 4.2s**");
+  assert.deepEqual(panel.elements, [{ tag: "markdown", content: "```\n先想一下\n```", text_size: "notation" }]);
 });
 
-test("card：预览里未闭合的思考显示「思考中…」", () => {
+test("card：预览里未闭合的思考标题显示「运行中…」，面板同样是累积全文", () => {
   const state = applyEvent(emptyPreview(), thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
-  const card = buildPreviewCard(state);
-  assert.deepEqual(card.body.elements[0], {
-    tag: "markdown",
-    content: "**🧠 思考中…（4 字）**",
-    text_size: "notation",
-  });
+  const panel = panelAt(buildPreviewCard(state));
+  assert.equal(panel.expanded, false, "默认收起");
+  assert.equal(panel.header.title.content, "**🧠 思考 · 运行中… · 4 字**");
+  assert.deepEqual(panel.elements, [{ tag: "markdown", content: "```\n先想一下\n```", text_size: "notation" }]);
+});
+
+test("card：定稿时仍未闭合的思考段标题不带状态词", () => {
+  const state = applyEvent(emptyPreview(), thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  const panel = panelAt(buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state));
+  assert.equal(panel.header.title.content, "**🧠 思考 · 4 字**", "没等到 thinking.done 就不标「运行完毕」");
+});
+
+test("card：思考全文超过 2000 字时面板内容头尾对半砍并标注省略字数", () => {
+  const thinking = "甲".repeat(1500) + "乙".repeat(1500);
+  const state = applyEvent(emptyPreview(), thinkingDone(thinking, "2026-10-21T10:00:04.230Z"));
+  const panel = panelAt(buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state));
+  const content = panel.elements[0]?.content ?? "";
+  assert.ok(content.startsWith("```\n甲"), "开头要留下");
+  assert.ok(content.endsWith("乙\n```"), "结尾要留下");
+  assert.match(content, /…（中间省略 \d+ 字）…/);
+  assert.ok(content.length <= 2000 + 16, `面板内容应受 2000 字上限约束，实际 ${content.length}`);
+});
+
+test("card：思考全文先脱敏再截断，跨 delta 拼起来的密钥也打码", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("密钥是 penguin_", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDelta("abcdef123456，记住它", "2026-10-21T10:00:01.000Z"));
+  state = applyEvent(state, thinkingDone("", "2026-10-21T10:00:02.000Z"));
+  const content = panelAt(buildPreviewCard(state)).elements[0]?.content ?? "";
+  assert.ok(!content.includes("abcdef123456"), `密钥本体泄漏：${content}`);
+  assert.ok(content.includes("penguin_***"), `打码标记应完整可见：${content}`);
+});
+
+test("card：思考全文自带 ``` 时围栏加长，代码块不被提前合上", () => {
+  const state = applyEvent(emptyPreview(), thinkingDone("看这段\n```\nconst a = 1;\n```\n完", "2026-10-21T10:00:04.230Z"));
+  const panel = panelAt(buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state));
+  const content = panel.elements[0]?.content ?? "";
+  assert.ok(content.startsWith("````\n"), content);
+  assert.ok(content.endsWith("\n````"), content);
 });
 
 test("card：正文原样展开，不进面板", () => {
@@ -156,7 +188,7 @@ test("card：工具渲染成默认收起的折叠面板，标题带名称与参�
   const panel = panelAt(card);
   assert.equal(panel.expanded, false, "默认收起");
   assert.equal(panel.header.title.tag, "markdown");
-  assert.equal(panel.header.title.content, '**🔧 exec_command** · `{"command":"ls"}`');
+  assert.equal(panel.header.title.content, '**🔧 exec_command · 运行完毕** · `{"command":"ls"}`');
   assert.deepEqual(panel.elements, [
     {
       tag: "markdown",
@@ -169,7 +201,7 @@ test("card：工具渲染成默认收起的折叠面板，标题带名称与参�
 test("card：工具参数里的反引号换成单引号，避免撑破标题行内代码", () => {
   const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", '{"command":"echo `hi`"}'));
   const panel = panelAt(buildPreviewCard(state));
-  assert.equal(panel.header.title.content, '**🔧 exec_command** · `{"command":"echo \'hi\'"}`');
+  assert.equal(panel.header.title.content, '**🔧 exec_command · 运行中…** · `{"command":"echo \'hi\'"}`');
   assert.ok(!panel.elements[0]?.content.includes("`hi`"), "面板围栏里也不该出现反引号");
 });
 
@@ -192,15 +224,22 @@ test("card：工具输出自带 ``` 时围栏加长，代码块不被提前合�
 test("card：无参数无输出的工具面板显示「（无详情）」", () => {
   const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", ""));
   const panel = panelAt(buildPreviewCard(state));
-  assert.equal(panel.header.title.content, "**🔧 exec_command**", "没有参数时标题只有名称");
+  assert.equal(panel.header.title.content, "**🔧 exec_command · 运行中…**", "没有参数时标题只有名称与状态");
   assert.deepEqual(panel.elements, [{ tag: "markdown", content: "（无详情）", text_size: "notation" }]);
 });
 
 test("card：只有输出没有参数时面板只有输出围栏块", () => {
   const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", "")), toolResultDone("c1", "结果"));
   const panel = panelAt(buildPreviewCard(state));
-  assert.equal(panel.header.title.content, "**🔧 exec_command**");
+  assert.equal(panel.header.title.content, "**🔧 exec_command · 运行完毕**");
   assert.deepEqual(panel.elements, [{ tag: "markdown", content: "```\n结果\n```", text_size: "notation" }]);
+});
+
+test("card：工具面板标题在收到 output 后从「运行中…」变「运行完毕」，空 output 也算完毕", () => {
+  let state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", '{"command":"ls"}'));
+  assert.match(panelAt(buildPreviewCard(state)).header.title.content, /运行中…/, "没收到 output 时是运行中");
+  state = applyEvent(state, toolResultDone("c1", ""));
+  assert.match(panelAt(buildPreviewCard(state)).header.title.content, /运行完毕/, "output 为空字符串也算运行完毕");
 });
 
 test("card：分区按 Run 真实时序排列，工具可夹在两段正文之间", () => {
@@ -213,7 +252,7 @@ test("card：分区按 Run 真实时序排列，工具可夹在两段正文之�
   const card = buildPreviewCard(state);
   assert.deepEqual(
     card.body.elements.map((element) => element.tag),
-    ["markdown", "collapsible_panel", "markdown", "collapsible_panel", "markdown"],
+    ["collapsible_panel", "collapsible_panel", "markdown", "collapsible_panel", "markdown"],
   );
   assert.equal(markdownAt(card, 2), "先看渲染器");
   assert.equal(markdownAt(card, 4), "再跑测试");
@@ -228,7 +267,7 @@ test("card：定稿分区与文本定稿同源，答案不丢", () => {
   const card = buildRunCard({ status: "completed", text: "第一部\n\n全部完成", usage: { total: 42 } }, state);
   assert.deepEqual(
     card.body.elements.map((element) => element.tag),
-    ["markdown", "markdown", "collapsible_panel", "markdown", "hr", "markdown"],
+    ["collapsible_panel", "markdown", "collapsible_panel", "markdown", "hr", "markdown"],
   );
   assert.equal(markdownAt(card, 1), "第一部");
   assert.equal(markdownAt(card, 3), "全部完成");
@@ -240,7 +279,7 @@ test("card：定稿改用 outcome 的权威全文时，旧正文分区被换成�
   const card = buildRunCard({ status: "completed", text: "最终答案", usage: { total: 42 } }, state);
   assert.ok(!hasText(card, "流式里的旧文本"), "旧正文分区应被删掉");
   assert.ok(hasText(card, "最终答案"), "outcome 的权威全文要出现");
-  assert.equal(panelAt(card).header.title.content, '**🔧 exec_command** · `{"command":"ls"}`', "工具分区保留");
+  assert.equal(panelAt(card).header.title.content, '**🔧 exec_command · 运行中…** · `{"command":"ls"}`', "工具分区保留");
 });
 
 test("card：outcome 没有正文且没有流式正文时给出占位说明", () => {
@@ -261,6 +300,8 @@ test("card：多个分区合计超预算时从最中间整块丢弃并标注，�
     (element) => element.tag === "markdown" && /……（中间省略 \d+ 个分区）……/.test(element.content),
   );
   assert.equal(markers.length, 1, "应有且仅有一条丢弃标注");
+  const markerIndex = card.body.elements.indexOf(markers[0]!);
+  assert.ok(markerIndex > 0 && markerIndex < card.body.elements.length - 1, "标注应插在幸存头尾之间，不在队尾");
   assert.equal(markdownAt(card, 0), pieces[0], "开头分区要留下");
   assert.ok(hasText(card, pieces.at(-1) ?? ""), "最后一个分区（最终答案）永不整块丢");
   const middle = pieces[30];
@@ -283,6 +324,30 @@ test("card：分区数超过飞书单卡 200 元素上限时继续丢分区", ()
   for (let i = 0; i < 300; i += 1) state = appendText(state, `第 ${i} 段`);
   const card = buildPreviewCard(state);
   assert.ok(card.body.elements.length <= 200, `实际 ${card.body.elements.length}`);
+  assert.ok(
+    card.body.elements.some(
+      (element) => element.tag === "markdown" && /……（中间省略 \d+ 个分区）……/.test(element.content),
+    ),
+    "应有丢弃标注",
+  );
+});
+
+test("card：超预算时优先整块丢弃思考面板，正文与工具面板保住", () => {
+  // 6 段思考（各顶满 2000 字上限）+ 6 段正文，合计远超 20KB 预算。
+  // 同权丢弃会从最中间开始连正文一起丢；优先丢思考则应正文全留、思考成片消失。
+  let state = emptyPreview();
+  for (let i = 0; i < 6; i += 1) {
+    state = applyEvent(state, thinkingDone("甲".repeat(2000), `2026-10-21T10:00:0${i}Z.000Z`));
+    state = appendText(state, "乙".repeat(2500));
+  }
+  const card = buildPreviewCard(state);
+  assert.ok(JSON.stringify(card).length <= CARD_BUDGET_CHARS, `实际 ${JSON.stringify(card).length}`);
+  assert.ok(panelsOf(card).length < 6, "思考面板应被优先丢弃");
+  assert.equal(
+    card.body.elements.filter((element) => element.tag === "markdown" && element.content === "乙".repeat(2500)).length,
+    6,
+    "6 段正文都不该被丢",
+  );
   assert.ok(
     card.body.elements.some(
       (element) => element.tag === "markdown" && /……（中间省略 \d+ 个分区）……/.test(element.content),
