@@ -61,6 +61,10 @@ export interface ToolPart {
   name: string;
   args?: string;
   output?: string;
+  /** tool_call 事件时间（ADR-0010：每步耗时的起点）。 */
+  startedAt?: string;
+  /** tool_result 事件时间（回填输出时一并记下，耗时的终点）。 */
+  endedAt?: string;
 }
 
 /** 提示分区：审批、压缩等非正文信息。 */
@@ -161,7 +165,16 @@ export function applyEvent(state: PreviewState, event: RunEvent): PreviewState {
           ? undefined
           : truncate(redact(event.arguments), TOOL_ARGS_LIMIT);
       return {
-        parts: [...state.parts, { kind: "tool", id: event.tool_call_id, name: event.name, ...(args !== undefined ? { args } : {}) }],
+        parts: [
+          ...state.parts,
+          {
+            kind: "tool",
+            id: event.tool_call_id,
+            name: event.name,
+            ...(args !== undefined ? { args } : {}),
+            startedAt: event.at,
+          },
+        ],
       };
     }
     case "tool_result.done": {
@@ -171,12 +184,13 @@ export function applyEvent(state: PreviewState, event: RunEvent): PreviewState {
       );
       const output = redact(event.output);
       if (index === -1) {
-        return { parts: [...state.parts, { kind: "tool", id: event.tool_call_id, name: "工具", output }] };
+        // 孤儿结果：只有终点没有起点——该步没有耗时（标题不给），但事件时间仍计入分组耗时。
+        return { parts: [...state.parts, { kind: "tool", id: event.tool_call_id, name: "工具", output, endedAt: event.at }] };
       }
       const target = state.parts[index];
       if (target?.kind !== "tool") return state;
       const parts = [...state.parts];
-      parts[index] = { ...target, output };
+      parts[index] = { ...target, output, endedAt: event.at };
       return { parts };
     }
     case "approval.requested":
@@ -254,6 +268,18 @@ export function thoughtPanelTitle(part: ThoughtPart, mode: RenderMode): string {
   }
   const seconds = (Date.parse(part.endedAt) - Date.parse(part.startedAt)) / 1000;
   return `**🧠 思考 · 运行完毕 · ${part.chars} 字 · ${seconds.toFixed(1)}s**`;
+}
+
+/**
+ * 起止时间 → 「X.Xs」（卡片路径的步耗时，ADR-0010）。
+ * 任一端缺失或解析不出时返回 undefined：缺时间戳的事件不参与耗时计算，也不编造数字。
+ */
+export function durationLabel(startedAt: string | undefined, endedAt: string | undefined): string | undefined {
+  if (startedAt === undefined || endedAt === undefined) return undefined;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return undefined;
+  return `${((end - start) / 1000).toFixed(1)}s`;
 }
 
 /** 思考分区的一行标签（文本兜底路径）：与卡片路径分流，状态词只出现在卡片里（ADR-0007）。 */

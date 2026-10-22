@@ -8,6 +8,8 @@ import {
   busyCard,
   errorCard,
   placeholderCard,
+  type CardElement,
+  type CollapsiblePanelElement,
   type RunCard,
 } from "../src/card.js";
 import { BUSY_HINT, applyEvent, emptyPreview, formatFinalText } from "../src/render.js";
@@ -19,17 +21,40 @@ const textDelta = (text: string): RunEvent => ({ type: "text.delta", role: "assi
 const textDone = (text: string): RunEvent => ({ type: "text.done", role: "assistant", text });
 const thinkingDelta = (thinking: string, at = "2026-10-21T10:00:00.000Z"): RunEvent => ({ type: "thinking.delta", thinking, at });
 const thinkingDone = (thinking: string, at = "2026-10-21T10:00:05.000Z"): RunEvent => ({ type: "thinking.done", thinking, at });
-const toolCallDone = (id: string, name: string, args = "{}"): RunEvent => ({
+const toolCallDone = (id: string, name: string, args = "{}", at = "2026-10-21T10:00:00.000Z"): RunEvent => ({
   type: "tool_call.done",
   name,
   arguments: args,
   tool_call_id: id,
+  at,
 });
-const toolResultDone = (id: string, output: string): RunEvent => ({
+const toolResultDone = (id: string, output: string, at = "2026-10-21T10:00:02.000Z"): RunEvent => ({
   type: "tool_result.done",
   output,
   tool_call_id: id,
+  at,
 });
+
+/** 折叠面板里的第一个 markdown 元素内容（步面板的内容载体；分组面板里是嵌套面板，取不到）。 */
+function panelContent(panel: CollapsiblePanelElement): string {
+  const first = panel.elements[0];
+  return first !== undefined && first.tag === "markdown" ? first.content : "";
+}
+
+/** 顶层元素里的全部折叠面板（不含分组面板里嵌套的步面板）。 */
+function topPanels(card: RunCard): CollapsiblePanelElement[] {
+  return card.body.elements.filter(
+    (element): element is CollapsiblePanelElement => element.tag === "collapsible_panel",
+  );
+}
+
+/** 递归元素个数：折叠面板本身算 1，面板里的元素（可能还是面板）继续累计（飞书 200 上限同口径）。 */
+function countAll(elements: CardElement[]): number {
+  return elements.reduce(
+    (total, element) => total + (element.tag === "collapsible_panel" ? 1 + countAll(element.elements) : 1),
+    0,
+  );
+}
 
 /** 连续 text.delta + text.done 落一个已收尾的正文分区。 */
 function appendText(state: ReturnType<typeof emptyPreview>, text: string): ReturnType<typeof emptyPreview> {
@@ -140,7 +165,7 @@ test("card：思考全文超过 2000 字时面板内容头尾对半砍并标注�
   const thinking = "甲".repeat(1500) + "乙".repeat(1500);
   const state = applyEvent(emptyPreview(), thinkingDone(thinking, "2026-10-21T10:00:04.230Z"));
   const panel = panelAt(buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state));
-  const content = panel.elements[0]?.content ?? "";
+  const content = panelContent(panel);
   assert.ok(content.startsWith("```\n甲"), "开头要留下");
   assert.ok(content.endsWith("乙\n```"), "结尾要留下");
   assert.match(content, /…（中间省略 \d+ 字）…/);
@@ -152,7 +177,7 @@ test("card：思考全文先脱敏再截断，跨 delta 拼起来的密钥也打
   state = applyEvent(state, thinkingDelta("密钥是 penguin_", "2026-10-21T10:00:00.000Z"));
   state = applyEvent(state, thinkingDelta("abcdef123456，记住它", "2026-10-21T10:00:01.000Z"));
   state = applyEvent(state, thinkingDone("", "2026-10-21T10:00:02.000Z"));
-  const content = panelAt(buildPreviewCard(state)).elements[0]?.content ?? "";
+  const content = panelContent(panelAt(buildPreviewCard(state)));
   assert.ok(!content.includes("abcdef123456"), `密钥本体泄漏：${content}`);
   assert.ok(content.includes("penguin_***"), `打码标记应完整可见：${content}`);
 });
@@ -160,7 +185,7 @@ test("card：思考全文先脱敏再截断，跨 delta 拼起来的密钥也打
 test("card：思考全文自带 ``` 时围栏加长，代码块不被提前合上", () => {
   const state = applyEvent(emptyPreview(), thinkingDone("看这段\n```\nconst a = 1;\n```\n完", "2026-10-21T10:00:04.230Z"));
   const panel = panelAt(buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state));
-  const content = panel.elements[0]?.content ?? "";
+  const content = panelContent(panel);
   assert.ok(content.startsWith("````\n"), content);
   assert.ok(content.endsWith("\n````"), content);
 });
@@ -188,7 +213,7 @@ test("card：工具渲染成默认收起的折叠面板，标题带名称与参�
   const panel = panelAt(card);
   assert.equal(panel.expanded, false, "默认收起");
   assert.equal(panel.header.title.tag, "markdown");
-  assert.equal(panel.header.title.content, '**🔧 exec_command · 运行完毕** · `{"command":"ls"}`');
+  assert.equal(panel.header.title.content, '**🔧 exec_command · 运行完毕 · 2.0s** · `{"command":"ls"}`');
   assert.deepEqual(panel.elements, [
     {
       tag: "markdown",
@@ -202,13 +227,13 @@ test("card：工具参数里的反引号换成单引号，避免撑破标题行�
   const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", '{"command":"echo `hi`"}'));
   const panel = panelAt(buildPreviewCard(state));
   assert.equal(panel.header.title.content, '**🔧 exec_command · 运行中…** · `{"command":"echo \'hi\'"}`');
-  assert.ok(!panel.elements[0]?.content.includes("`hi`"), "面板围栏里也不该出现反引号");
+  assert.ok(!panelContent(panel).includes("`hi`"), "面板围栏里也不该出现反引号");
 });
 
 test("card：工具输出超长时沿用 fencedOutput 的截断标注", () => {
   const output = Array.from({ length: 20 }, (_, i) => `第 ${i + 1} 行`).join("\n");
   const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command")), toolResultDone("c1", output));
-  const content = panelAt(buildPreviewCard(state)).elements[0]?.content ?? "";
+  const content = panelContent(panelAt(buildPreviewCard(state)));
   assert.ok(content.includes("第 20 行"), "末尾行要留下");
   assert.ok(!content.includes("第 12 行"), "第 12 行应被丢掉");
   assert.match(content, /（已截断，共 20 行，显示末尾 8 行）/);
@@ -217,7 +242,7 @@ test("card：工具输出超长时沿用 fencedOutput 的截断标注", () => {
 test("card：工具输出自带 ``` 时围栏加长，代码块不被提前合上", () => {
   const output = "```\nconst a = 1;\n```";
   const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command")), toolResultDone("c1", output));
-  const content = panelAt(buildPreviewCard(state)).elements[0]?.content ?? "";
+  const content = panelContent(panelAt(buildPreviewCard(state)));
   assert.ok(content.includes("````\n```\nconst a = 1;\n```\n````"), content);
 });
 
@@ -231,7 +256,7 @@ test("card：无参数无输出的工具面板显示「（无详情）」", () =
 test("card：只有输出没有参数时面板只有输出围栏块", () => {
   const state = applyEvent(applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", "")), toolResultDone("c1", "结果"));
   const panel = panelAt(buildPreviewCard(state));
-  assert.equal(panel.header.title.content, "**🔧 exec_command · 运行完毕**");
+  assert.equal(panel.header.title.content, "**🔧 exec_command · 运行完毕 · 2.0s**");
   assert.deepEqual(panel.elements, [{ tag: "markdown", content: "```\n结果\n```", text_size: "notation" }]);
 });
 
@@ -250,12 +275,122 @@ test("card：分区按 Run 真实时序排列，工具可夹在两段正文之�
   state = applyEvent(state, toolCallDone("c2", "exec_command", '{"command":"pnpm test"}'));
   state = appendText(state, "再跑测试");
   const card = buildPreviewCard(state);
+  // 思考与第一次工具调用相邻 → 合成一个分组；其后的工具调用单独一步，仍是 ADR-0007 的单面板
   assert.deepEqual(
     card.body.elements.map((element) => element.tag),
-    ["collapsible_panel", "collapsible_panel", "markdown", "collapsible_panel", "markdown"],
+    ["collapsible_panel", "markdown", "collapsible_panel", "markdown"],
   );
-  assert.equal(markdownAt(card, 2), "先看渲染器");
-  assert.equal(markdownAt(card, 4), "再跑测试");
+  assert.equal(markdownAt(card, 1), "先看渲染器");
+  assert.equal(markdownAt(card, 3), "再跑测试");
+  const group = panelAt(card, 0);
+  assert.equal(group.header.title.content, "**🧰 运行中… · 2 步**");
+  assert.equal(group.elements.length, 2, "组内两步各是一个嵌套面板");
+  const lone = card.body.elements[2];
+  assert.equal(lone?.tag, "collapsible_panel");
+  if (lone?.tag !== "collapsible_panel") return;
+  assert.equal(lone.header.title.content, '**🔧 exec_command · 运行中…** · `{"command":"pnpm test"}`');
+});
+
+test("card：连续的思考与工具分区合并成一个分组面板，组内每步一个嵌套面板，全部默认收起", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDone("先想一下", "2026-10-21T10:00:04.230Z"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}', "2026-10-21T10:00:04.500Z"));
+  state = applyEvent(state, toolResultDone("c1", "a.ts\nb.ts", "2026-10-21T10:00:05.700Z"));
+  const card = buildRunCard({ status: "completed", text: "答完了", usage: { total: 1 } }, state);
+  // 一个分组面板 + 正文 + 页脚；组内两步各是一个嵌套面板
+  assert.deepEqual(
+    card.body.elements.map((element) => element.tag),
+    ["collapsible_panel", "markdown", "hr", "markdown"],
+  );
+  const group = panelAt(card);
+  assert.equal(group.expanded, false, "分组默认收起");
+  assert.equal(group.header.title.content, "**🧰 运行完毕 · 2 步 · 5.7s**", "组耗时 = 组内最后事件时间 − 第一个事件时间");
+  assert.equal(group.elements.length, 2, "组内两步");
+  const steps = group.elements;
+  const thoughtStep = steps[0];
+  const toolStep = steps[1];
+  assert.equal(thoughtStep?.tag, "collapsible_panel");
+  assert.equal(toolStep?.tag, "collapsible_panel");
+  if (thoughtStep?.tag !== "collapsible_panel" || toolStep?.tag !== "collapsible_panel") return;
+  assert.equal(thoughtStep.expanded, false, "组内每步同样默认收起");
+  assert.equal(toolStep.expanded, false);
+  assert.equal(thoughtStep.header.title.content, "**🧠 思考 · 运行完毕 · 4 字 · 4.2s**", "思考步标题沿用 ADR-0007");
+  assert.equal(toolStep.header.title.content, '**🔧 exec_command · 运行完毕 · 1.2s** · `{"command":"ls"}`');
+  assert.deepEqual(thoughtStep.elements, [{ tag: "markdown", content: "```\n先想一下\n```", text_size: "notation" }]);
+  assert.ok(panelContent(toolStep).includes("a.ts"), "工具步面板内容是参数与输出围栏块");
+});
+
+test("card：预览期分组标题只报「🧰 运行中… · N 步」，不定终态", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}', "2026-10-21T10:00:04.500Z"));
+  state = applyEvent(state, toolResultDone("c1", "a.ts", "2026-10-21T10:00:05.700Z"));
+  // 哪怕两步都已闭合，Run 没结束就不标「运行完毕」
+  assert.equal(panelAt(buildPreviewCard(state)).header.title.content, "**🧰 运行中… · 2 步**");
+});
+
+test("card：定稿时组内有步未闭合，分组标题只写「🧰 N 步」——不标状态、不给耗时，不谎报完毕", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDone("先想一下", "2026-10-21T10:00:04.230Z"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}', "2026-10-21T10:00:04.500Z"));
+  const card = buildRunCard({ status: "completed", text: "答完了", usage: null }, state);
+  assert.equal(panelAt(card).header.title.content, "**🧰 2 步**");
+});
+
+test("card：组耗时按组内全部事件时间算，孤儿结果的 endedAt 也计入首末跨度", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("先想一下", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, thinkingDone("先想一下", "2026-10-21T10:00:01.000Z"));
+  state = applyEvent(state, toolResultDone("c9", "迟到的输出", "2026-10-21T10:00:05.000Z"));
+  const card = buildRunCard({ status: "completed", text: "答完了", usage: null }, state);
+  assert.equal(panelAt(card).header.title.content, "**🧰 运行完毕 · 2 步 · 5.0s**", "10:00:00 → 10:00:05");
+});
+
+test("card：text 与 notice 分区打断分组，组在它们之间断开", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("甲", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}'));
+  state = appendText(state, "中间夹一段正文");
+  state = applyEvent(state, toolCallDone("c2", "read_file", '{"path":"a.ts"}'));
+  state = applyEvent(state, thinkingDelta("乙", "2026-10-21T10:00:05.000Z"));
+  const card = buildPreviewCard(state);
+  assert.deepEqual(
+    card.body.elements.map((element) => element.tag),
+    ["collapsible_panel", "markdown", "collapsible_panel"],
+    "正文把前后两组断开，各自成组",
+  );
+  assert.equal(panelAt(card, 0).header.title.content, "**🧰 运行中… · 2 步**");
+  assert.equal(topPanels(card)[1]?.header.title.content, "**🧰 运行中… · 2 步**");
+  assert.equal(markdownAt(card, 1), "中间夹一段正文");
+});
+
+test("card：提示分区（notice）也打断分组", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, thinkingDelta("甲", "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, toolCallDone("c1", "exec_command"));
+  state = applyEvent(state, { type: "compaction.started" });
+  state = applyEvent(state, toolCallDone("c2", "read_file"));
+  state = applyEvent(state, thinkingDelta("乙", "2026-10-21T10:00:05.000Z"));
+  const card = buildPreviewCard(state);
+  assert.deepEqual(
+    card.body.elements.map((element) => element.tag),
+    ["collapsible_panel", "markdown", "collapsible_panel"],
+  );
+  assert.equal(markdownAt(card, 1), "🗜️ 正在压缩上下文…");
+});
+
+test("card：工具步标题带耗时；孤儿结果没有 startedAt，标题不给耗时（缺起点不编造）", () => {
+  let state = emptyPreview();
+  state = applyEvent(state, toolCallDone("c1", "exec_command", '{"command":"ls"}', "2026-10-21T10:00:00.000Z"));
+  state = applyEvent(state, toolResultDone("c1", "a.ts", "2026-10-21T10:00:02.500Z"));
+  assert.equal(
+    panelAt(buildPreviewCard(state)).header.title.content,
+    '**🔧 exec_command · 运行完毕 · 2.5s** · `{"command":"ls"}`',
+  );
+  const orphan = applyEvent(emptyPreview(), toolResultDone("c9", "孤儿输出", "2026-10-21T10:00:02.000Z"));
+  assert.equal(panelAt(buildPreviewCard(orphan)).header.title.content, "**🔧 工具 · 运行完毕**");
 });
 
 test("card：定稿分区与文本定稿同源，答案不丢", () => {
@@ -354,6 +489,66 @@ test("card：超预算时优先整块丢弃思考面板，正文与工具面板�
     ),
     "应有丢弃标注",
   );
+});
+
+test("card：超预算时整组丢弃，丢弃标注按组内真实分区数计（一个组含多个分区时不计组数）", () => {
+  // 5 组、每组 3 步（思考 + 工具 + 思考），组间夹短正文；合计远超 20KB 预算。
+  let state = emptyPreview();
+  for (let i = 0; i < 5; i += 1) {
+    const at = (second: number): string => `2026-10-21T10:00:${String(second).padStart(2, "0")}.000Z`;
+    state = applyEvent(state, thinkingDone("甲".repeat(2000), at(i * 10)));
+    state = applyEvent(state, toolCallDone(`c${i}`, "exec_command", '{"command":"ls"}', at(i * 10 + 1)));
+    state = applyEvent(state, toolResultDone(`c${i}`, "行".repeat(100), at(i * 10 + 2)));
+    state = applyEvent(state, thinkingDone("乙".repeat(2000), at(i * 10 + 3)));
+    if (i < 4) state = appendText(state, `第 ${i} 段正文`);
+  }
+  const card = buildPreviewCard(state);
+  assert.ok(JSON.stringify(card).length <= CARD_BUDGET_CHARS, `实际 ${JSON.stringify(card).length}`);
+  const markers = card.body.elements.filter(
+    (element) => element.tag === "markdown" && /……（中间省略 \d+ 个分区）……/.test(element.content),
+  );
+  assert.equal(markers.length, 1, "应有且仅有一条丢弃标注");
+  const marker = markers[0];
+  assert.ok(marker !== undefined && marker.tag === "markdown");
+  const droppedParts = Number(/……（中间省略 (\d+) 个分区）……/.exec(marker?.tag === "markdown" ? marker.content : "")?.[1]);
+  const survivingGroups = topPanels(card).length;
+  assert.ok(survivingGroups < 5, "应有组被整组丢弃");
+  assert.equal(droppedParts, (5 - survivingGroups) * 3, "标注按真实分区数（每组 3 步）累计，不按组数");
+  for (let i = 0; i < 4; i += 1) assert.ok(hasText(card, `第 ${i} 段正文`), "分组是细节，正文不被丢");
+});
+
+test("card：分组嵌套计入元素个数，超飞书 200 元素上限时继续丢组", () => {
+  // 100 组、每组「思考 + 工具」两步：每组 5 个元素（组面板 + 2 个步面板 + 2 个内容 markdown）。
+  let state = emptyPreview();
+  for (let i = 0; i < 100; i += 1) {
+    state = applyEvent(state, thinkingDone("想", "2026-10-21T10:00:00.000Z"));
+    state = applyEvent(state, toolCallDone(`c${i}`, "exec_command", '{"command":"ls"}'));
+    if (i % 5 === 4) state = appendText(state, `第 ${i} 段`);
+  }
+  const card = buildPreviewCard(state);
+  assert.ok(JSON.stringify(card).length <= CARD_BUDGET_CHARS, `实际 ${JSON.stringify(card).length}`);
+  assert.ok(countAll(card.body.elements) <= 200, `递归元素数 ${countAll(card.body.elements)}`);
+  assert.ok(
+    card.body.elements.some(
+      (element) => element.tag === "markdown" && /……（中间省略 \d+ 个分区）……/.test(element.content),
+    ),
+    "应有丢弃标注",
+  );
+});
+
+test("card：连头尾都放不下时，组面板内容按占比分摊预算、递归截断到最内层 markdown", () => {
+  let state = emptyPreview();
+  for (let i = 0; i < 5; i += 1) state = applyEvent(state, thinkingDone("甲".repeat(2000), `2026-10-21T10:00:0${i}.000Z`));
+  state = appendText(state, "答".repeat(60000));
+  const card = buildRunCard({ status: "completed", text: "答".repeat(60000), usage: { total: 1 } }, state);
+  assert.ok(JSON.stringify(card).length <= CARD_BUDGET_CHARS, `实际 ${JSON.stringify(card).length}`);
+  const group = panelAt(card);
+  assert.equal(group.elements.length, 5, "5 步思考都在组里");
+  for (const step of group.elements) {
+    if (step.tag !== "collapsible_panel") throw new Error("组内应是嵌套面板");
+    assert.match(panelContent(step), /…（中间省略 \d+ 字）…/, "最内层 markdown 被递归截断");
+  }
+  assert.match(markdownAt(card, 1), /…（中间省略 \d+ 字）…/, "结尾正文同样段内截断");
 });
 
 test("card：五种卡片都能 JSON.stringify 往返", () => {

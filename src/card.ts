@@ -4,7 +4,7 @@
 // 结构按 lark-cli 实测可发送、可 patch 的形态组织：思考与工具调用都放进默认收起的折叠面板。
 
 import type { FinalOutcome, PreviewPart, PreviewState, ThoughtPart, ToolPart } from "./render.js";
-import { fenceFor, finalParts, fencedOutput, thoughtPanelTitle } from "./render.js";
+import { durationLabel, fenceFor, finalParts, fencedOutput, thoughtPanelTitle } from "./render.js";
 import { fitMiddleDroppingPreferred } from "./budget.js";
 import { redact } from "./logger.js";
 
@@ -27,12 +27,15 @@ export interface MarkdownElement {
   text_size?: "notation";
 }
 
-/** 可折叠面板：工具调用的载体，默认收起，标题带名称与参数。 */
+/**
+ * 可折叠面板：工具调用的载体，默认收起，标题带名称与参数。
+ * elements 允许再放面板：分组面板里嵌套的就是每步的小面板（ADR-0010，Card 2.0 合法嵌套）。
+ */
 export interface CollapsiblePanelElement {
   tag: "collapsible_panel";
   expanded: boolean;
   header: { title: MarkdownElement };
-  elements: MarkdownElement[];
+  elements: CardElement[];
 }
 
 /** Card 2.0 元素：本项目只用 markdown、hr 与可折叠面板三种。 */
@@ -84,10 +87,12 @@ export function buildRunCard(outcome: FinalOutcome, state: PreviewState): RunCar
   );
 }
 
-/** 装配槽：一个分区对应一个元素；droppableFirst 标记预算紧张时优先整块丢弃的分区（思考，ADR-0007）。 */
+/** 装配槽：一个分区对应一个元素；droppableFirst 标记预算紧张时优先整块丢弃的分区（ADR-0007 思考面板、ADR-0010 分组）。 */
 interface Slot {
   element: CardElement;
   droppableFirst: boolean;
+  /** 这个槽代表的真实分区数（分组槽 > 1）：丢弃标注按分区数累计，一个组含多个分区时不计组数。 */
+  partCount: number;
 }
 
 /** 装配：分区 → 元素，过预算装配，再套上卡片外壳。 */
@@ -98,24 +103,62 @@ function assemble(
   mode: "preview" | "final",
   footer: CardElement[],
 ): RunCard {
-  // 一个分区恰好渲染成一个元素（思考与工具都是折叠面板），所以「丢分区」就是丢元素。
-  const slots: Slot[] = parts.map((part) => ({
-    element: partElement(part, mode),
-    droppableFirst: part.kind === "thought",
-  }));
+  const slots = toSlots(parts, mode);
   const elementsOf = (candidate: Slot[]): CardElement[] => [...candidate.map((slot) => slot.element), ...footer];
   const fits = (candidate: Slot[]): boolean =>
     JSON.stringify(card(title, template, elementsOf(candidate))).length <= CARD_BUDGET_CHARS &&
     countElements(elementsOf(candidate)) <= MAX_ELEMENTS;
-  // 丢分区循环与 render.ts 同构，共用 budget.ts 的内核；思考面板优先丢（ADR-0007）。
+  // 丢弃标注要按真实分区数计，而内核只告诉「丢了几个槽」：先按「最多可能丢多少分区」占位
+  // （占位标注不比任何最终标注短，拟合判定因此不会偏松），内核选出结果后再换成真实分区数。
+  const notice: Slot = { element: dropNotice(totalParts(slots)), droppableFirst: false, partCount: 0 };
+  // 丢分区循环与 render.ts 同构，共用 budget.ts 的内核；思考面板与分组优先丢（ADR-0007 / ADR-0010）。
   // 连头尾两个分区都放不下时返回 null，走卡片刻的段内截断（capSlots）。
-  const kept = fitMiddleDroppingPreferred(
-    slots,
-    fits,
-    (dropped): Slot => ({ element: dropNotice(dropped), droppableFirst: false }),
-    (slot) => slot.droppableFirst,
-  );
-  return card(title, template, elementsOf(kept ?? capSlots(slots, fits)));
+  const kept = fitMiddleDroppingPreferred(slots, fits, () => notice, (slot) => slot.droppableFirst);
+  const finalSlots =
+    kept === null
+      ? capSlots(slots, fits)
+      : kept.map((slot) => (slot === notice ? { ...notice, element: dropNotice(droppedParts(slots, kept)) } : slot));
+  return card(title, template, elementsOf(finalSlots));
+}
+
+/** 全部槽位代表的真实分区数（丢弃标注占位长度的上限）。 */
+function totalParts(slots: Slot[]): number {
+  return slots.reduce((sum, slot) => sum + slot.partCount, 0);
+}
+
+/** 被丢掉的槽位代表的真实分区数：幸存槽之外的都算，分组含几个分区就计几个。 */
+function droppedParts(slots: Slot[], kept: Slot[]): number {
+  return slots.reduce((sum, slot) => (kept.includes(slot) ? sum : sum + slot.partCount), 0);
+}
+
+/**
+ * 分区 → 槽位：连续的 thought / tool 分区合成一个分组面板（ADR-0010），text 与 notice 打断分组。
+ * 单独一步不成组——没有可合并的对象，沿用 ADR-0007 的单面板形态（多套一层分组就多一次无谓点击）；
+ * 单独的思考面板也仍按 ADR-0007 优先丢弃，分组的「细节优先丢」只作用于多步组。
+ */
+function toSlots(parts: PreviewPart[], mode: "preview" | "final"): Slot[] {
+  const slots: Slot[] = [];
+  let run: Array<ThoughtPart | ToolPart> = [];
+  const flush = (): void => {
+    const first = run[0];
+    if (first === undefined) return;
+    if (run.length === 1) {
+      slots.push({ element: partElement(first, mode), droppableFirst: first.kind === "thought", partCount: 1 });
+    } else {
+      slots.push({ element: groupPanel(run, mode), droppableFirst: true, partCount: run.length });
+    }
+    run = [];
+  };
+  for (const part of parts) {
+    if (part.kind === "thought" || part.kind === "tool") {
+      run.push(part);
+    } else {
+      flush();
+      slots.push({ element: partElement(part, mode), droppableFirst: false, partCount: 1 });
+    }
+  }
+  flush();
+  return slots;
 }
 
 /** 分区 → 元素：正文与提示原样展开；思考与工具进默认收起的折叠面板。 */
@@ -130,6 +173,59 @@ function partElement(part: PreviewPart, mode: "preview" | "final"): CardElement 
     case "tool":
       return toolPanel(part);
   }
+}
+
+/**
+ * 分组面板：一段连续执行（思考与工具交替）收进一个默认收起的折叠面板，
+ * 组内每步各是一个嵌套折叠面板——点开分组再点开某一步才看到详情（ADR-0010）。
+ */
+function groupPanel(steps: Array<ThoughtPart | ToolPart>, mode: "preview" | "final"): CollapsiblePanelElement {
+  return {
+    tag: "collapsible_panel",
+    expanded: false,
+    header: { title: { tag: "markdown", content: groupTitle(steps, mode) } },
+    elements: steps.map((step) => partElement(step, mode)),
+  };
+}
+
+/**
+ * 分组标题：预览「🧰 运行中… · N 步」；定稿且组内每步都已闭合才标「运行完毕」并给组耗时，
+ * 有步未闭合只写「🧰 N 步」——拿不到终态不谎报完毕（ADR-0007 的诚实原则沿用）。
+ */
+function groupTitle(steps: Array<ThoughtPart | ToolPart>, mode: "preview" | "final"): string {
+  const count = `${steps.length} 步`;
+  if (mode === "preview") return `**🧰 运行中… · ${count}**`;
+  if (!steps.every(stepClosed)) return `**🧰 ${count}**`;
+  const span = groupSpan(steps);
+  return span === undefined ? `**🧰 运行完毕 · ${count}**` : `**🧰 运行完毕 · ${count} · ${span}**`;
+}
+
+/** 一步是否已闭合：工具有 output、思考有 endedAt（与 ADR-0007 的状态口径一致）。 */
+function stepClosed(step: ThoughtPart | ToolPart): boolean {
+  return step.kind === "thought" ? step.endedAt !== undefined : step.output !== undefined;
+}
+
+/**
+ * 组耗时 = 组内最后一个事件时间 − 第一个事件时间（每个已知时间戳都算数：
+ * 思考的起止、工具的起止，孤儿结果只有终点也计入）。算不出起止就返回 undefined——
+ * 缺时间戳的事件不参与耗时计算，也不编造（ADR-0010）。
+ */
+function groupSpan(steps: Array<ThoughtPart | ToolPart>): string | undefined {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  let seen = 0;
+  for (const step of steps) {
+    for (const at of [step.startedAt, step.endedAt]) {
+      if (at === undefined) continue;
+      const millis = Date.parse(at);
+      if (Number.isNaN(millis)) continue;
+      seen += 1;
+      if (millis < min) min = millis;
+      if (millis > max) max = millis;
+    }
+  }
+  if (seen < 2) return undefined;
+  return `${((max - min) / 1000).toFixed(1)}s`;
 }
 
 /** 思考分区 → 折叠面板：标题是思考标签（带运行状态），面板里是完整思考全文（ADR-0007）。 */
@@ -156,18 +252,21 @@ function thinkingBody(part: ThoughtPart): string {
   return `${fence}\n${capContent(text, THOUGHT_PANEL_LIMIT)}\n${fence}`;
 }
 
-/** 工具分区 → 折叠面板：标题「🔧 名称 · 状态 · 参数」，面板里是参数与输出的围栏块。 */
+/** 工具分区 → 折叠面板：标题「🔧 名称 · 状态 · 耗时 · 参数」，面板里是参数与输出的围栏块。 */
 function toolPanel(part: ToolPart): CollapsiblePanelElement {
   const args = part.args === undefined || part.args === "" ? undefined : part.args;
   const output = part.output === undefined || part.output === "" ? undefined : part.output;
   // 状态只看 output 到没到：没到就是运行中，到了（含空串）就是运行完毕（ADR-0007）。
   const state = part.output === undefined ? "运行中…" : "运行完毕";
+  // 耗时有则加、无则不加：起点终点都来自事件时间戳，缺起点（孤儿结果）就不编造（ADR-0010）。
+  const duration = durationLabel(part.startedAt, part.endedAt);
+  const head =
+    duration === undefined
+      ? `**🔧 ${part.name} · ${state}**`
+      : `**🔧 ${part.name} · ${state} · ${duration}**`;
   // 反引号会撑破标题里的行内代码与面板里的围栏，先换成单引号（与 render.ts 的 renderTool 一致）。
   const shownArgs = args === undefined ? undefined : args.replace(/`/g, "'");
-  const title =
-    shownArgs === undefined
-      ? `**🔧 ${part.name} · ${state}**`
-      : `**🔧 ${part.name} · ${state}** · \`${shownArgs}\``;
+  const title = shownArgs === undefined ? head : `${head} · \`${shownArgs}\``;
   const blocks: string[] = [];
   if (shownArgs !== undefined) blocks.push(`\`\`\`json\n${shownArgs}\n\`\`\``);
   if (output !== undefined) blocks.push(fencedOutput(output));
@@ -196,12 +295,15 @@ function dropNotice(dropped: number): CardElement {
   return { tag: "markdown", content: `……（中间省略 ${dropped} 个分区）……` };
 }
 
-/** 元素个数（含嵌套）：飞书单卡 200 元素上限连 collapsible_panel 内部的元素一起算。 */
+/** 元素个数（含嵌套）：飞书单卡 200 元素上限连 collapsible_panel 内部的元素一起算；分组面板里还有步面板，递归累计。 */
 function countElements(elements: CardElement[]): number {
-  return elements.reduce(
-    (total, element) => total + (element.tag === "collapsible_panel" ? 1 + element.elements.length : 1),
-    0,
-  );
+  return elements.reduce((total, element) => total + countElement(element), 0);
+}
+
+/** 单个元素的元素个数：折叠面板本身算 1，面板里的元素（可能还是面板）递归累计。 */
+function countElement(element: CardElement): number {
+  if (element.tag === "collapsible_panel") return 1 + countElements(element.elements);
+  return 1;
 }
 
 /**
@@ -214,8 +316,9 @@ function capSlots(slots: Slot[], fits: (candidate: Slot[]) => boolean): Slot[] {
   if (first === undefined) return slots;
   const last = slots.at(-1) ?? first;
   const single = slots.length === 1;
-  const dropped = slots.length - 2;
-  const middle = dropped > 0 ? [{ element: dropNotice(dropped), droppableFirst: false } satisfies Slot] : [];
+  // 中间被丢的分区数按真实分区数累计（分组槽含多个分区），与丢分区循环同一口径。
+  const dropped = slots.slice(1, single ? slots.length : -1).reduce((sum, slot) => sum + slot.partCount, 0);
+  const middle = dropped > 0 ? [{ element: dropNotice(dropped), droppableFirst: false, partCount: 0 } satisfies Slot] : [];
   for (let budget = CARD_BUDGET_CHARS; budget > 0; budget = Math.floor(budget / 2)) {
     const cappedFirst = capSlot(first, single ? budget : Math.floor(budget / 2));
     const tailBudget = budget - contentLength(cappedFirst.element);
@@ -226,11 +329,11 @@ function capSlots(slots: Slot[], fits: (candidate: Slot[]) => boolean): Slot[] {
   return single ? [capSlot(first, 0)] : [capSlot(first, 0), ...middle, capSlot(last, 0)];
 }
 
-/** 元素的原始内容字符数（JSON 测长前的口径）：markdown 看 content，折叠面板看面板内容。 */
+/** 元素的原始内容字符数（JSON 测长前的口径）：markdown 看 content，折叠面板看面板内容（递归到最内层）。 */
 function contentLength(element: CardElement): number {
   if (element.tag === "markdown") return element.content.length;
   if (element.tag === "collapsible_panel") {
-    return element.elements.reduce((total, item) => total + item.content.length, 0);
+    return element.elements.reduce((total, item) => total + contentLength(item), 0);
   }
   return 0;
 }
@@ -239,9 +342,13 @@ function contentLength(element: CardElement): number {
 function capElement(element: CardElement, budget: number): CardElement {
   if (element.tag === "markdown") return { ...element, content: capContent(element.content, budget) };
   if (element.tag === "collapsible_panel") {
+    const total = contentLength(element);
+    if (total <= budget) return element;
+    // 分组面板里还有步面板：按各子元素当前长度占比分摊预算，递归到最内层 markdown。
+    // 单层面板（只有一个 markdown 子元素）时分到全款，与原来的行为逐字等价。
     return {
       ...element,
-      elements: element.elements.map((item) => ({ ...item, content: capContent(item.content, budget) })),
+      elements: element.elements.map((item) => capElement(item, Math.floor((budget * contentLength(item)) / total))),
     };
   }
   return element;

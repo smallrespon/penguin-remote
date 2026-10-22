@@ -112,11 +112,12 @@ export function toRunEvents(message: OmniMessage): RunEvent[] {
           name: str(p.name),
           arguments: str(p.arguments),
           tool_call_id: str(p.tool_call_id),
+          at,
         },
       ];
     }
     case "tool_call_output": {
-      return [{ type: "tool_result.done", output: str(p.output), tool_call_id: str(p.tool_call_id) }];
+      return [{ type: "tool_result.done", output: str(p.output), tool_call_id: str(p.tool_call_id), at }];
     }
     default:
       return [];

@@ -24,16 +24,18 @@ const textDelta = (text: string): RunEvent => ({ type: "text.delta", role: "assi
 const textDone = (text: string): RunEvent => ({ type: "text.done", role: "assistant", text });
 const thinkingDelta = (thinking: string, at = "2026-10-21T10:00:00.000Z"): RunEvent => ({ type: "thinking.delta", thinking, at });
 const thinkingDone = (thinking: string, at = "2026-10-21T10:00:05.000Z"): RunEvent => ({ type: "thinking.done", thinking, at });
-const toolCallDone = (id: string, name: string, args = "{}"): RunEvent => ({
+const toolCallDone = (id: string, name: string, args = "{}", at = "2026-10-21T10:00:00.000Z"): RunEvent => ({
   type: "tool_call.done",
   name,
   arguments: args,
   tool_call_id: id,
+  at,
 });
-const toolResultDone = (id: string, output: string): RunEvent => ({
+const toolResultDone = (id: string, output: string, at = "2026-10-21T10:00:02.000Z"): RunEvent => ({
   type: "tool_result.done",
   output,
   tool_call_id: id,
+  at,
 });
 
 const OPTIONS: PreviewOptions = { throttleMs: 1500, throttleChars: 300, maxChars: 3500 };
@@ -175,7 +177,21 @@ test("render：tool_call.done 先脱敏再截断，跨 80 字切口的密钥不�
 test("render：tool_call.done 参数为空时不记 args", () => {
   const state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", ""));
   const part = state.parts.at(-1);
-  assert.deepEqual(part, { kind: "tool", id: "c1", name: "exec_command" });
+  assert.deepEqual(part, { kind: "tool", id: "c1", name: "exec_command", startedAt: "2026-10-21T10:00:00.000Z" });
+});
+
+test("render：tool_call.done 记 startedAt，tool_result.done 回填 endedAt（每步耗时的依据）", () => {
+  let state = applyEvent(emptyPreview(), toolCallDone("c1", "exec_command", '{"command":"ls"}', "2026-10-21T10:00:00.000Z"));
+  const called = state.parts.at(-1);
+  assert.equal(called?.kind, "tool");
+  if (called?.kind !== "tool") return;
+  assert.equal(called.startedAt, "2026-10-21T10:00:00.000Z");
+  assert.equal(called.endedAt, undefined, "没收到输出就没有终点");
+  state = applyEvent(state, toolResultDone("c1", "a.ts", "2026-10-21T10:00:02.500Z"));
+  const finished = state.parts.at(-1);
+  if (finished?.kind !== "tool") return;
+  assert.equal(finished.startedAt, "2026-10-21T10:00:00.000Z", "回填输出不丢起点");
+  assert.equal(finished.endedAt, "2026-10-21T10:00:02.500Z");
 });
 
 test("render：tool_result.done 回填到最后一个同 id 且没有输出的工具分区", () => {
@@ -184,14 +200,23 @@ test("render：tool_result.done 回填到最后一个同 id 且没有输出的�
   state = applyEvent(state, toolCallDone("c2", "read_file", '{"path":"a.ts"}'));
   state = applyEvent(state, toolResultDone("c1", "a.ts\nb.ts"));
   assert.deepEqual(state.parts, [
-    { kind: "tool", id: "c1", name: "exec_command", args: '{"command":"ls"}', output: "a.ts\nb.ts" },
-    { kind: "tool", id: "c2", name: "read_file", args: '{"path":"a.ts"}' },
+    {
+      kind: "tool",
+      id: "c1",
+      name: "exec_command",
+      args: '{"command":"ls"}',
+      startedAt: "2026-10-21T10:00:00.000Z",
+      endedAt: "2026-10-21T10:00:02.000Z",
+      output: "a.ts\nb.ts",
+    },
+    { kind: "tool", id: "c2", name: "read_file", args: '{"path":"a.ts"}', startedAt: "2026-10-21T10:00:00.000Z" },
   ]);
 });
 
 test("render：tool_result.done 找不到对应调用时追加一个通用工具分区", () => {
   const state = applyEvent(emptyPreview(), toolResultDone("c9", "孤儿输出"));
-  assert.deepEqual(state.parts, [{ kind: "tool", id: "c9", name: "工具", output: "孤儿输出" }]);
+  // 孤儿结果只有终点没有起点：该步无耗时（卡片标题不给耗时），但事件时间仍计入组耗时。
+  assert.deepEqual(state.parts, [{ kind: "tool", id: "c9", name: "工具", output: "孤儿输出", endedAt: "2026-10-21T10:00:02.000Z" }]);
 });
 
 test("render：审批与压缩提示按事件顺序落成提示分区", () => {

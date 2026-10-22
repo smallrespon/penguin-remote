@@ -48,15 +48,32 @@ test("thinking 增量与完整思考映射为思考事件", () => {
   ]);
 });
 
-test("tool_call 与 tool_call_output 映射为工具事件", () => {
+test("tool_call 与 tool_call_output 映射为工具事件，并带上事件时间戳", () => {
   const events = [
-    ...toRunEvents(omni({ type: "tool_call", role: "assistant", name: "exec_command", arguments: '{"cmd":"date"}', tool_call_id: "tc1" })),
-    ...toRunEvents(omni({ type: "tool_call_output", role: "user", output: "Tue Oct 21", tool_call_id: "tc1" })),
+    ...toRunEvents(
+      omni({ type: "tool_call", role: "assistant", name: "exec_command", arguments: '{"cmd":"date"}', tool_call_id: "tc1" }, { timestamp: "2026-10-21T10:00:00.000Z" }),
+    ),
+    ...toRunEvents(
+      omni({ type: "tool_call_output", role: "user", output: "Tue Oct 21", tool_call_id: "tc1" }, { timestamp: "2026-10-21T10:00:03.500Z" }),
+    ),
   ];
   assert.deepEqual(events, [
-    { type: "tool_call.done", name: "exec_command", arguments: '{"cmd":"date"}', tool_call_id: "tc1" },
-    { type: "tool_result.done", output: "Tue Oct 21", tool_call_id: "tc1" },
+    { type: "tool_call.done", name: "exec_command", arguments: '{"cmd":"date"}', tool_call_id: "tc1", at: "2026-10-21T10:00:00.000Z" },
+    { type: "tool_result.done", output: "Tue Oct 21", tool_call_id: "tc1", at: "2026-10-21T10:00:03.500Z" },
   ]);
+});
+
+test("tool_call / tool_call_output 缺 timestamp 时 at 兜底为当前时间（与思考事件同口径）", () => {
+  const before = Date.now();
+  const events = [
+    ...toRunEvents(omni({ type: "tool_call", role: "assistant", name: "exec_command", arguments: "{}", tool_call_id: "tc1" })),
+    ...toRunEvents(omni({ type: "tool_call_output", role: "user", output: "ok", tool_call_id: "tc1" })),
+  ];
+  for (const event of events) {
+    if (event.type !== "tool_call.done" && event.type !== "tool_result.done") continue;
+    assert.ok(!Number.isNaN(Date.parse(event.at)), `at 应是可解析的时间戳：${event.at}`);
+    assert.ok(Math.abs(Date.parse(event.at) - before) < 60_000, "缺 timestamp 时兜底到当前时间，不能拿纪元时间充数");
+  }
 });
 
 test("未知 payload 类型被忽略（不产生渲染事件）", () => {

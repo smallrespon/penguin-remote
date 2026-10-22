@@ -4,7 +4,7 @@
 // 摊平文本（flatText）在 flat-text.ts，这里再导出方便一站式 import。
 
 import type { OutboundMessage } from "../../src/channels/types.js";
-import type { CollapsiblePanelElement, RunCard } from "../../src/card.js";
+import type { CardElement, CollapsiblePanelElement, RunCard } from "../../src/card.js";
 
 export { flatText } from "./flat-text.js";
 
@@ -31,11 +31,15 @@ export function footerOf(card: RunCard): string {
   return last !== undefined && last.tag === "markdown" ? last.content : "";
 }
 
-/** 卡片里的全部折叠面板（工具调用的载体），按出现顺序。 */
+/** 卡片里的全部折叠面板（工具调用的载体），按出现顺序；分组面板内嵌套的步面板也一并展开（ADR-0010）。 */
 export function panelsOf(card: RunCard): CollapsiblePanelElement[] {
-  return card.body.elements.filter(
-    (element): element is CollapsiblePanelElement => element.tag === "collapsible_panel",
-  );
+  return card.body.elements.flatMap(panelsIn);
+}
+
+/** 元素里的全部折叠面板：面板自身 + 其子元素里递归找到的面板（分组内还有每步的小面板）。 */
+function panelsIn(element: CardElement): CollapsiblePanelElement[] {
+  if (element.tag !== "collapsible_panel") return [];
+  return [element, ...element.elements.flatMap(panelsIn)];
 }
 
 /** 取出第 index 个折叠面板（默认第 0 个）。 */

@@ -8,8 +8,9 @@ export type RunEvent =
   | { type: "text.done"; role: "assistant"; text: string }
   | { type: "thinking.delta"; thinking: string; at: string }
   | { type: "thinking.done"; thinking: string; at: string }
-  | { type: "tool_call.done"; name: string; arguments: string; tool_call_id: string }
-  | { type: "tool_result.done"; output: string; tool_call_id: string }
+  // 工具事件带 at：每步耗时与分组耗时都按事件时间戳真实计算（ADR-0010）。
+  | { type: "tool_call.done"; name: string; arguments: string; tool_call_id: string; at: string }
+  | { type: "tool_result.done"; output: string; tool_call_id: string; at: string }
   | { type: "approval.requested"; tool_call: { name: string; arguments: string; tool_call_id: string } }
   | { type: "compaction.started" };
 
