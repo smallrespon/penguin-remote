@@ -328,7 +328,7 @@ test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () =
   });
 
   await channel.receive("/sessions");
-  assert.match(channel.lastSent(), /还没有历史会话/);
+  assert.match(channel.lastSent(), /没有未归档的会话/);
 
   // 别人的会话即使用 /use 1 也切不过去
   await channel.receive("/use 1");
@@ -434,17 +434,22 @@ test("实时列表查询失败：/sessions 与 /use 退回本地历史并首行�
   assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
 });
 
-test("/sessions 无会话（实时与本地都空）：保持「还没有历史会话」提示", async () => {
+test("/sessions 无会话：实时为空提示「没有未归档的会话」，本地兜底为空提示「还没有历史会话」", async () => {
   const server = new FakeSessionServer();
   const channel = new FakeChannel();
   const { gateway } = await makeGateway(server, channel);
   await gateway.start();
 
   await channel.receive("/sessions");
-  assert.match(channel.lastSent(), /还没有历史会话/);
+  assert.match(channel.lastSent(), /没有未归档的会话/);
 
   await channel.receive("/use 1");
   assert.match(channel.lastSent(), /没有第 1 个会话/);
+
+  // 兜底路径（本地历史也为空）：沿用旧文案
+  server.nextListStatus = 500;
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /还没有历史会话/);
 });
 
 test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () => {
@@ -854,7 +859,7 @@ test("多张图片：ok 的转 data URL，超限的跳过并把注明拼进输�
     { messageId: "om_in_1", fileKey: "img_huge" },
   ]);
   assert.deepEqual(server.taskInputParts(), [
-    { type: "text", text: "两张图\n有图片超过 20MB 上限，未发送" },
+    { type: "text", text: "两张图\n（有图片超过 20MB 上限，未发送）" },
     { type: "image_url", imageUrl: `data:image/png;base64,${PNG_SIGNATURE.toString("base64")}` },
   ]);
 });

@@ -3,7 +3,7 @@
 
 import type { ChannelAdapter, IncomingMessage } from "./channels/types.js";
 import type { BridgeConfig } from "./config.js";
-import { imageDataUrlOrNote } from "./images.js";
+import { imageDataUrlOrNote, stripImagePlaceholders } from "./images.js";
 import type { Lanes } from "./lanes.js";
 import { redact } from "./logger.js";
 import type { Logger } from "./logger.js";
@@ -61,19 +61,21 @@ const LIVE_LIST_FALLBACK_NOTE = "⚠️ 实时列表查询失败，显示本地�
 /** 标题拍平（服务端标题可能含换行）后截断到 40 字；空标题给占位。 */
 const TITLE_MAX_CHARS = 40;
 
-/** 图片占位符（与 channels/feishu.ts 的 IMAGE_PLACEHOLDER 同口径；解码时通常已剥，这里兜底）。 */
-const IMAGE_PLACEHOLDER = /!?\[Image\]\(([^)\s]+)\)/g;
+/** 标题拍平 + 截断；空标题（null 或只有空白）用 emptyLabel 占位。 */
+function flattenTitle(title: string | null, emptyLabel: string): string {
+  if (title === null) return emptyLabel;
+  const flat = title.replace(/\s+/g, " ").trim();
+  return flat === "" ? emptyLabel : flat.slice(0, TITLE_MAX_CHARS);
+}
 
 /** 本地历史标题：先移除图片占位符再拍平截断；纯图片消息（文本为空）回落占位标题。 */
 function runTitle(text: string): string {
-  const stripped = text.replace(IMAGE_PLACEHOLDER, " ").replace(/\s+/g, " ").trim();
-  return stripped === "" ? "（图片消息）" : stripped.slice(0, TITLE_MAX_CHARS);
+  return flattenTitle(stripImagePlaceholders(text), "（图片消息）");
 }
 
-function flattenTitle(title: string | null): string {
-  if (title === null) return "（无标题）";
-  const flat = title.replace(/\s+/g, " ").trim();
-  return flat === "" ? "（无标题）" : flat.slice(0, TITLE_MAX_CHARS);
+/** 兜底降级时给回复加一行注明；实时成功时原文返回。 */
+function withFallbackNote(live: boolean, body: string): string {
+  return live ? body : `${LIVE_LIST_FALLBACK_NOTE}\n${body}`;
 }
 
 /** 一条会话行：序号. 标题 — 最近活跃时间 — `model` — `sessionId`；当前会话行首加 →。 */
@@ -81,7 +83,7 @@ function sessionLine(entry: SessionListEntry, index: number, currentSessionId: s
   const at = entry.at === null ? "未知时间" : entry.at.slice(0, 16).replace("T", " ");
   const model = entry.model === null ? "" : ` — \`${entry.model}\``;
   const marker = entry.sessionId === currentSessionId ? "→ " : "";
-  return `${marker}${index + 1}. ${flattenTitle(entry.title)} — ${at}${model} — \`${entry.sessionId}\``;
+  return `${marker}${index + 1}. ${flattenTitle(entry.title, "（无标题）")} — ${at}${model} — \`${entry.sessionId}\``;
 }
 
 export class Gateway {
@@ -333,13 +335,18 @@ export class Gateway {
     const binding = this.deps.registry.bindingFor(chatId);
     const { entries, live } = await this.sessionListFor(chatId);
     if (entries.length === 0) {
-      await this.reply(chatId, "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。");
+      // 实时为空 = 没有未归档会话（可能都已归档）；本地为空才是「没有历史会话」。
+      const empty =
+        live
+          ? "当前 Project/Agent 下没有未归档的会话，发一条消息就开始新的对话。"
+          : "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。";
+      await this.reply(chatId, empty);
       return;
     }
     const lines = entries.map((entry, index) => sessionLine(entry, index, binding.sessionId));
     const current = binding.sessionId === null ? "无（下一条消息新建）" : `\`${binding.sessionId}\``;
     const body = `**最近会话**（当前：${current}）\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
-    await this.reply(chatId, live ? body : `${LIVE_LIST_FALLBACK_NOTE}\n${body}`);
+    await this.reply(chatId, withFallbackNote(live, body));
   }
 
   private async handleUse(chatId: string, index: number): Promise<void> {
@@ -354,7 +361,7 @@ export class Gateway {
       b.sessionId = entry.sessionId;
     });
     const done = `✅ 已切回会话 \`${entry.sessionId}\`，下一条消息继续该对话。`;
-    await this.reply(chatId, live ? done : `${LIVE_LIST_FALLBACK_NOTE}\n${done}`);
+    await this.reply(chatId, withFallbackNote(live, done));
   }
 
   private async handleSkill(chatId: string, name: string | null, mode: "once" | "on" | "off"): Promise<void> {

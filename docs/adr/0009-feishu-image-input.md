@@ -14,7 +14,7 @@
 - 投递即拼装：`RunSpec` 增加 `images: string[]`（data URL 数组）；`SessionClient.startTask` 的入参从纯字符串扩为「字符串或 part 数组」——有图片时发 `[{type:"text"},…{type:"image_url"}]`，无图片时行为与现在逐字一致（单 text part）。纯图片消息（文本为空）只投 image_url parts。
 - 范围只限图片：文件（file）、音频、视频类消息维持不响应；回复方向（Agent → 飞书）的图片输出不在本次范围。
 
-**Consequences**: 用户在飞书里发图片（带文字或不带）即可让模型看图，llm-homework 这类「拍题」场景可直接用。代价与边界：`IncomingMessage`/`ChannelAdapter`/`RunSpec`/`startTask` 签名扩展（测试替身同步更新）；多张图会放大请求体（base64 约 +33%），受服务端 20MB/图与整体 body 上限约束，超限图按上述策略跳过；data URL 在内存中经手，不写 `runs.jsonl`、不进日志（与思考全文同级的保密口径）；图片 key 只在下载瞬间出现在 lark-cli 参数里，参数经 `runCommand` 走脱敏日志。
+**Consequences**: 用户在飞书里发图片（带文字或不带）即可让模型看图，llm-homework 这类「拍题」场景可直接用。代价与边界：`IncomingMessage`/`ChannelAdapter`/`RunSpec`/`startTask` 签名扩展（测试替身同步更新）；多张图会放大请求体（base64 约 +33%），受服务端 20MB/图与整体 body 上限约束，超限图按上述策略跳过；data URL 在内存中经手，不写 `runs.jsonl`、不进日志（与思考全文同级的保密口径）；图片 key 只在下载瞬间出现在 lark-cli 子进程参数里，`runCommand` 不记录参数，出错信息经 `redact()` 脱敏后才进日志。
 
 **Considered Options**:
 - 把图片先落到工作区目录、只在文本里给模型路径：模型侧读不读、何时读不可控，且工作区可能只读；data URL 是服务端文档化的 inline 路径，实测模型确实看了图。放弃。
