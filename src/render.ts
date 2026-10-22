@@ -241,13 +241,18 @@ function renderPart(part: PreviewPart, mode: RenderMode): string {
   }
 }
 
-function renderThought(part: ThoughtPart, mode: RenderMode): string {
+/** 思考分区的一行标签：流式显示「思考中…（N 字）」，定稿按已闭合样式显示。 */
+export function thoughtLabel(part: ThoughtPart, mode: RenderMode): string {
   // 定稿时还没闭合的思考段：按已闭合的样式显示，但拿不到耗时就省掉。
   if (part.endedAt === undefined) {
     return mode === "final" ? `**🧠 思考 · ${part.chars} 字**` : `**🧠 思考中…（${part.chars} 字）**`;
   }
   const seconds = (Date.parse(part.endedAt) - Date.parse(part.startedAt)) / 1000;
   return `**🧠 思考 · ${part.chars} 字 · ${seconds.toFixed(1)}s**`;
+}
+
+function renderThought(part: ThoughtPart, mode: RenderMode): string {
+  return thoughtLabel(part, mode);
 }
 
 function renderTool(part: ToolPart): string {
@@ -263,7 +268,7 @@ function renderTool(part: ToolPart): string {
 }
 
 /** 工具输出的围栏代码块：保留末尾几行、每行限宽，超出行数时显式标注。 */
-function fencedOutput(output: string): string {
+export function fencedOutput(output: string): string {
   const lines = output.split("\n");
   const kept = lines.length > TOOL_OUTPUT_MAX_LINES ? lines.slice(-TOOL_OUTPUT_MAX_LINES) : lines;
   const body = kept.map((line) => truncateLine(line, TOOL_OUTPUT_LINE_WIDTH)).join("\n");
@@ -369,7 +374,7 @@ export function formatFinalText(
  * outcome 没有正文时（典型：中断发生在完整文本落盘前），保留流式累积的正文——
  * 那是当时最好的答案；连流式正文也没有，才给占位说明。
  */
-function finalParts(outcome: { text: string }, state: PreviewState): PreviewPart[] {
+export function finalParts(outcome: { text: string }, state: PreviewState): PreviewPart[] {
   const finalText = outcome.text.trim();
   const textParts = state.parts.filter((part): part is TextPart => part.kind === "text");
   const accumulated = textParts.map((part) => part.text).join("\n\n");
