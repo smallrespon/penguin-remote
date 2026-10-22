@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { decodeMessageEvent, FeishuChannel, stripMentions } from "../src/channels/feishu.js";
+import { placeholderCard } from "../src/card.js";
 import { createLogger } from "../src/logger.js";
+import type { RunResult } from "../src/proc.js";
 import { FakeChild, makeFakeRun, makeFakeSpawn } from "./helpers/fake-child.js";
 import { waitFor } from "./helpers/wait.js";
 
@@ -95,6 +97,24 @@ function makeChannel(spawn = makeFakeSpawn().spawn): FeishuChannel {
   });
 }
 
+/** 记录型假 run：连 stdin 一起记，按 args 谓词匹配 canned 响应（断言卡片 payload 用）。 */
+function makeRecordingRun(
+  handlers: Array<{ match: (args: string[]) => boolean; result: RunResult | Error }>,
+): {
+  run: (bin: string, args: string[], opts?: { input?: string }) => Promise<RunResult>;
+  calls: Array<{ args: string[]; input: string }>;
+} {
+  const calls: Array<{ args: string[]; input: string }> = [];
+  const run = (bin: string, args: string[], opts?: { input?: string }) => {
+    calls.push({ args, input: opts?.input ?? "" });
+    const handler = handlers.find((h) => h.match(args));
+    if (handler === undefined) return Promise.reject(new Error(`unexpected command: ${args.join(" ")}`));
+    if (handler.result instanceof Error) return Promise.reject(handler.result);
+    return Promise.resolve(handler.result);
+  };
+  return { run, calls };
+}
+
 test("FeishuChannel.start 拉取机器人身份并启动事件流，事件流消息进 handler", async () => {
   const fake = makeFakeSpawn();
   const channel = makeChannel(fake.spawn);
@@ -134,7 +154,7 @@ test("FeishuChannel.send 返回 message_id，失败时抛出带原因的错误",
     resolveBotOpenId: async () => BOT,
     run: ok.run,
   });
-  assert.equal(await channel.send("oc_chat", "你好"), "om_reply");
+  assert.equal(await channel.send("oc_chat", { kind: "text", text: "你好" }), "om_reply");
   assert.deepEqual(ok.calls[0]?.slice(0, 3), ["im", "+messages-send", "--as"]);
 
   const failing = makeFakeRun([
@@ -150,7 +170,7 @@ test("FeishuChannel.send 返回 message_id，失败时抛出带原因的错误",
     resolveBotOpenId: async () => BOT,
     run: failing.run,
   });
-  await assert.rejects(() => channel2.send("oc_chat", "你好"), /bot not in chat/);
+  await assert.rejects(() => channel2.send("oc_chat", { kind: "text", text: "你好" }), /bot not in chat/);
 });
 
 test("FeishuChannel.edit 按 messageId 改消息", async () => {
@@ -167,7 +187,7 @@ test("FeishuChannel.edit 按 messageId 改消息", async () => {
     resolveBotOpenId: async () => BOT,
     run: edit.run,
   });
-  await channel.edit("om_reply", "更新后的内容");
+  await channel.edit("om_reply", { kind: "text", text: "更新后的内容" });
   assert.deepEqual(edit.calls[0], [
     "im",
     "+messages-edit",
@@ -178,6 +198,100 @@ test("FeishuChannel.edit 按 messageId 改消息", async () => {
     "--markdown",
     "-",
   ]);
+});
+
+test("FeishuChannel.send 卡片：走 interactive 消息，stdin 是卡片 JSON", async () => {
+  const card = placeholderCard();
+  const fake = makeRecordingRun([
+    {
+      match: (args) => args[1] === "+messages-send",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: { message_id: "om_card" } }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: fake.run,
+  });
+
+  assert.equal(await channel.send("oc_chat", { kind: "card", card }), "om_card");
+  assert.deepEqual(fake.calls[0]?.args, [
+    "im",
+    "+messages-send",
+    "--as",
+    "bot",
+    "--chat-id",
+    "oc_chat",
+    "--msg-type",
+    "interactive",
+    "--content",
+    "-",
+  ]);
+  assert.equal(fake.calls[0]?.input, JSON.stringify(card));
+});
+
+test("FeishuChannel.edit 卡片：走 im messages patch，stdin 是双层转义的 content", async () => {
+  const card = placeholderCard();
+  const fake = makeRecordingRun([
+    {
+      match: (args) => args[1] === "messages",
+      result: { status: 0, stdout: JSON.stringify({ ok: true, data: {} }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: fake.run,
+  });
+
+  await channel.edit("om_card", { kind: "card", card });
+  assert.deepEqual(fake.calls[0]?.args, [
+    "im",
+    "messages",
+    "patch",
+    "--as",
+    "bot",
+    "--message-id",
+    "om_card",
+    "--data",
+    "-",
+  ]);
+  // patch 的 content 是 JSON 序列化后的字符串：外层对象再包一层。
+  assert.equal(fake.calls[0]?.input, JSON.stringify({ content: JSON.stringify(card) }));
+});
+
+test("FeishuChannel 卡片发送/更新失败：错误能区分卡片路径并带原因", async () => {
+  const card = placeholderCard();
+  const failing = makeRecordingRun([
+    {
+      match: (args) => args[1] === "+messages-send",
+      result: { status: 1, stdout: JSON.stringify({ ok: false, error: { message: "card too large" } }), stderr: "" },
+    },
+    {
+      match: (args) => args[1] === "messages",
+      result: { status: 1, stdout: JSON.stringify({ ok: false, error: { message: "message not found" } }), stderr: "" },
+    },
+  ]);
+  const channel = new FeishuChannel({
+    bin: "lark-cli",
+    logger: silentLogger,
+    spawn: makeFakeSpawn().spawn,
+    resolveBotOpenId: async () => BOT,
+    run: failing.run,
+  });
+
+  await assert.rejects(
+    () => channel.send("oc_chat", { kind: "card", card }),
+    /发送卡片消息失败（lark-cli exit=1）：card too large/,
+  );
+  await assert.rejects(
+    () => channel.edit("om_card", { kind: "card", card }),
+    /更新卡片消息失败（lark-cli exit=1）：message not found/,
+  );
 });
 
 test("FeishuChannel 拿不到机器人身份时 start 失败（fail-fast）", async () => {

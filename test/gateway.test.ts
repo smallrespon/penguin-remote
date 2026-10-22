@@ -13,7 +13,7 @@ import { loadConfig } from "../src/config.js";
 import { formatSkillInput, helpText, parseCommand } from "../src/router.js";
 import { FakeSessionServer, frame, sessionClient, waitForTask, type FrameScript } from "./helpers/fake-sessions.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
-import { FakeChannel } from "./helpers/fake-channel.js";
+import { FakeChannel, textOf } from "./helpers/fake-channel.js";
 
 const silent = createLogger("error", () => {});
 
@@ -124,10 +124,10 @@ test("最小闭环：飞书一句话 → 会话 API → 同聊天收到一条最
 
   // T6：先发占位消息，最终文本通过编辑落到同一条消息上
   assert.equal(channel.sent.length, 1);
-  assert.equal(channel.sent[0]?.markdown, PLACEHOLDER_TEXT);
-  const finalEdit = channel.edited.at(-1)?.markdown ?? "";
-  assert.match(finalEdit, /现在是20:00/);
-  assert.match(finalEdit, /用量 42 tokens/);
+  assert.equal(textOf(channel.sent[0]?.message ?? { kind: "text", text: "" }), PLACEHOLDER_TEXT);
+  const finalEdit = channel.edited.at(-1)?.message ?? { kind: "text", text: "" };
+  assert.match(textOf(finalEdit), /现在是20:00/);
+  assert.match(textOf(finalEdit), /用量 42 tokens/);
 });
 
 test("最小闭环：Run 进行中同聊天再来消息 → 只提示不排队", async () => {
@@ -365,7 +365,7 @@ test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () =>
   assert.match(channel.lastSent(), /已中断/);
   await running;
   // 定稿落在占位消息上，写明未正常完成
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = textOf(channel.edited.at(-1)?.message ?? { kind: "text", text: "" });
   assert.match(final, /未正常完成（aborted）/);
   assert.ok(server.requests.some((r) => r.path.endsWith("/abort")), "断流/中断要显式 abort");
 
@@ -611,7 +611,7 @@ test("allowlist：命中 chat_id 或 open_id 才响应，其余静默忽略", as
     server.taskPosts().length,
     1,
   );
-  assert.match(channel.edited.at(-1)?.markdown ?? "", /在/);
+  assert.match(textOf(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /在/);
 
   // 未命中的聊天：不回复、不发起 Run
   const before = channel.sent.length;

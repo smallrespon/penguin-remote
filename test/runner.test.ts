@@ -8,12 +8,18 @@ import { executeRun, type RunHandle } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeSessionServer, frame, sessionClient } from "./helpers/fake-sessions.js";
-import { FakeChannel } from "./helpers/fake-channel.js";
+import { FakeChannel, textOf } from "./helpers/fake-channel.js";
 import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
 
 const AGENT = { projectId: "default_project", agentId: "default_agent" };
+
+/** 最后一次编辑的文本（没有编辑过时为空串）。 */
+function lastEditedText(channel: FakeChannel): string {
+  const last = channel.edited.at(-1);
+  return last === undefined ? "" : textOf(last.message);
+}
 
 /** 一轮正常 Run 的帧脚本：思考 → 工具 → 正文 → 用量 → idle。 */
 function happyScript(): Array<string | { hang: true }> {
@@ -75,8 +81,9 @@ test("新建会话：档位下发 + thinking PATCH + 定稿含分区与用量页
   const patch = server.requests.find((r) => r.method === "PATCH");
   assert.deepEqual(patch?.body, { thinkingLevel: "high" });
 
-  assert.equal(channel.sent[0]?.markdown, PLACEHOLDER_TEXT);
-  const final = channel.edited.at(-1)?.markdown ?? channel.sent.at(-1)?.markdown ?? "";
+  assert.equal(textOf(channel.sent[0]?.message ?? { kind: "text", text: "" }), PLACEHOLDER_TEXT);
+  const finalEdit = channel.edited.at(-1);
+  const final = finalEdit === undefined ? channel.lastSent() : textOf(finalEdit.message);
   assert.match(final, /🧠 思考 · 1 字/);
   assert.match(final, /🔧 exec_command/);
   assert.match(final, /今天 21 号/);
@@ -111,7 +118,7 @@ test("409 会话忙：提示 BUSY_HINT，且不中断别人的任务", async () 
   const report = await runOnce(server, channel);
 
   assert.equal(report.status, "failed");
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.equal(final, BUSY_HINT);
   assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), false);
 });
@@ -125,7 +132,7 @@ test("流中断（没看到 running 就结束）：显式中止并报失败", as
 
   assert.equal(report.status, "failed");
   assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), true);
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.match(final, /执行失败/);
 });
 
@@ -142,7 +149,7 @@ test("fatal 终局：request_end 带错误，定稿写明未正常完成", async
   const report = await runOnce(server, channel);
 
   assert.equal(report.status, "fatal");
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.match(final, /未正常完成（fatal）/);
   assert.match(final, /403 quota/);
 });
@@ -167,7 +174,7 @@ test("/stop：abort 后流补发 abort 事件与 idle，结局为 aborted", asyn
 
   assert.equal(report.status, "aborted");
   assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), true);
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.match(final, /写了一/);
   assert.match(final, /未正常完成（aborted）/);
 });
@@ -187,7 +194,7 @@ test("审批请求：先落「等待审批」预览，再按策略拒绝并把�
   assert.deepEqual(server.approvalCalls, [
     { sessionId: "session-fake-1", toolCallId: "tc7", decision: "deny" },
   ]);
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.match(final, /⚠️ 等待审批：`exec_command`/);
   assert.match(final, /🚫 已拒绝 `exec_command`/);
   assert.equal(report.status, "completed");
@@ -209,7 +216,7 @@ test("会话自愈：tasks 返回新 id 后改订阅新 id，report 用新 id", 
 
   assert.equal(report.sessionId, "session-healed");
   assert.equal(report.status, "completed");
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.match(final, /自愈后完成/);
 });
 
@@ -217,14 +224,14 @@ test("编辑全部失败：降级为最终一次性发送", async () => {
   const server = new FakeSessionServer();
   server.defaultScript = happyScript();
   const channel = new FakeChannel();
-  channel.failEditWith = new Error("edit rejected");
+  channel.failEditKinds = ["text"];
 
   const report = await runOnce(server, channel);
 
   assert.equal(report.status, "completed");
   assert.equal(channel.edited.length, 0);
-  const finals = channel.sent.filter((m) => m.markdown !== PLACEHOLDER_TEXT);
-  assert.match(finals.at(-1)?.markdown ?? "", /今天 21 号/);
+  const finals = channel.sent.filter((m) => textOf(m.message) !== PLACEHOLDER_TEXT);
+  assert.match(textOf(finals.at(-1)?.message ?? { kind: "text", text: "" }), /今天 21 号/);
 });
 
 test("建会话失败：占位消息里写失败原因", async () => {
@@ -239,6 +246,6 @@ test("建会话失败：占位消息里写失败原因", async () => {
 
   assert.equal(report.status, "failed");
   assert.equal(report.sessionId, null);
-  const final = channel.edited.at(-1)?.markdown ?? "";
+  const final = lastEditedText(channel);
   assert.match(final, /执行失败：model not found/);
 });

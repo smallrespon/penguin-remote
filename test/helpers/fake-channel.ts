@@ -1,15 +1,20 @@
-import type { ChannelAdapter, IncomingMessage } from "../../src/channels/types.js";
+import type { ChannelAdapter, IncomingMessage, OutboundMessage } from "../../src/channels/types.js";
 
 export interface SentMessage {
   chatId: string;
-  markdown: string;
+  message: OutboundMessage;
   /** send 返回的 message_id（后续 edit 打在它上面）。 */
   messageId: string;
 }
 
 export interface EditedMessage {
   messageId: string;
-  markdown: string;
+  message: OutboundMessage;
+}
+
+/** 取出站消息的文本：文本消息取 text，卡片没有可断言文本，返回空串。 */
+export function textOf(message: OutboundMessage): string {
+  return message.kind === "text" ? message.text : "";
 }
 
 /** 测试用 Channel：记录 send/edit，可向 Bridge 灌入站消息。 */
@@ -18,10 +23,10 @@ export class FakeChannel implements ChannelAdapter {
   readonly edited: EditedMessage[] = [];
   private handler: ((message: IncomingMessage) => void | Promise<void>) | null = null;
   private nextId = 1;
-  /** 让 send 抛出（模拟飞书发送失败）。 */
-  failSendWith: Error | null = null;
-  /** 让 edit 抛出（模拟飞书编辑频率限制）。 */
-  failEditWith: Error | null = null;
+  /** 让这些 kind 的 send 抛出（模拟飞书发送失败）。 */
+  failSendKinds: Array<"text" | "card"> = [];
+  /** 让这些 kind 的 edit 抛出（模拟飞书编辑频率限制）。 */
+  failEditKinds: Array<"text" | "card"> = [];
   /** 单条消息允许的编辑次数上限（模拟飞书 230072）；null = 不限。 */
   editLimitPerMessage: number | null = null;
   private readonly editCounts = new Map<string, number>();
@@ -34,21 +39,25 @@ export class FakeChannel implements ChannelAdapter {
     this.handler = null;
   }
 
-  async send(chatId: string, markdown: string): Promise<string> {
-    if (this.failSendWith !== null) throw this.failSendWith;
+  async send(chatId: string, message: OutboundMessage): Promise<string> {
+    if (this.failSendKinds.includes(message.kind)) {
+      throw new Error(`FakeChannel: send(${message.kind}) failed`);
+    }
     const messageId = `om_fake_${this.nextId++}`;
-    this.sent.push({ chatId, markdown, messageId });
+    this.sent.push({ chatId, message, messageId });
     return messageId;
   }
 
-  async edit(messageId: string, markdown: string): Promise<void> {
-    if (this.failEditWith !== null) throw this.failEditWith;
+  async edit(messageId: string, message: OutboundMessage): Promise<void> {
+    if (this.failEditKinds.includes(message.kind)) {
+      throw new Error(`FakeChannel: edit(${message.kind}) failed`);
+    }
     const count = (this.editCounts.get(messageId) ?? 0) + 1;
     this.editCounts.set(messageId, count);
     if (this.editLimitPerMessage !== null && count > this.editLimitPerMessage) {
       throw new Error(`The message has reached the number of times it can be edited. (${messageId})`);
     }
-    this.edited.push({ messageId, markdown });
+    this.edited.push({ messageId, message });
   }
 
   /** 模拟收到一条飞书消息。 */
@@ -65,6 +74,7 @@ export class FakeChannel implements ChannelAdapter {
   }
 
   lastSent(): string {
-    return this.sent.at(-1)?.markdown ?? "";
+    const last = this.sent.at(-1);
+    return last === undefined ? "" : textOf(last.message);
   }
 }
