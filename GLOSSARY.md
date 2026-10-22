@@ -41,7 +41,7 @@ PenguinHarness 侧的对话上下文容器，多个 Run 可续接同一 Session�
 _Avoid_: chat、conversation（那些指飞书侧的聊天）
 
 **会话 API**:
-PenguinHarness 以人类登录态（cookie）驱动的 HTTP 面：`/api/projects/:p/agents/:a/sessions` 建会话、`/api/sessions/:id/*` 做投递 / 中止 / 审批 / 查询；同一路由的 GET 还提供按 Agent 的会话列表（未归档过滤在客户端做，见 ADR-0008）。Bridge 自 ADR-0005 起只走这一面，建出来的都是普通会话，不归档。
+PenguinHarness 以人类登录态（cookie）驱动的 HTTP 面：`/api/projects/:p/agents/:a/sessions` 建会话、`/api/sessions/:id/*` 做投递 / 中止 / 审批 / 查询；同一路由的 GET 还提供按 Agent 的会话列表（未归档 + 工作区过滤都在客户端做，见 ADR-0008 / ADR-0013）。Bridge 自 ADR-0005 起只走这一面，建出来的都是普通会话，不归档。
 _Avoid_: 用户 API、web API
 
 **AMSP**:
@@ -55,6 +55,10 @@ _Avoid_: 登录态、admin token、管理员令牌
 **档位**:
 模型 / 思考程度 / 工作区三项设置的合称，按聊天存放在 binding 里，只对该聊天之后新建的会话生效（见 ADR-0005）。
 _Avoid_: 配置项、参数、设置
+
+**工作区（当前工作区）**:
+聊天绑定里的 `workspace` 路径，建新会话时下发给服务端；`/sessions` 的实时列表按它收窄（见 ADR-0013）。没设时服务端每次新建会话都另配一个临时工作区，这种聊天不限定工作区。
+_Avoid_: 目录、项目路径
 
 ### 飞书侧
 

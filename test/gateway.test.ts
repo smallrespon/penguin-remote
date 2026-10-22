@@ -373,18 +373,139 @@ test("/sessions 实时列出服务端未归档会话：→ 标当前会话、标
 
   await channel.receive("/sessions");
   const text = channel.lastSent();
-  assert.match(text, /\*\*未归档会话\*\*（共 3 个）/);
+  assert.match(text, /\*\*未归档会话\*\*（共 3 个，未限定工作区）/);
   assert.ok(!text.includes("显示最近"), "不超过 50 条时不加截断注明");
   assert.ok(
-    text.includes("→ 1. 远程会话 第二行标题 — 2026-10-22 10:00 — `step-3` — `session-remote-1`"),
+    text.includes("→ **1.** 远程会话 第二行标题 — 2026-10-22 10:00 — `step-3` — `session-remote-1`"),
     `当前会话行首应带 →、换行拍平、时间取 lastActiveAt：${text}`,
   );
-  assert.ok(text.includes("2. （无标题） — 2026-10-22 09:00 — `session-remote-2`"), "空标题给占位");
+  assert.ok(text.includes("**2.** （无标题） — 2026-10-22 09:00 — `session-remote-2`"), "空标题给占位");
   const longTitle = "超长标题".repeat(20);
-  assert.ok(text.includes(`3. ${longTitle.slice(0, 40)}`), "长标题截断到 40 字");
+  assert.ok(text.includes(`**3.** ${longTitle.slice(0, 40)}`), "长标题截断到 40 字");
   assert.ok(!text.includes(longTitle), "截断后不应出现完整标题");
   assert.ok(!text.includes("session-archived"), "已归档会话不列");
   assert.match(text, /用 `\/use <序号>` 切回去续聊。/);
+});
+
+test("/sessions 只列当前工作区的未归档会话：头部带工作区、别的工作区不出现（ADR-0013）", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await registry.update("oc_chat", (b) => {
+    b.workspace = "/root/thesis";
+  });
+  server.addSession({ sessionId: "s_thesis_new", title: "改论文", workspace: "/root/thesis", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+  server.addSession({ sessionId: "s_thesis_old", title: "读论文", workspace: "/root/thesis", lastActiveAt: "2026-10-22T08:00:00.000Z" });
+  server.addSession({ sessionId: "s_remote", title: "别的workspace", workspace: "/root/penguin_remote", lastActiveAt: "2026-10-22T11:00:00.000Z" });
+  server.addSession({ sessionId: "s_thesis_archived", title: "已归档", workspace: "/root/thesis", archived: true, lastActiveAt: "2026-10-22T12:00:00.000Z" });
+
+  await registry.update("oc_chat", (b) => {
+    b.sessionId = "s_thesis_new";
+  });
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.match(text, /\*\*未归档会话\*\*（工作区 `\/root\/thesis`，共 2 个）/);
+  assert.ok(!text.includes("未限定工作区"), "限定了工作区就不该写「未限定」");
+  assert.ok(text.includes("→ **1.** 改论文"), "当前会话仍在列表里，序号 1");
+  assert.ok(text.includes("**2.** 读论文"), "同工作区的旧会话也在");
+  assert.ok(!text.includes("s_remote"), "别的工作区的会话不列");
+  assert.ok(!text.includes("s_thesis_archived"), "已归档不列");
+
+  // /use 打的是同一份（收窄后的）列表：范围内的跳得动，范围外的不可跳
+  await channel.receive("/use 2");
+  assert.match(channel.lastSent(), /已切回会话 `s_thesis_old`/);
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /已切回会话 `s_thesis_new`/);
+});
+
+test("/sessions 当前工作区下没有未归档会话时，空提示带工作区名", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await registry.update("oc_chat", (b) => {
+    b.workspace = "/root/thesis";
+  });
+  server.addSession({ sessionId: "s_elsewhere", workspace: "/root/other", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+  server.addSession({ sessionId: "s_archived", workspace: "/root/thesis", archived: true, lastActiveAt: "2026-10-22T11:00:00.000Z" });
+
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /工作区 `\/root\/thesis` 下没有未归档的会话/);
+  assert.ok(channel.lastSent().includes("发一条消息就开始新的对话"), "没绑会话时才说「发消息就开新对话」");
+});
+
+test("/sessions 工作区为空但仍绑着别的工作区的会话：空提示不谎称「发消息就开新对话」", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await registry.update("oc_chat", (b) => {
+    b.workspace = "/root/thesis";
+    b.sessionId = "s_elsewhere";
+  });
+  server.addSession({ sessionId: "s_elsewhere", workspace: "/root/other", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.match(text, /工作区 `\/root\/thesis` 下没有未归档的会话。/);
+  assert.ok(!text.includes("发一条消息就开始新的对话"), "还绑着旧会话，下一条消息是续接不是新开");
+  assert.ok(
+    text.includes("（当前会话 `s_elsewhere` 不在这个工作区的未归档列表里；发消息会继续它。）"),
+    `空列表同样要注明当前会话去向：${text}`,
+  );
+});
+
+test("/sessions 当前会话在别的工作区：注明它未列出，但不从绑定里消失", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await registry.update("oc_chat", (b) => {
+    b.workspace = "/root/thesis";
+    b.sessionId = "s_elsewhere";
+  });
+  server.addSession({ sessionId: "s_thesis", title: "改论文", workspace: "/root/thesis", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+  server.addSession({ sessionId: "s_elsewhere", title: "旧工作区的会话", workspace: "/root/other", lastActiveAt: "2026-10-22T09:00:00.000Z" });
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.ok(text.includes("**1.** 改论文"), "列表只含当前工作区");
+  assert.ok(!text.includes("→ "), "当前会话不在列表里，没有 → 行");
+  assert.ok(
+    text.includes("（当前会话 `s_elsewhere` 不在这个工作区的未归档列表里；发消息会继续它。）"),
+    `应注明当前会话的去向：${text}`,
+  );
+});
+
+test("/sessions 当前会话在工作区内但排名超过 50：不误报「不在这个工作区」", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await registry.update("oc_chat", (b) => {
+    b.workspace = "/root/thesis";
+  });
+  // 51 个同工作区会话：s51 最新（排第 1）、s1 最旧（排第 51，超出展示条数）
+  for (let i = 1; i <= 51; i += 1) {
+    const at = new Date(Date.parse("2026-10-22T09:00:00.000Z") + i * 60_000).toISOString();
+    server.addSession({ sessionId: `s${i}`, title: `会话 ${i}`, workspace: "/root/thesis", lastActiveAt: at });
+  }
+  await registry.update("oc_chat", (b) => {
+    b.sessionId = "s1";
+  });
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.ok(text.includes("（显示最近 50 个"), "超出展示条数时注明截断");
+  assert.ok(!text.includes("不在这个工作区"), "在工作区里、只是排名靠后：不该误报不在工作区");
+  assert.ok(!text.includes("→ "), "超出展示条数的当前会话没有 → 行（头部已说明截断）");
 });
 
 test("/use 跳到只存在于服务端实时列表的远程会话；越界提示不变", async () => {
@@ -419,16 +540,16 @@ test("/sessions 超过 50 条：头部注明总数、只显示最近 50 个，/u
 
   await channel.receive("/sessions");
   const text = channel.lastSent();
-  assert.match(text, /\*\*未归档会话\*\*（共 60 个）/, "头部注明截断前的真实总数");
+  assert.match(text, /\*\*未归档会话\*\*（共 60 个，未限定工作区）/, "头部注明截断前的真实总数");
   assert.ok(
     text.includes("（显示最近 50 个，更早的会话未列出、暂不可 `/use` 跳转）"),
     `超过 50 条时如实注明截断：${text}`,
   );
-  assert.ok(text.includes("1. 会话 60"), "最新的一条排第 1");
-  assert.ok(text.includes("50. 会话 11"), "第 50 条只到倒数第 50 新的会话");
+  assert.ok(text.includes("**1.** 会话 60"), "最新的一条排第 1");
+  assert.ok(text.includes("**50.** 会话 11"), "第 50 条只到倒数第 50 新的会话");
   assert.ok(!text.includes("`s10`"), "更早的会话不列出");
   assert.equal(
-    text.split("\n").filter((line) => /^\d+\. /.test(line)).length,
+    text.split("\n").filter((line) => /^\*\*\d+\.\*\* /.test(line)).length,
     50,
     "只渲染 50 行",
   );

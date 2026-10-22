@@ -8,6 +8,7 @@ import type { Lanes } from "./lanes.js";
 import { redact } from "./logger.js";
 import type { Logger } from "./logger.js";
 import type { SessionClient } from "./penguin/sessions.js";
+import { normalizeWorkspacePath } from "./penguin/sessions.js";
 import { executeRun } from "./penguin/runner.js";
 import type { Registry } from "./registry.js";
 import type { RunLog } from "./runlog.js";
@@ -87,12 +88,15 @@ function withFallbackNote(live: boolean, body: string): string {
   return live ? body : `${LIVE_LIST_FALLBACK_NOTE}\n${body}`;
 }
 
-/** 一条会话行：序号. 标题 — 最近活跃时间 — `model` — `sessionId`；当前会话行首加 →。 */
+/** 一条会话行：序号. 标题 — 最近活跃时间 — `model` — `sessionId`；当前会话行首加 →。
+ * 序号用粗体而不是 markdown 有序列表语法：飞书 post 的 md 按 CommonMark 渲染，
+ * 行首 `N. ` 会被当成有序列表、序号交给渲染器重排，两位数以上更不保险；
+ * 粗体序号在任何渲染器下都原样显示，且与 `/use <序号>` 严格一致。 */
 function sessionLine(entry: SessionListEntry, index: number, currentSessionId: string | null): string {
   const at = entry.at === null ? "未知时间" : entry.at.slice(0, 16).replace("T", " ");
   const model = entry.model === null ? "" : ` — \`${entry.model}\``;
   const marker = entry.sessionId === currentSessionId ? "→ " : "";
-  return `${marker}${index + 1}. ${flattenTitle(entry.title, "（无标题）")} — ${at}${model} — \`${entry.sessionId}\``;
+  return `${marker}**${index + 1}.** ${flattenTitle(entry.title, "（无标题）")} — ${at}${model} — \`${entry.sessionId}\``;
 }
 
 export class Gateway {
@@ -310,23 +314,46 @@ export class Gateway {
   // ---- 控制命令 ----
 
   /**
-   * /sessions 与 /use 共用的列表来源（ADR-0008）：实时查服务端当前 (project, agent) 下的
-   * 未归档会话；查询失败（网络错误 / 非 2xx）时退回 Registry 本地历史，调用方负责注明。
+   * /sessions 与 /use 共用的列表来源（ADR-0008 / ADR-0013）：实时查服务端当前 (project, agent) 下、
+   * **当前工作区**的未归档会话；查询失败（网络错误 / 非 2xx）时退回 Registry 本地历史，调用方负责注明。
    * ADR-0011：实时路径返回全量未归档会话，这里统一截断到展示条数——/use 只允许跳到列表里
    * 看得见的会话，未列出的更早会话不可跳；total 是截断前的真实总数，供回复头部注明。
-   * 本地兜底路径保持原有口径（Registry 的 HISTORY_LIMIT=10），不假装全量。
+   * 本地兜底路径保持原有口径（Registry 的 HISTORY_LIMIT=10，且按聊天不按工作区），不假装全量。
+   * workspace 是这次查询用的工作区（null = 没设 /workspace，未限定）；currentInList 是
+   * 「当前续接的会话在不在截断前的全量列表里」——供回复判断要不要注明它的去向。
    */
-  private async sessionListFor(chatId: string): Promise<{ entries: SessionListEntry[]; total: number; live: boolean }> {
+  private async sessionListFor(chatId: string): Promise<{
+    entries: SessionListEntry[];
+    total: number;
+    live: boolean;
+    workspace: string | null;
+    currentInList: boolean;
+  }> {
     const binding = this.deps.registry.bindingFor(chatId);
+    // ADR-0013：没设 /workspace 的聊天不限工作区——服务端每次新建会话都另配临时工作区，
+    // 按工作区过滤只会得到空列表（/status 里这种聊天显示「临时工作区」，同一口径）。
+    // 空串 / 纯空白按「没设」算：手改 bindings.json 出 `workspace: ""` 时不该渲染出空工作区名。
+    const workspace =
+      binding.workspace != null && binding.workspace.trim() !== ""
+        ? normalizeWorkspacePath(binding.workspace)
+        : null;
+    const currentInList = (ids: readonly string[]): boolean =>
+      binding.sessionId !== null && ids.includes(binding.sessionId);
     try {
-      const items = await this.deps.sessions.listSessions(binding.projectId, binding.agentId);
+      const items = await this.deps.sessions.listSessions(binding.projectId, binding.agentId, { workspace });
       const entries = items.map((item) => ({
         sessionId: item.sessionId,
         title: item.title,
         at: item.lastActiveAt,
         model: item.modelId,
       }));
-      return { entries: capEntries(entries), total: entries.length, live: true };
+      return {
+        entries: capEntries(entries),
+        total: entries.length,
+        live: true,
+        workspace,
+        currentInList: currentInList(entries.map((entry) => entry.sessionId)),
+      };
     } catch (error: unknown) {
       const text = redact(error instanceof Error ? error.message : String(error));
       this.logger.warn(`实时会话列表查询失败，改用本地历史：${text}`);
@@ -336,31 +363,51 @@ export class Gateway {
         at: item.at,
         model: item.model ?? null,
       }));
-      return { entries: capEntries(entries), total: entries.length, live: false };
+      return {
+        entries: capEntries(entries),
+        total: entries.length,
+        live: false,
+        workspace,
+        currentInList: currentInList(entries.map((entry) => entry.sessionId)),
+      };
     }
   }
 
   private async handleSessions(chatId: string): Promise<void> {
-    const { entries, total, live } = await this.sessionListFor(chatId);
+    const binding = this.deps.registry.bindingFor(chatId);
+    const { entries, total, live, workspace, currentInList } = await this.sessionListFor(chatId);
+    // 当前会话不在（收窄后的）全量列表里（典型：设了 /workspace 却续接着别的工作区的会话，
+    // 或它已被归档）：注明去向，不让它凭空消失——否则空列表那句「发消息就开新对话」会说谎
+    // （runner 对非空 sessionId 是续接，不会新开）。只陈述「不在这个工作区的未归档列表里」，
+    // 不猜原因。在列表里只是排名超过展示条数时不必注明——头部已说明截断。
+    const currentOutOfScope =
+      live && workspace !== null && binding.sessionId !== null && !currentInList
+        ? `\n\n（当前会话 \`${binding.sessionId}\` 不在这个工作区的未归档列表里；发消息会继续它。）`
+        : "";
     if (entries.length === 0) {
-      // 实时为空 = 没有未归档会话（可能都已归档）；本地为空才是「没有历史会话」。
+      // 实时为空 = 该工作区下没有未归档会话（可能都已归档）；本地为空才是「没有历史会话」。
       const empty =
-        live
-          ? "当前 Project/Agent 下没有未归档的会话，发一条消息就开始新的对话。"
-          : "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。";
-      await this.reply(chatId, empty);
+        live && workspace !== null
+          ? `工作区 \`${workspace}\` 下没有未归档的会话${binding.sessionId === null ? "，发一条消息就开始新的对话" : ""}。`
+          : live
+            ? "当前 Project/Agent 下没有未归档的会话，发一条消息就开始新的对话。"
+            : "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。";
+      await this.reply(chatId, `${empty}${currentOutOfScope}`);
       return;
     }
-    const binding = this.deps.registry.bindingFor(chatId);
     const lines = entries.map((entry, index) => sessionLine(entry, index, binding.sessionId));
     // ADR-0011：头部注明截断前的真实总数；超出展示条数时如实说明更早的会话未列出、暂不可跳。
-    // 兜底路径只拿到 Registry 本地历史，不保证未归档——头部口径跟着来源走，不冒充全量。
-    const header = live ? "**未归档会话**" : "**本地历史会话**";
+    // ADR-0013：限定工作区时在头部写清是哪个工作区；没设 /workspace 时如实注明「未限定」。
+    // 兜底路径只拿到 Registry 本地历史，不保证未归档、也不按工作区——头部口径跟着来源走，不冒充全量。
+    const scope = workspace === null ? "" : `工作区 \`${workspace}\`，`;
+    const header = live
+      ? `**未归档会话**（${scope}共 ${total} 个${workspace === null ? "，未限定工作区" : ""}）`
+      : "**本地历史会话**";
     const truncationNote =
       total > SESSION_DISPLAY_LIMIT
         ? `\n（显示最近 ${SESSION_DISPLAY_LIMIT} 个，更早的会话未列出、暂不可 \`/use\` 跳转）`
         : "";
-    const body = `${header}（共 ${total} 个）${truncationNote}\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
+    const body = `${header}${truncationNote}\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。${currentOutOfScope}`;
     await this.reply(chatId, withFallbackNote(live, body));
   }
 

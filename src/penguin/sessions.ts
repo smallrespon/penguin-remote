@@ -1,7 +1,7 @@
 // 会话 API 客户端：Bridge 与 PenguinHarness 之间的唯一传输层（ADR-0005）。
 // 走 `penguin chat` 同款路径——owner 令牌当 penguin_session cookie：
 //   建会话 POST /api/projects/:p/agents/:a/sessions（普通会话，不归档）
-//   列表   GET  /api/projects/:p/agents/:a/sessions（未归档过滤在客户端；条数不截断，ADR-0011）
+//   列表   GET  /api/projects/:p/agents/:a/sessions（未归档 + 工作区过滤在客户端；条数不截断，ADR-0011）
 //   钉思考 PATCH /api/sessions/:id
 //   订阅   GET  /api/sessions/:id/stream（SSE）
 //   投递   POST /api/sessions/:id/tasks
@@ -51,6 +51,18 @@ export interface SessionListItem {
   /** 最近活跃时间（ISO 8601）；列表排序依据，服务端可能缺。 */
   lastActiveAt: string | null;
   modelId: string | null;
+  /** 会话所属工作区（服务端 workspaceDir）；「当前工作区」过滤的依据（ADR-0013）。 */
+  workspace: string | null;
+}
+
+/** listSessions 的可选过滤条件。 */
+export interface ListSessionsOptions {
+  /**
+   * 只列这个工作区下的会话（ADR-0013）。undefined / null = 不限工作区：
+   * 没设 /workspace 的聊天，服务端每次建会话都另配一个临时工作区，
+   * 按工作区过滤只会得到空列表，所以这种聊天必须看到全部未归档会话。
+   */
+  workspace?: string | null;
 }
 
 export interface TaskStartResult {
@@ -261,8 +273,15 @@ export class SessionClient {
    * 会话（含已归档），未归档过滤 / lastActiveAt 倒序在客户端做；条数不再截断——展示层
    * （网关）自己决定截断到多少并注明总数。远程（Web / CLI / 其他客户端）新建的未归档
    * 会话因此也可见、可跳。
+   * options.workspace（ADR-0013）：只保留该工作区下的会话；不传 = 不限工作区。
    */
-  async listSessions(projectId: string, agentId: string): Promise<SessionListItem[]> {
+  async listSessions(
+    projectId: string,
+    agentId: string,
+    options: ListSessionsOptions = {},
+  ): Promise<SessionListItem[]> {
+    const workspaceFilter =
+      options.workspace != null && options.workspace !== "" ? normalizeWorkspacePath(options.workspace) : null;
     const data = await this.request<{ sessions?: unknown }>(
       "GET",
       `/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/sessions`,
@@ -276,11 +295,15 @@ export class SessionClient {
       if (session.archived === true) continue;
       const sessionId = typeof session.sessionId === "string" ? session.sessionId : "";
       if (sessionId === "") continue;
+      const workspace = typeof session.workspace === "string" ? normalizeWorkspacePath(session.workspace) : null;
+      // ADR-0013：指定了工作区就只留它的；服务端没报 workspace 的会话无法归属，一并排除。
+      if (workspaceFilter !== null && workspace !== workspaceFilter) continue;
       items.push({
         sessionId,
         title: typeof session.title === "string" ? session.title : null,
         lastActiveAt: typeof session.lastActiveAt === "string" ? session.lastActiveAt : null,
         modelId: typeof session.modelId === "string" ? session.modelId : null,
+        workspace,
       });
     }
     // lastActiveAt 倒序；缺时间的排最后，同刻保持服务端顺序（sort 稳定）
@@ -380,4 +403,17 @@ function toSessionInfo(raw: Record<string, unknown> | undefined): SessionInfo {
     workspace: typeof session.workspace === "string" ? session.workspace : null,
     title: typeof session.title === "string" ? session.title : null,
   };
+}
+
+/**
+ * 工作区路径归一（ADR-0013）：去掉尾部斜杠（根目录 `/` 除外）。
+ * 用户手敲的 `/workspace /root/x/` 与服务端返回的 `/root/x` 必须能对上，
+ * 否则工作区过滤永远不命中、列表会凭空变空。
+ */
+export function normalizeWorkspacePath(path: string): string {
+  const trimmed = path.trim();
+  if (trimmed === "") return "";
+  // 整串都是斜杠（`/`、`//`）时砍完是空串，兜底回根目录，别把过滤器变成空串。
+  const stripped = trimmed.replace(/\/+$/, "");
+  return stripped === "" ? "/" : stripped;
 }

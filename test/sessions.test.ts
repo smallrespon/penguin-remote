@@ -8,6 +8,7 @@ import {
   SessionBusyError,
   SessionClient,
   type StreamItem,
+  normalizeWorkspacePath,
 } from "../src/penguin/sessions.js";
 import { FakeSessionServer, frame } from "./helpers/fake-sessions.js";
 
@@ -182,6 +183,7 @@ test("listSessions：GET 当前 (project, agent) 的会话，按 lastActiveAt �
     title: null,
     lastActiveAt: "2026-10-22T09:00:00.000Z",
     modelId: null,
+    workspace: null,
   });
   const request = server.requests.at(-1);
   assert.equal(request?.method, "GET");
@@ -198,6 +200,55 @@ test("listSessions：过滤已归档会话", async () => {
     items.map((item) => item.sessionId),
     ["s_live"],
   );
+});
+
+test("listSessions：按工作区过滤，只留当前工作区的未归档会话（ADR-0013）", async () => {
+  const server = new FakeSessionServer();
+  server.addSession({ sessionId: "s_mine_new", workspace: "/root/thesis", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+  server.addSession({ sessionId: "s_mine_old", workspace: "/root/thesis", lastActiveAt: "2026-10-22T08:00:00.000Z" });
+  server.addSession({ sessionId: "s_other_ws", workspace: "/root/penguin_remote", lastActiveAt: "2026-10-22T11:00:00.000Z" });
+  server.addSession({ sessionId: "s_mine_archived", workspace: "/root/thesis", archived: true, lastActiveAt: "2026-10-22T12:00:00.000Z" });
+  server.addSession({ sessionId: "s_no_ws", workspace: null, lastActiveAt: "2026-10-22T13:00:00.000Z" });
+
+  const items = await client(server).listSessions("default_project", "default_agent", { workspace: "/root/thesis" });
+  assert.deepEqual(
+    items.map((item) => item.sessionId),
+    ["s_mine_new", "s_mine_old"],
+    "只留当前工作区、未归档；别的工作区与服务端没报 workspace 的都排除",
+  );
+  assert.equal(items[0]?.workspace, "/root/thesis", "条目带出工作区");
+});
+
+test("listSessions：不传 workspace = 不限工作区（没设 /workspace 的聊天看全部）", async () => {
+  const server = new FakeSessionServer();
+  server.addSession({ sessionId: "s_a", workspace: "/root/a", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+  server.addSession({ sessionId: "s_b", workspace: "/root/b", lastActiveAt: "2026-10-22T09:00:00.000Z" });
+
+  assert.deepEqual(
+    (await client(server).listSessions("default_project", "default_agent")).map((item) => item.sessionId),
+    ["s_a", "s_b"],
+  );
+  assert.deepEqual(
+    (await client(server).listSessions("default_project", "default_agent", { workspace: null })).map((item) => item.sessionId),
+    ["s_a", "s_b"],
+    "显式传 null 同样是不限",
+  );
+});
+
+test("listSessions：工作区路径尾部斜杠归一，/root/x/ 与 /root/x 能对上", async () => {
+  const server = new FakeSessionServer();
+  server.addSession({ sessionId: "s_mine", workspace: "/root/thesis", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+  server.addSession({ sessionId: "s_other", workspace: "/root/other", lastActiveAt: "2026-10-22T09:00:00.000Z" });
+
+  const items = await client(server).listSessions("default_project", "default_agent", { workspace: "/root/thesis///" });
+  assert.deepEqual(
+    items.map((item) => item.sessionId),
+    ["s_mine"],
+  );
+  assert.equal(normalizeWorkspacePath("/"), "/", "根目录归一后还是根目录");
+  assert.equal(normalizeWorkspacePath("//"), "/", "整串斜杠兜底回根目录，不变成空过滤器");
+  assert.equal(normalizeWorkspacePath(" /root/x/ "), "/root/x", "顺带 trim");
+  assert.equal(normalizeWorkspacePath(""), "", "空串仍是空串（调用方按「不过滤」处理）");
 });
 
 test("listSessions：按 (project, agent) 隔离，别的 Agent 的会话看不到", async () => {

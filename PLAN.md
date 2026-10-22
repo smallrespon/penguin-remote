@@ -484,3 +484,11 @@ v1.0.0 发布清单与唯一剩余步骤。
 1. **步骤分组折叠（ADR-0010）**：连续的思考/工具分区合并为一个默认收起的 `collapsible_panel`，标题「🧰 运行完毕 · N 步 · X.Xs」（流式「🧰 运行中… · N 步」；定稿有步未闭合时不标状态），组内每步一个嵌套折叠面板（工具「🔧 名称 · 状态 · X.Xs · 参数」、思考沿用 ADR-0007 标题），正文与提示行打断分组。`tool_call`/`tool_result` 事件补 `at` 时间戳（omni.ts 从 OmniMessage.timestamp 带出）供每步耗时计算。文本兜底路径不变。
 2. **/sessions 全量（ADR-0011）**：`listSessions` 去掉 10 条截断返回全部未归档会话；展示层截断 50 条 + 头部注明总数；`/use <n>` 口径不变。
 3. **HTML 页交付（ADR-0012）**：远程回复里的 a2ui / mermaid 等富内容，Bridge 用 answer-me-with-html 的渲染器生成单文件 HTML，随 Run 定稿一并作为文件消息发进聊天；飞书卡片保持现状（正文 + 分组折叠），HTML 是「点开即看」的富载体。用户已把 answer-me-with-html 打成插件（`@ported/answer-me-with-html`）装入 Agent，Bridge 不 vendor 渲染器：默认转发 Agent 产出的页面（定稿文本里的 `.html` 绝对路径链接，死链在定稿前剥掉），`AMWH_RENDER_SCRIPT` 配置了渲染器时额外把含 a2ui / mermaid 围栏的回复自动渲染成页。详见 ADR-0012 与 GLOSSARY「HTML 页」词条。
+
+## 19. v1.6：/sessions 收窄到当前工作区 + 序号修复（2026-10-22，ADR-0013）
+
+**动因（用户原话，v1.5 验收后的返工）**：「我要改的是输入 /sessions 显示当前工作区未归档的对话，你再好好检查一下」「而且要实时获取，而且序号你也命名错了，序号只显示了个位数，不能显示两位数以上的」。
+
+1. **工作区收窄（ADR-0013）**：`listSessions` 加可选 `workspace` 过滤（服务端列表条目本就带 `workspace`，客户端过滤，与已归档过滤同址）；网关传 `binding.workspace`，头部写明工作区与总数，空列表文案带工作区名；当前会话不在收窄后的列表里时注明去向。没设 `/workspace` 的聊天不限定工作区并注明——服务端对不传 workspace 的新建会话每次现配临时工作区（`agents/<agent>/workspaces/tmp-*`），按工作区过滤只会得到空列表。
+2. **序号修复**：行序号从 markdown 有序列表（`1. `）改为粗体 `**1.**`——飞书 post 的 `md` 按 CommonMark 渲染，行首 `N. ` 会被当成有序列表、序号交给渲染器重排，两位数以上不可靠；粗体序号原样显示且与 `/use <序号>` 严格一致。
+3. 路径归一 `normalizeWorkspacePath`（去尾斜杠）：手敲 `/workspace /root/x/` 与服务端返回的 `/root/x` 必须能对上。
