@@ -15,6 +15,7 @@ import { FakeSessionServer, frame, sessionClient, waitForTask, type FrameScript 
 import { flatText } from "./helpers/flat-text.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import { FakeChannel } from "./helpers/fake-channel.js";
+import { MAX_INLINE_IMAGE_BYTES } from "../src/images.js";
 
 const silent = createLogger("error", () => {});
 
@@ -327,7 +328,7 @@ test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () =
   });
 
   await channel.receive("/sessions");
-  assert.match(channel.lastSent(), /还没有历史会话/);
+  assert.match(channel.lastSent(), /没有未归档的会话/);
 
   // 别人的会话即使用 /use 1 也切不过去
   await channel.receive("/use 1");
@@ -343,6 +344,112 @@ test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () =
   await channel.receive("/use 1");
   assert.match(channel.lastSent(), /已切回会话/);
   assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
+});
+
+// ---- T10：会话列表实时化（ADR-0008）----
+
+test("/sessions 实时列出服务端未归档会话：→ 标当前会话、标题拍平并截断", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  // 远程（Web / CLI）新建的会话：Bridge 本地 Registry 历史里没有，只能来自服务端列表
+  server.addSession({
+    sessionId: "session-remote-1",
+    title: "远程会话\n第二行标题",
+    modelId: "step-3",
+    lastActiveAt: "2026-10-22T10:00:00.000Z",
+  });
+  server.addSession({ sessionId: "session-remote-2", title: null, lastActiveAt: "2026-10-22T09:00:00.000Z" });
+  server.addSession({
+    sessionId: "session-remote-3",
+    title: "超长标题".repeat(20),
+    lastActiveAt: "2026-10-22T08:00:00.000Z",
+  });
+  // 已归档：默认列表不出现
+  server.addSession({ sessionId: "session-archived", archived: true, lastActiveAt: "2026-10-22T11:00:00.000Z" });
+
+  await registry.update("oc_chat", (b) => {
+    b.sessionId = "session-remote-1";
+  });
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.match(text, /\*\*最近会话\*\*（当前：`session-remote-1`）/);
+  assert.ok(
+    text.includes("→ 1. 远程会话 第二行标题 — 2026-10-22 10:00 — `step-3` — `session-remote-1`"),
+    `当前会话行首应带 →、换行拍平、时间取 lastActiveAt：${text}`,
+  );
+  assert.ok(text.includes("2. （无标题） — 2026-10-22 09:00 — `session-remote-2`"), "空标题给占位");
+  const longTitle = "超长标题".repeat(20);
+  assert.ok(text.includes(`3. ${longTitle.slice(0, 40)}`), "长标题截断到 40 字");
+  assert.ok(!text.includes(longTitle), "截断后不应出现完整标题");
+  assert.ok(!text.includes("session-archived"), "已归档会话不列");
+  assert.match(text, /用 `\/use <序号>` 切回去续聊。/);
+});
+
+test("/use 跳到只存在于服务端实时列表的远程会话；越界提示不变", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  server.addSession({ sessionId: "session-remote-1", title: "远程会话", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /已切回会话 `session-remote-1`/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, "session-remote-1", "切换只改本聊天绑定");
+
+  // 越界：保持现有文案，且不动绑定
+  await channel.receive("/use 2");
+  assert.match(channel.lastSent(), /⚠️ 没有第 2 个会话，`\/sessions` 查看列表。/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, "session-remote-1");
+});
+
+test("实时列表查询失败：/sessions 与 /use 退回本地历史并首行注明", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("答 1");
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  const first = channel.receive("第一问");
+  await first;
+  const sessionId = server.lastTaskSession() ?? "";
+  assert.notEqual(sessionId, "");
+
+  // 实时查询挂掉：退回 Registry 本地历史
+  server.nextListStatus = 500;
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.ok(text.startsWith("⚠️ 实时列表查询失败，显示本地历史"), `首行应注明兜底：${text}`);
+  assert.ok(text.includes(sessionId), "仍列出本地历史会话");
+  assert.ok(text.includes("**最近会话**"), "兜底渲染沿用现有版式");
+
+  server.nextListStatus = 500;
+  await channel.receive("/use 1");
+  assert.ok(channel.lastSent().startsWith("⚠️ 实时列表查询失败，显示本地历史"), "换会话也要注明列表来源降级");
+  assert.match(channel.lastSent(), /已切回会话/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
+});
+
+test("/sessions 无会话：实时为空提示「没有未归档的会话」，本地兜底为空提示「还没有历史会话」", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /没有未归档的会话/);
+
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /没有第 1 个会话/);
+
+  // 兜底路径（本地历史也为空）：沿用旧文案
+  server.nextListStatus = 500;
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /还没有历史会话/);
 });
 
 test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () => {
@@ -674,4 +781,114 @@ test("router：全命令集解析", () => {
 
 test("router：helpText 常驻风险提示", () => {
   assert.match(helpText(), /全权限驱动/);
+});
+
+// ---- T12：图片入站投递（ADR-0009）----
+
+/** PNG 8 字节签名：sniffMimeType 认得出、体积极小。 */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** JPEG 魔数 + 补足字节：嗅探通过但超过服务端 20MB inline 上限。 */
+function oversizedJpeg(): Buffer {
+  return Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(MAX_INLINE_IMAGE_BYTES)]);
+}
+
+test("图片入站：handleRun 下载 → data URL，与文本一起投递 parts", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("图里是一只猫");
+  const channel = new FakeChannel();
+  channel.downloadImageResults = [PNG_SIGNATURE];
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("这张图是什么", { images: ["img_1"] });
+
+  // 下载走 messageId + fileKey，拿到字节后转 data URL 跟在文本 part 之后
+  assert.deepEqual(channel.imageDownloads, [{ messageId: "om_in_1", fileKey: "img_1" }]);
+  assert.deepEqual(server.taskInputParts(), [
+    { type: "text", text: "这张图是什么" },
+    { type: "image_url", imageUrl: `data:image/png;base64,${PNG_SIGNATURE.toString("base64")}` },
+  ]);
+  assert.match(flatText(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /图里是一只猫/);
+});
+
+test("纯图片消息：只投 image_url parts，不注入占位文本，标题为「（图片消息）」", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("看到一张图");
+  const channel = new FakeChannel();
+  channel.downloadImageResults = [PNG_SIGNATURE];
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("", { images: ["img_only"] });
+
+  assert.deepEqual(server.taskInputParts(), [
+    { type: "image_url", imageUrl: `data:image/png;base64,${PNG_SIGNATURE.toString("base64")}` },
+  ]);
+  assert.equal(registry.bindingFor("oc_chat").history[0]?.title, "（图片消息）");
+});
+
+test("图片下载失败：Run 按失败处理，回复脱敏错误，不投任务也不发占位卡", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
+  const channel = new FakeChannel();
+  channel.failDownload = true;
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("看图", { images: ["img_bad"] });
+
+  assert.equal(server.taskPosts().length, 0, "下载失败不应投递任务");
+  assert.equal(channel.sent.length, 1, "只有错误回复，没有占位卡");
+  assert.match(channel.lastSent(), /^出错了：FakeChannel: downloadImage\(img_bad\) failed$/);
+});
+
+test("多张图片：ok 的转 data URL，超限的跳过并把注明拼进输入文本", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("好");
+  const channel = new FakeChannel();
+  channel.downloadImageResults = [PNG_SIGNATURE, oversizedJpeg()];
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("两张图", { images: ["img_ok", "img_huge"] });
+
+  // 串行下载：按 message.images 顺序
+  assert.deepEqual(channel.imageDownloads, [
+    { messageId: "om_in_1", fileKey: "img_ok" },
+    { messageId: "om_in_1", fileKey: "img_huge" },
+  ]);
+  assert.deepEqual(server.taskInputParts(), [
+    { type: "text", text: "两张图\n（有图片超过 20MB 上限，未发送）" },
+    { type: "image_url", imageUrl: `data:image/png;base64,${PNG_SIGNATURE.toString("base64")}` },
+  ]);
+});
+
+test("skill 注入与图片共存：文本被 skill 包裹，图片 part 不受影响", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("好");
+  const channel = new FakeChannel();
+  channel.downloadImageResults = [PNG_SIGNATURE];
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("/skill lark-im");
+  await channel.receive("总结这张图", { images: ["img_1"] });
+
+  assert.deepEqual(server.taskInputParts(), [
+    { type: "text", text: formatSkillInput("lark-im", "总结这张图") },
+    { type: "image_url", imageUrl: `data:image/png;base64,${PNG_SIGNATURE.toString("base64")}` },
+  ]);
+});
+
+test("历史标题清洗：图片占位符不进标题（解码层通常已剥，这里是网关兜底）", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("好");
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("看图 ![Image](img_x) 谢谢");
+
+  assert.equal(registry.bindingFor("oc_chat").history[0]?.title, "看图 谢谢");
 });

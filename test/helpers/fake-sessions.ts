@@ -1,7 +1,7 @@
-// 测试用假会话 API 服务器：以 AuthedFetch 形态注入，覆盖建会话 / PATCH / tasks /
+// 测试用假会话 API 服务器：以 AuthedFetch 形态注入，覆盖建会话 / 会话列表 / PATCH / tasks /
 // abort / approvals / SSE 订阅。帧用真实 ReadableStream 推送，走真实 SSE 解析路径。
 
-import type { AuthedFetch } from "../../src/penguin/sessions.js";
+import type { AuthedFetch, TaskInputPart } from "../../src/penguin/sessions.js";
 import { SessionClient } from "../../src/penguin/sessions.js";
 import { waitFor } from "./wait.js";
 
@@ -18,6 +18,13 @@ export interface FakeSession {
   modelId: string | null;
   workspace: string | null;
   title: string | null;
+  /** 最近活跃时间（列表排序依据）；不传时由建会话 / 投递任务自动拨快。 */
+  lastActiveAt?: string;
+  /** true = 已归档：不出现在 GET 列表里（服务端口径；客户端也会再过滤一次）。 */
+  archived?: boolean;
+  /** 归属：GET 列表按 (project, agent) 过滤，建会话时从路径登记。 */
+  projectId?: string;
+  agentId?: string;
 }
 
 /** 一段流脚本：帧序列；`{ hang: true }` 表示发完不回包、不断流。 */
@@ -31,6 +38,8 @@ export class FakeSessionServer {
   readonly approvalCalls: Array<{ sessionId: string; toolCallId: string; decision: string }> = [];
   /** 下一次 startTask 强制返回的 HTTP 状态（用后清除）。 */
   nextTaskStatus: number | null = null;
+  /** 下一次 GET 会话列表强制返回的 HTTP 状态（用后清除）。 */
+  nextListStatus: number | null = null;
   /** 按 sessionId 脚本化的 SSE 帧；缺省的会话用 defaultScript，再缺省只发快照后挂住。 */
   scripts = new Map<string, FrameScript>();
   /** 所有没有单独脚本的会话共用的帧脚本。 */
@@ -42,6 +51,8 @@ export class FakeSessionServer {
   /** 已打开的事件流数量（断言 close 用）。 */
   openStreams = 0;
   private counter = 0;
+  /** 假时钟刻度：每次会话活动（建会话 / 投递任务）拨快一分钟，保证 lastActiveAt 有序可比。 */
+  private clockTicks = 0;
   /** 在流的事件流控制器（abort 时往里补发帧）。 */
   private readonly controllers = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
 
@@ -62,6 +73,17 @@ export class FakeSessionServer {
   /** 所有 tasks 投递请求（按时间序）。 */
   taskPosts(): FakeRequest[] {
     return this.requests.filter((r) => r.method === "POST" && /\/tasks$/.test(r.path));
+  }
+
+  /**
+   * 第 index 次（缺省最近一次）tasks 投递的 input parts（服务端契约形状）：
+   * `[{type:"text",text},…{type:"image_url",imageUrl}]`；没有投递时为空数组。
+   */
+  taskInputParts(index = -1): TaskInputPart[] {
+    const posts = this.taskPosts();
+    const post = index === -1 ? posts.at(-1) : posts[index];
+    const body = post?.body as { input?: unknown } | undefined;
+    return Array.isArray(body?.input) ? (body.input as TaskInputPart[]) : [];
   }
 
   /** 往一条仍在订阅中的事件流补发一帧（模拟 Run 进行中的事件）。 */
@@ -88,9 +110,40 @@ export class FakeSessionServer {
         modelId: typeof body?.modelId === "string" ? body.modelId : null,
         workspace: typeof body?.workspace === "string" ? body.workspace : null,
         title: null,
+        projectId: createMatch[1] ?? "",
+        agentId: createMatch[2] ?? "",
+        lastActiveAt: this.tick(),
       };
       this.sessions.set(sessionId, session);
       return json({ session });
+    }
+
+    // 会话列表（ADR-0008）：按 (project, agent) 取，未归档、lastActiveAt 倒序。
+    if (createMatch && method === "GET") {
+      if (this.nextListStatus !== null) {
+        const status = this.nextListStatus;
+        this.nextListStatus = null;
+        return json({ error: { code: "boom" } }, status);
+      }
+      const projectId = createMatch[1] ?? "";
+      const agentId = createMatch[2] ?? "";
+      const sessions = [...this.sessions.values()]
+        .filter((s) => s.archived !== true && s.projectId === projectId && s.agentId === agentId)
+        .sort((a, b) => (b.lastActiveAt ?? "").localeCompare(a.lastActiveAt ?? ""))
+        .map((s) => ({
+          sessionId: s.sessionId,
+          title: s.title,
+          status: s.status,
+          provider: s.provider,
+          modelId: s.modelId,
+          workspace: s.workspace,
+          lastActiveAt: s.lastActiveAt ?? null,
+          createdAt: null,
+          archived: false,
+          source: "user",
+          client: "cli",
+        }));
+      return json({ sessions });
     }
 
     const sessionMatch = /^\/sessions\/([^/]+)$/.exec(path);
@@ -113,12 +166,15 @@ export class FakeSessionServer {
         return json({ error: { code: status === 409 ? "task_in_progress" : "boom" } }, status);
       }
       const session = this.sessions.get(tasksMatch[1] ?? "");
-      if (session !== undefined) session.status = "running";
+      if (session !== undefined) {
+        session.status = "running";
+        session.lastActiveAt = this.tick();
+      }
       if (this.healTo !== null) {
         // 自愈：Trace 丢了，服务端换成新 id；顺手把新会话登记好，后续路由都认。
         const healed = this.healTo;
         if (!this.sessions.has(healed)) {
-          this.sessions.set(healed, { ...(session ?? emptySession(healed)), sessionId: healed, status: "running" });
+          this.sessions.set(healed, { ...(session ?? emptySession(healed)), sessionId: healed, status: "running", lastActiveAt: this.tick() });
         }
         return json({ sessionId: healed, queued: false }, 202);
       }
@@ -186,6 +242,27 @@ export class FakeSessionServer {
     }
 
     return json({ error: { code: "not_found", message: `no route ${method} ${path}` } }, 404);
+  }
+
+  /**
+   * 登记一条会话（列表字段可控：lastActiveAt / archived / 标题 / 模型 / 归属）。
+   * 归属缺省算默认 Project/Agent 名下——与建会话路由的默认坐标一致。
+   */
+  addSession(session: Partial<FakeSession> & { sessionId: string }): FakeSession {
+    const full: FakeSession = {
+      ...emptySession(session.sessionId),
+      projectId: "default_project",
+      agentId: "default_agent",
+      ...session,
+    };
+    this.sessions.set(full.sessionId, full);
+    return full;
+  }
+
+  /** 拨快假时钟一分钟，返回 ISO 时间戳（服务端 lastActiveAt 形态）。 */
+  private tick(): string {
+    this.clockTicks += 1;
+    return new Date(Date.parse("2026-10-22T10:00:00.000Z") + this.clockTicks * 60_000).toISOString();
   }
 
   /** 脚本 → SSE 响应体；hang 之后流永远不结束（直到 close 或 abort 补发帧）。 */

@@ -2,6 +2,30 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.4.0] - 2026-10-22
+
+会话列表实时化 + 飞书图片入站（ADR-0008 / ADR-0009）。用户原话：「我发现你换对话时不能实时监测当前工作区未归档的对话，这样的话我也不能直接跳转到在远程新添加的对话」「llm-homework 这个工作区的最新的对话发送不了图片」
+
+### 变更
+
+- **会话列表实时化**（ADR-0008）：`/sessions` 与 `/use` 改查服务端 `GET /api/projects/:p/agents/:a/sessions`——当前 Project/Agent 下未归档会话，按最近活跃倒序前 10 条；在 Web 界面 / CLI / 其他客户端远程新建的对话也能直接看见并跳入。查询失败（网络错误 / 非 2xx）时退回 Registry 本地历史，并在回复首行注明「⚠️ 实时列表查询失败，显示本地历史」。本地历史从「列表主来源」降为「兜底来源 + 审计轨迹」。
+- **图片入站**（ADR-0009）：入站消息里的 `![Image](img_key)` 占位符在解码时提取为图片 key 并从文本移除（`message_type` 白名单扩到含 `image`；纯图片消息合法）。Channel 适配器新增 `downloadImage`（lark-cli `im +messages-resources-download`，临时文件即用即删）；`src/images.ts` 按魔数嗅探 mime、拼 base64 data URL。`startTask` 入参扩展为「字符串或 part 数组」，有图片时投 `[{type:"text"},…{type:"image_url",imageUrl}]`——服务端契约：type 是 `image_url`、字段名是驼峰 `imageUrl`。
+- **边界**：只发图片不带文字时只投 image parts（不注入占位文本）；超过服务端 20MB inline 上限或嗅探不出 mime 的图片跳过，并在输入文本里注明；文件 / 音频 / 视频类消息仍不响应；data URL 不落 `runs.jsonl`、不进日志。
+- **新增 ADR**：`docs/adr/0008-live-session-list.md`、`docs/adr/0009-feishu-image-input.md`；PLAN §4.3 / §5 / §17 与 GLOSSARY 同步。
+
+### 评审整改
+
+- **临时文件清理按实际落盘路径**：`downloadImage` 的清理从「只删请求路径」改为「删信封回报的 `saved_path` + 兜底删请求路径」——lark-cli 可能补扩展名，只删 `--output` 会给不一致时留下残留。
+- **占位符正则收敛单一出处**：`IMAGE_PLACEHOLDER` 与提取逻辑从 `channels/feishu.ts` 移到 `src/images.ts`（GLOSSARY 领域概念的单一出处），gateway 的标题清洗改导入 `stripImagePlaceholders`，消除两处重复定义。
+- **空列表文案区分来源**：实时列表为空提示「当前 Project/Agent 下没有未归档的会话」，本地兜底为空才提示「还没有历史会话」——避免混淆两个词汇。
+- **标题函数统一**：`flattenTitle(title, emptyLabel)` 同时服务会话行与本地历史标题；兜底注明提取为 `withFallbackNote`。
+- **纯图片消息占位符形状实测修正**：真机验收发现 lark-cli 对纯图片（`message_type=image`）消息渲染成 `[Image: img_key]`（带冒号），而非富文本内嵌的 `![Image](img_key)`——旧正则漏掉这种形状，纯图片消息的 key 提取不到。`IMAGE_PLACEHOLDER` 改为双形状匹配（`matchAll` 双组取值），GLOSSARY 与 ADR-0009 同步记录两种形状，各补测试。修后纯图片消息真机复测通过（模型正确读到图内表格，输入文本干净）。
+
+### 工程
+
+- 测试 197 → 237 个全绿，`pnpm typecheck` / `pnpm build` 通过。
+- 双轴评审（Standards + Spec，固定点 v1.3 合并点 `6abff9a`）后落实上述整改。
+
 ## [1.3.0] - 未发布
 
 Run 回复卡片里「思考」分区从一行标签改为默认收起的折叠面板，工具折叠面板标题补上运行状态标识（ADR-0007，逆转 ADR-0006「思考不存全文、不进面板」）。用户原话：「再修改一下，我发现你的回复中有部分思考和工具可以折叠，标识好像是运行完毕，主要在正文之间，这个能不能做」

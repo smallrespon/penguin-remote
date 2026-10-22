@@ -1,6 +1,7 @@
 // 会话 API 客户端：Bridge 与 PenguinHarness 之间的唯一传输层（ADR-0005）。
 // 走 `penguin chat` 同款路径——owner 令牌当 penguin_session cookie：
 //   建会话 POST /api/projects/:p/agents/:a/sessions（普通会话，不归档）
+//   列表   GET  /api/projects/:p/agents/:a/sessions（未归档过滤在客户端，ADR-0008）
 //   钉思考 PATCH /api/sessions/:id
 //   订阅   GET  /api/sessions/:id/stream（SSE）
 //   投递   POST /api/sessions/:id/tasks
@@ -40,11 +41,34 @@ export interface SessionInfo {
   title: string | null;
 }
 
+/**
+ * 一条会话的列表项（GET /projects/:p/agents/:a/sessions，ADR-0008）。
+ * 服务端标题最长 120 字符、可能含换行，展示前由调用方拍平截断。
+ */
+export interface SessionListItem {
+  sessionId: string;
+  title: string | null;
+  /** 最近活跃时间（ISO 8601）；列表排序依据，服务端可能缺。 */
+  lastActiveAt: string | null;
+  modelId: string | null;
+}
+
+/** 会话列表条数上限（与 Registry 的 HISTORY_LIMIT 一致：兜底本地历史也用这个数）。 */
+export const SESSION_LIST_LIMIT = 10;
+
 export interface TaskStartResult {
   /** 实际承载任务的会话 id（自愈改名后与请求的 id 不同）。 */
   sessionId: string;
   queued: boolean;
 }
+
+/**
+ * 任务投递的一个 input part（服务端 parseTaskInput 契约）：文本或图片。
+ * 图片 part 的 type 是 `image_url`，但字段名是驼峰 `imageUrl`（2026-10-22 实测）。
+ */
+export type TaskInputPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; imageUrl: string };
 
 /** 带 cookie 的请求函数（OwnerSession.fetchAuthed），401 自动重铸重试。 */
 export type AuthedFetch = (path: string, init?: RequestInit) => Promise<Response>;
@@ -235,14 +259,55 @@ export class SessionClient {
     return toSessionInfo(data.session);
   }
 
-  /** 投递一条任务；返回实际会话 id（可能因自愈而变）与是否入队。 */
-  async startTask(sessionId: string, input: string): Promise<TaskStartResult> {
+  /**
+   * 当前 (project, agent) 下的会话列表（ADR-0008）。服务端返回全部会话（含已归档），
+   * 未归档过滤 / lastActiveAt 倒序 / 截断都在客户端做——与 `penguin session ls` 同口径。
+   * 远程（Web / CLI / 其他客户端）新建的未归档会话因此也可见、可跳。
+   */
+  async listSessions(projectId: string, agentId: string): Promise<SessionListItem[]> {
+    const data = await this.request<{ sessions?: unknown }>(
+      "GET",
+      `/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/sessions`,
+    );
+    const raw: unknown[] = Array.isArray(data.sessions) ? data.sessions : [];
+    const items: SessionListItem[] = [];
+    for (const entry of raw) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const session = entry as Record<string, unknown>;
+      // 已归档：服务端侧栏不显示，Bridge 也不列（全量视图留作后续可选增强）
+      if (session.archived === true) continue;
+      const sessionId = typeof session.sessionId === "string" ? session.sessionId : "";
+      if (sessionId === "") continue;
+      items.push({
+        sessionId,
+        title: typeof session.title === "string" ? session.title : null,
+        lastActiveAt: typeof session.lastActiveAt === "string" ? session.lastActiveAt : null,
+        modelId: typeof session.modelId === "string" ? session.modelId : null,
+      });
+    }
+    // lastActiveAt 倒序；缺时间的排最后，同刻保持服务端顺序（sort 稳定）
+    items.sort((a, b) => {
+      const left = a.lastActiveAt ?? "";
+      const right = b.lastActiveAt ?? "";
+      if (left === right) return 0;
+      return left < right ? 1 : -1;
+    });
+    return items.slice(0, SESSION_LIST_LIMIT);
+  }
+
+  /**
+   * 投递一条任务；返回实际会话 id（可能因自愈而变）与是否入队。
+   * input 传字符串时投单个 text part（与旧行为逐字一致）；传 part 数组时按序投递
+   * （ADR-0009：图片走 `{type:"image_url", imageUrl}`，字段名是驼峰）。
+   */
+  async startTask(sessionId: string, input: string | TaskInputPart[]): Promise<TaskStartResult> {
+    const parts: TaskInputPart[] = typeof input === "string" ? [{ type: "text", text: input }] : input;
     let response: Response;
     try {
       response = await this.fetchAuthed(`/sessions/${encodeURIComponent(sessionId)}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: [{ type: "text", text: input }] }),
+        body: JSON.stringify({ input: parts }),
       });
     } catch (error: unknown) {
       throw new SessionApiError(`投递任务失败：${error instanceof Error ? error.message : String(error)}`);

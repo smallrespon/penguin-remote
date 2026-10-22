@@ -29,6 +29,12 @@ export class FakeChannel implements ChannelAdapter {
   /** 单条消息允许的编辑次数上限（模拟飞书 230072）；null = 不限。 */
   editLimitPerMessage: number | null = null;
   private readonly editCounts = new Map<string, number>();
+  /** downloadImage 的返回值队列：每次调用取出队首；空了返回内置假图片字节。 */
+  downloadImageResults: Array<Buffer | Error> = [];
+  /** 让 downloadImage 抛出（模拟飞书下载失败）。 */
+  failDownload = false;
+  /** 记录收到的下载请求（messageId + fileKey）。 */
+  readonly imageDownloads: Array<{ messageId: string; fileKey: string }> = [];
 
   async start(handler: (message: IncomingMessage) => void | Promise<void>): Promise<void> {
     this.handler = handler;
@@ -74,9 +80,21 @@ export class FakeChannel implements ChannelAdapter {
       messageId: `om_in_${this.sent.length + this.edited.length + 1}`,
       senderId: "ou_user",
       text,
+      images: [],
       ...overrides,
     };
     await this.handler?.(message);
+  }
+
+  /** 模拟下载一条入站消息里的图片：按注入的队列返回，或用内置假图片字节。 */
+  async downloadImage(messageId: string, fileKey: string): Promise<Buffer> {
+    this.imageDownloads.push({ messageId, fileKey });
+    if (this.failDownload) {
+      throw new Error(`FakeChannel: downloadImage(${fileKey}) failed`);
+    }
+    const next = this.downloadImageResults.shift();
+    if (next instanceof Error) throw next;
+    return next ?? Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
   }
 
   lastSent(): string {

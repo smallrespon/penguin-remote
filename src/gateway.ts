@@ -3,6 +3,7 @@
 
 import type { ChannelAdapter, IncomingMessage } from "./channels/types.js";
 import type { BridgeConfig } from "./config.js";
+import { imageDataUrlOrNote, stripImagePlaceholders } from "./images.js";
 import type { Lanes } from "./lanes.js";
 import { redact } from "./logger.js";
 import type { Logger } from "./logger.js";
@@ -42,6 +43,47 @@ export interface GatewayDeps {
 
 interface ActiveRun {
   abort: () => Promise<void>;
+}
+
+/** 会话列表统一条目形态：实时（服务端）与本地历史（Registry）都归一到它再渲染。 */
+interface SessionListEntry {
+  sessionId: string;
+  /** 服务端标题（可能含换行）或本地历史标题；null / 空 = 无标题。 */
+  title: string | null;
+  /** 展示用时间：实时列表取 lastActiveAt，本地历史取 at；null = 服务端没给。 */
+  at: string | null;
+  model: string | null;
+}
+
+/** 列表查询失败时的兜底注明（ADR-0008：结果不丢，老行为降级为兜底）。 */
+const LIVE_LIST_FALLBACK_NOTE = "⚠️ 实时列表查询失败，显示本地历史";
+
+/** 标题拍平（服务端标题可能含换行）后截断到 40 字；空标题给占位。 */
+const TITLE_MAX_CHARS = 40;
+
+/** 标题拍平 + 截断；空标题（null 或只有空白）用 emptyLabel 占位。 */
+function flattenTitle(title: string | null, emptyLabel: string): string {
+  if (title === null) return emptyLabel;
+  const flat = title.replace(/\s+/g, " ").trim();
+  return flat === "" ? emptyLabel : flat.slice(0, TITLE_MAX_CHARS);
+}
+
+/** 本地历史标题：先移除图片占位符再拍平截断；纯图片消息（文本为空）回落占位标题。 */
+function runTitle(text: string): string {
+  return flattenTitle(stripImagePlaceholders(text), "（图片消息）");
+}
+
+/** 兜底降级时给回复加一行注明；实时成功时原文返回。 */
+function withFallbackNote(live: boolean, body: string): string {
+  return live ? body : `${LIVE_LIST_FALLBACK_NOTE}\n${body}`;
+}
+
+/** 一条会话行：序号. 标题 — 最近活跃时间 — `model` — `sessionId`；当前会话行首加 →。 */
+function sessionLine(entry: SessionListEntry, index: number, currentSessionId: string | null): string {
+  const at = entry.at === null ? "未知时间" : entry.at.slice(0, 16).replace("T", " ");
+  const model = entry.model === null ? "" : ` — \`${entry.model}\``;
+  const marker = entry.sessionId === currentSessionId ? "→ " : "";
+  return `${marker}${index + 1}. ${flattenTitle(entry.title, "（无标题）")} — ${at}${model} — \`${entry.sessionId}\``;
 }
 
 export class Gateway {
@@ -183,15 +225,28 @@ export class Gateway {
         b.skill = null;
       });
     }
-    const input = skill === null ? text : formatSkillInput(skill, text);
 
     const attempt = await this.deps.lanes.run(chatId, async () => {
+      // 图片入站（ADR-0009）：串行下载转 data URL；下载抛错直接冒泡，由 handleMessage
+      // 的统一错误路径脱敏回复（此时还没发占位卡、没投任务）；超限 / 嗅探失败的图
+      // 跳过，注明（去重）拼进输入文本——纯图片且全跳过时，注明就是全部输入。
+      const dataUrls: string[] = [];
+      const notes: string[] = [];
+      for (const key of message.images) {
+        const bytes = await this.deps.channel.downloadImage(message.messageId, key);
+        const decision = imageDataUrlOrNote(bytes);
+        if (decision.kind === "ok") dataUrls.push(decision.dataUrl);
+        else notes.push(decision.note);
+      }
+      const inputText = [text, ...new Set(notes)].filter(Boolean).join("\n");
+      const input = skill === null ? inputText : formatSkillInput(skill, inputText);
       try {
         return await executeRun(
           { channel: this.deps.channel, logger: this.logger },
           {
             chatId,
             input,
+            ...(dataUrls.length > 0 ? { images: dataUrls } : {}),
             agent: { projectId: binding.projectId, agentId: binding.agentId },
             sessionId: binding.sessionId,
             // 档位只在下发新建会话时生效；续接的会话保持它创建时的设置。
@@ -225,7 +280,7 @@ export class Gateway {
     if (report.sessionId !== null && report.sessionId !== binding.sessionId) {
       await this.deps.registry.noteSession(chatId, {
         sessionId: report.sessionId,
-        title: text.slice(0, 40),
+        title: runTitle(text),
         ...(report.modelId !== null ? { model: report.modelId } : {}),
         projectId: binding.projectId,
         agentId: binding.agentId,
@@ -244,37 +299,69 @@ export class Gateway {
 
   // ---- 控制命令 ----
 
+  /**
+   * /sessions 与 /use 共用的列表来源（ADR-0008）：实时查服务端当前 (project, agent) 下的
+   * 未归档会话；查询失败（网络错误 / 非 2xx）时退回 Registry 本地历史，调用方负责注明。
+   */
+  private async sessionListFor(chatId: string): Promise<{ entries: SessionListEntry[]; live: boolean }> {
+    const binding = this.deps.registry.bindingFor(chatId);
+    try {
+      const items = await this.deps.sessions.listSessions(binding.projectId, binding.agentId);
+      return {
+        entries: items.map((item) => ({
+          sessionId: item.sessionId,
+          title: item.title,
+          at: item.lastActiveAt,
+          model: item.modelId,
+        })),
+        live: true,
+      };
+    } catch (error: unknown) {
+      const text = redact(error instanceof Error ? error.message : String(error));
+      this.logger.warn(`实时会话列表查询失败，改用本地历史：${text}`);
+      return {
+        entries: this.deps.registry.sessionsFor(binding).map((item) => ({
+          sessionId: item.sessionId,
+          title: item.title,
+          at: item.at,
+          model: item.model ?? null,
+        })),
+        live: false,
+      };
+    }
+  }
+
   private async handleSessions(chatId: string): Promise<void> {
     const binding = this.deps.registry.bindingFor(chatId);
-    // 会话按 (project, agent) 隔离：只列当前绑定下能续聊的
-    const sessions = this.deps.registry.sessionsFor(binding);
-    if (sessions.length === 0) {
-      await this.reply(chatId, "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。");
+    const { entries, live } = await this.sessionListFor(chatId);
+    if (entries.length === 0) {
+      // 实时为空 = 没有未归档会话（可能都已归档）；本地为空才是「没有历史会话」。
+      const empty =
+        live
+          ? "当前 Project/Agent 下没有未归档的会话，发一条消息就开始新的对话。"
+          : "这个聊天在当前 Project/Agent 下还没有历史会话，发一条消息就开始新的对话。";
+      await this.reply(chatId, empty);
       return;
     }
-    const lines = sessions.map(
-      (item, index) =>
-        `${index + 1}. ${item.title || "（无标题）"} — ${item.at.slice(0, 16).replace("T", " ")}` +
-        `${item.model !== undefined ? ` — \`${item.model}\`` : ""} — \`${item.sessionId}\``,
-    );
+    const lines = entries.map((entry, index) => sessionLine(entry, index, binding.sessionId));
     const current = binding.sessionId === null ? "无（下一条消息新建）" : `\`${binding.sessionId}\``;
-    await this.reply(
-      chatId,
-      `**最近会话**（当前：${current}）\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`,
-    );
+    const body = `**最近会话**（当前：${current}）\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
+    await this.reply(chatId, withFallbackNote(live, body));
   }
 
   private async handleUse(chatId: string, index: number): Promise<void> {
-    const binding = this.deps.registry.bindingFor(chatId);
-    const record = this.deps.registry.sessionsFor(binding)[index - 1];
-    if (record === undefined) {
+    const { entries, live } = await this.sessionListFor(chatId);
+    const entry = entries[index - 1];
+    if (entry === undefined) {
       await this.reply(chatId, `⚠️ 没有第 ${index} 个会话，\`/sessions\` 查看列表。`);
       return;
     }
+    // 只改本聊天的会话绑定；会话的创建 / 归档 / 删除仍归服务端与其他客户端。
     await this.deps.registry.update(chatId, (b) => {
-      b.sessionId = record.sessionId;
+      b.sessionId = entry.sessionId;
     });
-    await this.reply(chatId, `✅ 已切回会话 \`${record.sessionId}\`，下一条消息继续该对话。`);
+    const done = `✅ 已切回会话 \`${entry.sessionId}\`，下一条消息继续该对话。`;
+    await this.reply(chatId, withFallbackNote(live, done));
   }
 
   private async handleSkill(chatId: string, name: string | null, mode: "once" | "on" | "off"): Promise<void> {

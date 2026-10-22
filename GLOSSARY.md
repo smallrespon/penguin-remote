@@ -15,7 +15,7 @@ Bridge 与外部 IM 之间的协议转换接口（发送消息、编辑消息、
 _Avoid_: 渠道插件、connector
 
 **Feishu 适配器**:
-基于 lark-cli 子进程的 Channel 适配器实现：两条 `event consume` 事件流入；出口是 `messages-send`（文本与交互卡片）与 `im messages patch`（更新 Run 回复卡片）——`messages-edit` 只剩文本兜底路径在用（卡片发送失败时的降级链路，见 ADR-0006）。
+基于 lark-cli 子进程的 Channel 适配器实现：两条 `event consume` 事件流入；出口是 `messages-send`（文本与交互卡片）与 `im messages patch`（更新 Run 回复卡片）——`messages-edit` 只剩文本兜底路径在用（卡片发送失败时的降级链路，见 ADR-0006）；入站图片二进制经 `im +messages-resources-download` 下载（见 ADR-0009）。
 _Avoid_: 飞书通道、lark adapter
 
 **Lane**:
@@ -41,7 +41,7 @@ PenguinHarness 侧的对话上下文容器，多个 Run 可续接同一 Session�
 _Avoid_: chat、conversation（那些指飞书侧的聊天）
 
 **会话 API**:
-PenguinHarness 以人类登录态（cookie）驱动的 HTTP 面：`/api/projects/:p/agents/:a/sessions` 建会话、`/api/sessions/:id/*` 做投递 / 中止 / 审批 / 查询。Bridge 自 ADR-0005 起只走这一面，建出来的都是普通会话，不归档。
+PenguinHarness 以人类登录态（cookie）驱动的 HTTP 面：`/api/projects/:p/agents/:a/sessions` 建会话、`/api/sessions/:id/*` 做投递 / 中止 / 审批 / 查询；同一路由的 GET 还提供按 Agent 的会话列表（未归档过滤在客户端做，见 ADR-0008）。Bridge 自 ADR-0005 起只走这一面，建出来的都是普通会话，不归档。
 _Avoid_: 用户 API、web API
 
 **AMSP**:
@@ -73,6 +73,10 @@ _Avoid_: streaming（那个指会话 SSE 事件流）、打字机效果
 **回复分区**:
 一条飞书回复消息内按内容类型划分的结构块：思考、工具调用、正文等，各带一行标签以示区分；分区按 Run 的真实时序排列，工具调用可夹在两段正文之间；在回复卡片里，思考与工具调用收进折叠面板（见「折叠面板」），文本消息里则是普通标签行。
 _Avoid_: 消息板块、三段式
+
+**图片占位符**:
+lark-cli 把入站消息预渲染成可读文本时，图片呈现成的标记，两种形状均已实测：富文本（post）内嵌图片是 `![Image](img_xxx)`，纯图片（image）消息是 `[Image: img_xxx]`。真正的二进制要用 `im +messages-resources-download` 另取。Bridge 解码时把占位符提取成图片 key、从文本中移除，下载后以 `image_url` part 投给 Agent（见 ADR-0009）。
+_Avoid_: 图片标记、image tag
 
 **审批**:
 工具执行前请求人类决策的机制；v1 运行在 allow-all 模式，不产生审批请求（见 ADR-0004）。

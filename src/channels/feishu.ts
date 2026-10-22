@@ -3,8 +3,14 @@
 // 出：`im +messages-send` / `im +messages-edit`（文本），
 //     `im +messages-send --msg-type interactive` / `im messages patch`（交互卡片）。
 
+import { randomUUID } from "node:crypto";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type { ChannelAdapter, IncomingMessage, OutboundMessage } from "./types.js";
 import { runCommand, readLines, spawnManaged, type ManagedChild, type SpawnFn } from "../proc.js";
+import { extractImageKeys } from "../images.js";
 import type { Logger } from "../logger.js";
 import { redact } from "../logger.js";
 
@@ -23,7 +29,7 @@ export interface FeishuChannelOptions {
 /** lark-cli 的输出信封。 */
 interface LarkEnvelope {
   ok?: boolean;
-  data?: { message_id?: string } & Record<string, unknown>;
+  data?: { message_id?: string; saved_path?: string } & Record<string, unknown>;
   error?: { message?: string } & Record<string, unknown>;
 }
 
@@ -64,7 +70,7 @@ function readContent(raw: unknown): string {
 
 /**
  * 把一条 `im.message.receive_v1` 事件解码成统一消息；不该响应的返回 null：
- * 非消息事件、机器人自己发的、非文本/富文本类型、群聊里没被 @、剥离后空文本。
+ * 非消息事件、机器人自己发的、非文本/富文本/图片类型、群聊里没被 @、剥离后既无文本也无图片。
  */
 export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMessage | null {
   const event = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
@@ -82,7 +88,8 @@ export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMes
   if (payload.sender_type === "bot") return null;
 
   const messageType = str(payload.message_type);
-  if (messageType !== "" && messageType !== "text" && messageType !== "post") return null;
+  // 纯图片消息（image）同样只带图片占位符；文件/音频/视频/表情等仍不响应。
+  if (messageType !== "" && messageType !== "text" && messageType !== "post" && messageType !== "image") return null;
 
   const mentions = Array.isArray(payload.mentions) ? payload.mentions : [];
   if (chatType === "group") {
@@ -95,9 +102,11 @@ export function decodeMessageEvent(raw: unknown, botOpenId: string): IncomingMes
     .map((m) => (typeof m === "object" && m !== null ? str((m as { name?: unknown }).name) : ""))
     .filter((name) => name !== "");
 
-  const text = stripMentions(readContent(payload.content), mentionNames);
-  if (text === "") return null;
-  return { chatId, chatType, messageId, senderId, text };
+  const { keys, text: withoutImages } = extractImageKeys(readContent(payload.content));
+  const text = stripMentions(withoutImages, mentionNames);
+  // 纯图片消息：文本为空但有图片，仍是合法消息。
+  if (text === "" && keys.length === 0) return null;
+  return { chatId, chatType, messageId, senderId, text, images: keys };
 }
 
 function str(value: unknown): string {
@@ -284,6 +293,55 @@ export class FeishuChannel implements ChannelAdapter {
       );
     }
     return { data: envelope.data };
+  }
+
+  /**
+   * 下载一条入站消息里的图片：lark-cli 把二进制落到临时文件，读进内存后**立刻删除**（成功与失败都删）。
+   * 临时文件落在 `os.tmpdir()`（lark-cli 的 --output 只接受允许目录内的路径）。
+   * 删除按信封回报的 `saved_path` 走（lark-cli 可能补扩展名，与实际落盘路径未必等于 --output），
+   * 同时兜底删一次请求路径，两个都删保证不残留。
+   */
+  async downloadImage(messageId: string, fileKey: string): Promise<Buffer> {
+    const tmpPath = join(tmpdir(), `penguin-remote-image-${randomUUID()}`);
+    let savedPath: string | null = null;
+    try {
+      const result = await this.run(this.bin, [
+        "im",
+        "+messages-resources-download",
+        "--as",
+        "bot",
+        "--message-id",
+        messageId,
+        "--file-key",
+        fileKey,
+        "--type",
+        "image",
+        "--output",
+        tmpPath,
+      ]);
+      const envelope = parseEnvelope(result.stdout);
+      if (result.status !== 0 || envelope?.ok !== true) {
+        throw new Error(
+          `下载图片失败（lark-cli exit=${result.status}）：${redact(envelope?.error?.message ?? result.stderr.trim())}`,
+        );
+      }
+      const reported = envelope.data?.saved_path;
+      if (reported === undefined || reported === "") {
+        throw new Error("lark-cli 未返回 saved_path，无法读取下载的图片");
+      }
+      savedPath = reported;
+      return await readFile(savedPath);
+    } finally {
+      // 清理失败不影响结果：文件本来就是要丢的
+      for (const path of new Set([tmpPath, savedPath])) {
+        if (path === null) continue;
+        try {
+          await rm(path, { force: true });
+        } catch {
+          // 见上
+        }
+      }
+    }
   }
 
   async stop(): Promise<void> {

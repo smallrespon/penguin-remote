@@ -142,8 +142,8 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 
 ### 4.3 会话与「换对话」
 
-- Registry 记录每个 chat 用过的所有 session（task 投递返回时落盘），`/sessions` 列最近 N 条（标题取服务端生成的标题或首条消息摘要），`/use <n>` 把绑定切回该 session，下一条消息继续往这个会话投递。
-- 会话列表仍靠 Bridge 自己的 Registry（OpenClaw 式「Gateway 是单一事实来源」）；会话 API 虽能按 Agent 列会话，但跨聊天/跨项目的汇总视图没有，自持更简单。
+- Registry 记录每个 chat 用过的所有 session（task 投递返回时落盘），作为审计轨迹与**兜底**列表；`/sessions` 默认**实时查询服务端**当前 Project/Agent 下的未归档会话（`GET /api/projects/:p/agents/:a/sessions`，按 lastActiveAt 倒序前 10 条），`/use <n>` 在这份实时列表上切换——远程（Web/CLI/其他客户端）新建的未归档会话可直接看见并跳入；查询失败才退回 Registry 本地历史并在回复中注明（ADR-0008，2026-10-22）。
+- 为什么改：v1.0–v1.3 的「自持列表」让 Bridge 看不见任何非自己创建的会话，用户在远程新建的对话无法跳转；服务端列表接口一直存在（`penguin session ls` 就在用），Bridge 建的会话本就不归档，实时列表天然覆盖自己建的会话，不存在「列出去了却续不了」。
 - `/new` = 清掉当前 sessionId 绑定，下一条消息新建（新建时带上当前档位）。
 - 迁移约定：v1.0 时期 AMSP 建的会话是 `source: "api"`（已归档）。2026-10-21 实测：默认 Agent 名下的旧会话仍可被会话 API 续接（续了也保持归档），绑定保留、自然老化；按聊天懒建的 `feishu_*` 专属 Agent 名下的旧会话经会话 API 不可达（404，随 Agent 清理一并消失），这类绑定在 Registry 加载时迁回默认 Agent 并清掉会话引用（历史记录按归属自然过滤）。自 ADR-0005 起新建的会话都是普通会话（`source: "user"`，不归档）。
 
@@ -181,8 +181,8 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 |---|---|
 | `/help` | 命令列表 |
 | `/new` | 新开会话（清 session 绑定） |
-| `/sessions` | 列出本聊天绑定过的最近 10 个会话（序号/标题/时间/模型） |
-| `/use <n>` | 切到第 n 个会话 |
+| `/sessions` | 实时列出当前 Project/Agent 下最近 10 个未归档会话（序号/标题/时间/模型，当前会话以 `→` 标出）；查询失败退回本地历史并注明（ADR-0008） |
+| `/use <n>` | 切到实时列表的第 n 个会话（含远程新建的未归档会话） |
 | `/project` / `/project <名字>` | 列出（owner 会话拉 `GET /api/projects`）/ 切换项目；切项目 = Agent 归位默认 + 换对话（session 按 Agent 隔离） |
 | `/agent` / `/agent <名字>` | 列出（`GET /api/projects/:p/agents`）/ 切换 Agent；切 Agent = 换对话（session 按 Agent 隔离） |
 | `/model <名字>` | 把模型写进本聊天 binding，下一新会话生效 |
@@ -453,3 +453,13 @@ v1.0.0 发布清单与唯一剩余步骤。
 3. **承载变化：折叠块状态标识**：思考标题「🧠 思考 · 运行中… · N 字」（流式）/「🧠 思考 · 运行完毕 · N 字 · X.Xs」（定稿，耗时按事件时间戳真实计算）；工具标题「🔧 名称 · 运行完毕 · 参数」（收到 output）/「🔧 名称 · 运行中… · 参数」（未收到 output），状态紧跟工具名，与思考标题「名称 · 状态 · 详情」语序一致。
 4. **预算优先级**：超预算时先把思考面板当丢弃首选（靠中间的优先），保住工具轨迹与正文答案；思考丢光仍超预算，再按现有规则从中间丢其他分区。文本兜底路径的预算口径不变（`render.ts` 的 `fitMiddleDropping` 原样保留）。
 5. **边界**：定稿时仍未闭合的思考段（始终没等到 `thinking.done`）标题不带状态词，沿用「🧠 思考 · N 字」——拿不到终态，不谎报「完毕」；文本兜底路径里思考仍是一行标签（文本消息没有折叠载体），「运行完毕」等状态词只出现在卡片路径。
+
+---
+
+## 17. v1.4：会话列表实时化 + 图片入站（2026-10-22，ADR-0008 / ADR-0009）
+
+**动因（用户原话）**：「我发现你换对话时不能实时监测当前工作区未归档的对话，这样的话我也不能直接跳转到在远程新添加的对话」「llm-homework 这个工作区的最新的对话发送不了图片」。
+
+1. **会话列表实时化（ADR-0008）**：`/sessions` 与 `/use` 改查服务端 `GET /api/projects/:p/agents/:a/sessions`——未归档、按 `lastActiveAt` 倒序前 10 条；本地 Registry 历史降级为查询失败时的兜底（回复中注明）。用户在任何客户端新建的对话从此可见、可跳。
+2. **图片入站（ADR-0009）**：入站消息的 `![Image](img_key)` 占位符在解码时提取为图片 key 并从文本中移除；`message_type` 白名单扩到含 `image`；Channel 适配器新增 `downloadImage(messageId, fileKey)`（lark-cli `im +messages-resources-download`，临时文件即用即删）；`src/images.ts` 纯函数按魔数嗅探 mime、拼 base64 data URL，超服务端 20MB inline 上限或嗅探失败的图片跳过并在输入里注明；`startTask` 入参扩为「字符串或 part 数组」，有图片时投 `[{type:"text"},…{type:"image_url",imageUrl}]`，纯图片消息只投 image_url parts（不注入占位文本，用户拍板）。
+3. **边界**：文件 / 音频 / 视频类消息仍不响应；回复方向不出图；data URL 不落 `runs.jsonl`、不进日志。
