@@ -11,8 +11,10 @@ export interface IncomingMessage {
   chatType: ChatType;
   messageId: string;
   senderId: string;
-  /** 已剥离 @ 占位符、可读的文本。 */
+  /** 已剥离 @ 占位符与图片占位符、可读的文本；纯图片消息为空串。 */
   text: string;
+  /** 消息里的图片 key 列表（`![Image](img_key)` 提取而来）；无图片为 []。 */
+  images: string[];
 }
 
 /** 一条出站消息：纯文本，或一张交互卡片（Card 2.0）。 */
@@ -28,4 +30,6 @@ export interface ChannelAdapter {
   send(chatId: string, message: OutboundMessage): Promise<string>;
   /** 改一条机器人自己发出的消息（文本或交互卡片）。 */
   edit(messageId: string, message: OutboundMessage): Promise<void>;
+  /** 下载一条入站消息里的图片二进制（按 messageId + 图片 key）。 */
+  downloadImage(messageId: string, fileKey: string): Promise<Buffer>;
 }
