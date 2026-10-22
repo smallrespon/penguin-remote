@@ -15,7 +15,7 @@ Bridge 与外部 IM 之间的协议转换接口（发送消息、编辑消息、
 _Avoid_: 渠道插件、connector
 
 **Feishu 适配器**:
-基于 lark-cli 子进程的 Channel 适配器实现：两条 `event consume` 事件流入，`messages-send` / `messages-edit` 出。
+基于 lark-cli 子进程的 Channel 适配器实现：两条 `event consume` 事件流入；出口是 `messages-send`（文本与交互卡片）与 `im messages patch`（更新 Run 回复卡片）——`messages-edit` 只剩文本兜底路径在用（卡片发送 / patch 失败时的降级链路，见 ADR-0006）。
 _Avoid_: 飞书通道、lark adapter
 
 **Lane**:
@@ -58,8 +58,16 @@ _Avoid_: 配置项、参数、设置
 
 ### 飞书侧
 
+**回复卡片**:
+Run 回复的承载形态：一张飞书交互卡片（Card 2.0），header 放状态文案（🦐 思考中… / 🦐 执行中… / ✅ 完成 / ❌ 未正常完成），内容是按 Run 真实时序排列的回复分区，页脚是分割线 + 用量行；预览与定稿经 `im messages patch` 更新同一张卡（见 ADR-0006）。
+_Avoid_: 消息卡片、卡片消息（指飞书卡片形态本身，不特指 Run 回复）
+
+**折叠面板**:
+回复卡片里默认收起、点击展开的 `collapsible_panel` 元素；每个工具调用各占一个，标题行是「🔧 名称 · 截断参数」，展开后是参数与 output（见 ADR-0006）。
+_Avoid_: 折叠块、collapsible、手风琴
+
 **流式预览**:
-用一条占位消息加节流 `messages-edit` 实现的渐进显示效果。
+用一张占位交互卡片加节流 `im messages patch` 更新实现的渐进显示效果；预览与定稿是同一张卡（见 ADR-0006）。
 _Avoid_: streaming（那个指会话 SSE 事件流）、打字机效果
 
 **回复分区**:

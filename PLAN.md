@@ -56,7 +56,7 @@ PenguinHarness 为「外部程序驱动 Agent」提供了官方入口：**Agent 
 
 - 收消息：`lark-cli event consume im.message.receive_v1 --as bot` → stdout 逐行 NDJSON；stderr 就绪标记 `[event] ready event_key=…`；stdin EOF 会优雅退出（长驻需喂不 EOF 的 stdin 或定时重启）。**本机已验证**：bus daemon 自动起、WebSocket 连上、超时干净退出。
 - 发消息：`lark-cli im +messages-send --as bot --chat-id oc_xxx --markdown "…"`。
-- 编辑已发消息（流式预览用）：`lark-cli im +messages-edit --as bot --message-id om_xxx --markdown "…"`（bot only，正好匹配）。
+- 编辑已发消息：文本消息走 `lark-cli im +messages-edit --as bot --message-id om_xxx --markdown "…"`（bot only，正好匹配；单条编辑上限 20 次，见 §11）；交互卡片走 `lark-cli im messages patch --as bot --message-id om_xxx --data …`（只更新 interactive 卡片，无编辑次数上限、连打 27 次全过，内容上限 30KB，见 §11 / ADR-0006）。
 - 审批按钮：interactive 卡片 + `lark-cli event consume card.action.trigger`；更新卡片用 `api POST /open-apis/interactive/v1/card/update`（token 30 分钟有效）。卡片 JSON 必须按 lark-im skill 的卡片工作流生成（实现时读 `references/card/lark-im-card-create.md`）。
 - 事件里带 `chat_type`（p2p/group）、`mentions`（群聊里是否被 @）、`message_id`、`sender_id`，文本已渲染成可读文本。
 
@@ -85,7 +85,7 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 │  ┌─────────────┐   NDJSON    ┌──────────────┐                │
 │  │ Feishu      │ ──────────► │ 消息解码器    │                │
 │  │ Adapter     │ ◄────────── │ (chat/user/  │                │
-│  │ (lark-cli   │   send/edit │  text/mentions)               │
+│  │ (lark-cli   │  send/patch │  text/mentions)               │
 │  │  子进程)     │             └──────┬───────┘                │
 │  └─────────────┘                    │                        │
 │                              ┌──────▼───────┐                │
@@ -113,7 +113,7 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 | Channel 适配器统一接口（协议转换引擎） | `channels/types.ts` 定义接口，`channels/feishu.ts` 是唯一实现；未来加 Telegram/企业微信不动内核 |
 | Lane Queue 串行执行 | 按 `chatId` 串行：一个聊天同时只跑一个 Run（AMSP 本身也禁止会话并发） |
 | 会话绑定持久化（Claude-to-IM） | `state/bindings.json`：chatId ↔ (profile, sessionId, skill)，原子写 |
-| 流式预览 + 按平台节流（Claude-to-IM） | 占位消息 + `messages-edit` 节流（≥1s/次） |
+| 流式预览 + 按平台节流（Claude-to-IM） | 占位交互卡片 + `im messages patch` 节流（≥1s/次；文本兜底路径仍用 `messages-edit`，见 ADR-0006） |
 | 内联按钮审批（Claude-to-IM） | `approval.requested` → 卡片「允许/拒绝」→ `card.action.trigger` → AMSP approvals |
 | 密钥 chmod 600 + 日志脱敏 | key 只走 env / 0600 文件；日志对 `penguin_` 打码 |
 | Heartbeat / Cron | v2：用 PenguinHarness 自带 `penguin schedule` 或 Bridge 内置定时 |
@@ -160,11 +160,11 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 
 ### 4.5 流式预览与渲染
 
-- 每条 Run 开始：发一条占位消息（markdown，内容为「🦐 思考中…」），拿到 `message_id`。
+- 每条 Run 开始：发一张占位交互卡片（Card 2.0，header 状态「🦐 思考中…」），拿到 `message_id`；预览与定稿都 patch 这一张卡（承载形态见 §13 / ADR-0006）。
 - **订阅先于投递**：先连 `GET /api/sessions/:id/stream`（SSE，首事件是 `task_state` 快照），再 `POST .../tasks`，保证不丢事件。
 - 事件映射（OmniMessage → 回复分区，格式细节见 §13）：`partial_text` 增量累积正文分区，完整的 assistant `text` 消息收尾；`partial_thinking`/`thinking` 折叠成思考标签行「🧠 思考中…（n 字）」；`tool_call` 追加「🔧 工具名」+ 一行截断到 80 字的参数（先 redact 后截断）；`tool_call_output` 回填 `output:` 围栏代码块（末尾 8 行、每行 ≤100 字符）；`compaction_begin` 记一条「🗜️ 正在压缩上下文…」提示分区。
 - 终局判定：`task_state` 从 running 回 idle 即 Run 结束；`request_end` 的 status（completed / aborted / fatal / retryable）与 `abort` 事件的 error_code 决定结局文案；用量按请求累计（每个 `request_begin` 配对的 `token_usage.request.total` 求和，压缩期间的用量也计入；一个请求都没跑过则没有用量页脚），与 v1.0 AMSP 客户端口径一致。
-- 节流：每 ≥1.5s 或累积 ≥300 字符才 `messages-edit` 一次；最终定稿一次。编辑失败（频率限制）退化为「不编辑，最后一次性发总结」；单条消息编辑次数用尽（实测 20 次）换新消息续接预览。
+- 节流：每 ≥1.5s 或累积 ≥300 字符才 `im messages patch` 一次；最终定稿一次。patch 实测没有单条消息的编辑次数上限（连打 27 次全过），不再需要换新消息续接预览；patch 失败（频控 / 超限）退化为「不 patch，最后一次性发总结」，卡片发送失败则整体退回文本降级链路。
 - 断流处置：SSE 中途断开不会让服务端停止任务，Bridge 显式 `POST .../abort` 中止并把该 Run 记为失败，避免僵尸任务占住会话。
 
 ### 4.6 并发与限流
@@ -358,7 +358,7 @@ allowlist（配置项，留空 = 开放访问，见 §7）、日志脱敏、cons
 ## 11. 风险与未验证点
 
 1. **lark-cli 长驻稳定性**：consume 的 bus daemon「最后一个消费者退出 30s 后自动退出」——Bridge 必须始终持有 consume 进程；进程异常退出要有守护重启（P5）。
-2. **飞书消息编辑次数上限**（已实测，2026-10-21）：单条消息最多编辑 **20 次**（第 21 次报 `230072 The message has reached the number of times it can be edited`；官方文档未写明，用探测脚本实测）。一个 93s / 30 次请求的长任务就会耗尽。已实现的应对：编辑失败就换一条新消息继续承载预览（持续续接，上限 10 次；若新消息一次都没编辑成功过则不再换，直接降级），定稿落在最新那条消息上；只有发送本身也失败才退化成「最终一次性发送」，结果不丢。
+2. **卡片承载上限**（已实测，2026-10-22，ADR-0006）：预览 / 定稿走 `im messages patch` 更新同一张交互卡片，没有文本消息那种单条编辑 20 次的上限（连打 27 次全过），长任务不再需要换新消息续接；真正的新边界是单次 patch 内容 30KB、单卡 200 个元素、客户端需 ≥7.20（更旧的只显示 header）——渲染层用约 20KB 预算收敛分区（超限时中间省略 N 个分区）规避。20 次编辑上限（第 21 次报 `230072 The message has reached the number of times it can be edited`；官方文档未写明，用探测脚本实测）只对文本兜底路径仍成立：卡片发送 / patch 失败时退回 `messages-edit` 文本链路，此时编辑失败就换一条新消息继续承载预览（持续续接，上限 10 次；若新消息一次都没编辑成功过则不再换，直接降级），定稿落在最新那条消息上；只有发送本身也失败才退化成「最终一次性发送」，结果不丢。
 3. **卡片回调链路**（仅 v2 审批模式需要）：`card.action.trigger` 的 token 只有 30 分钟、更新卡片走另一个 API——真要做时先最小验证。
 4. **owner 令牌生命周期**：`penguin auth token` 默认 1 小时过期，过期后 owner 路由 401。Bridge 要主动重铸（过期前 5 分钟），重铸失败要能在飞书里提示而不是静默失败。
 5. **Agent 蔓延**：按聊天懒建专属 Agent 会让 Agent 数量随聊天增长；命名规范 `feishu_<hash>`，`agents.json` 记 `chatId`/`keyId`/`createdAt`（v1 未记 lastUsedAt，回收脚本留待需要时再加）。
@@ -380,23 +380,22 @@ allowlist（配置项，留空 = 开放访问，见 §7）、日志脱敏、cons
 | Agent/Project 切换范围 | 全部 | owner 可见即可切 |
 | Issue tracker | GitHub Issues | 需先 git init + 建仓库；gh 已登录（smallrespon，repo scope） |
 | 默认档位 | 不预设 | 走 Project/Agent 现有配置；`/model` 动态列可用模型（列表截断到前 30 个 + 注明总数，见 §5；匹配不限） |
-| 回复结构 | 有序「回复分区」+ 加粗标签行分隔 | 不新增配置项；超长优先整块丢弃中间分区，详见 §13 |
+| 回复结构 | 有序「回复分区」承载为交互卡片：工具折叠面板 + 思考标签行 + 正文 + 状态 header / 用量页脚 | 不新增配置项；超长优先整块丢弃中间分区，另设约 20KB 预算，详见 §13 / ADR-0006 |
 
 > 收集这类决定时用 a2ui 的 form/choice 块提问（用户偏好，2026-10-21）。
 
 ---
 
-## 13. 回复分区（2026-10-21）
+## 13. 回复卡片（2026-10-22，ADR-0006）
 
-Run 的回复在飞书消息里按「回复分区」结构化展示（词条见 `GLOSSARY.md`），设计参照 ZCode 的有序 parts 模型（调研：`docs/research/zcode-reply-structure.md`）；实现在 `src/render.ts`，测试在 `test/render.test.ts`。
+Run 的回复承载为飞书交互卡片（Card 2.0，词条见 `GLOSSARY.md`）：数据模型仍是单一有序 parts 流（思考 / 工具调用 / 正文按 Run 真实时序排列，设计参照 ZCode 的有序 parts 模型，调研：`docs/research/zcode-reply-structure.md`），渲染目标从文本消息变为卡片。占位消息、流式预览、定稿三态共用同一张卡：占位即建卡，预览与定稿都经 lark-cli `im messages patch` 更新。
 
-1. 数据模型是单一有序 parts 流：思考 / 工具调用 / 正文按 Run 真实时序排列，工具调用可夹在两段正文之间；审批、压缩等提示作为独立标签行按发生时刻插入。
-2. 分区之间用加粗标签行分隔（飞书没有颜色与折叠交互，标签行是 ZCode 做法的对应物）。
-3. 思考标签行：流式「🧠 思考中…（N 字）」，定稿「🧠 思考 · N 字 · X.Xs」（耗时按事件时间戳真实计算）。
-4. 工具调用行：`**🔧 工具名**` + 一行截断到约 80 字的参数（与输出一同过 `redact()` 脱敏）+ `output:` + 围栏代码块（保留末尾 8 行、每行 ≤100 字符，超出标注「已截断，共 N 行，显示末尾 8 行」）。
-5. 定稿消息保留全部分区（思考标签 + 工具轨迹 + 正文 + 用量页脚），与预览一致。
-6. 不新增配置项；消息超长时优先整块丢弃中间分区并标注「……（中间省略 N 个分区）……」，单个正文段超预算时段内首尾对半砍；展不开时结尾分区（通常是最终答案）段内截断，永远不整块丢弃。
-7. 定稿正文以 `outcome.text` 为准：与流式累积的正文在忽略空白差异后不一致时，替换为 `outcome.text` 单段（保证答案不丢）；一致时保留全部分区原样。
+1. 数据模型是单一有序 parts 流：思考 / 工具调用 / 正文按 Run 真实时序排列，工具调用可夹在两段正文之间；审批、压缩等提示作为独立普通行按发生时刻插入。
+2. 承载形态：卡片 header 只放状态文案——占位「🦐 思考中…」、预览「🦐 执行中…」、定稿完成「✅ 完成」、定稿失败「❌ 未正常完成」；定稿页脚 = 分割线 + 用量行（与旧文本版文案一致）。
+3. 工具调用 = 一个默认收起的 `collapsible_panel`（折叠面板）：标题行「🔧 名称 · 截断参数」（参数约 80 字，与输出一同先过 `redact()` 脱敏再截断），点开展示参数与 output——保留末尾 8 行、每行 ≤100 字符，超出显式标注「已截断，共 N 行」。
+4. 思考标签行：流式「🧠 思考中…（N 字）」，定稿「🧠 思考 · N 字 · X.Xs」（耗时按事件时间戳真实计算），定稿用 12px notation 字号；不存全文、不进面板。
+5. 正文永远展开，不进面板；定稿正文以 `outcome.text` 为准：与流式累积的正文在忽略空白差异后不一致时，替换为 `outcome.text` 单段（保证答案不丢）；一致时保留全部分区原样。
+6. 预算与降级：不新增配置项；parts 超限时优先整块丢弃中间分区并标注「……（中间省略 N 个分区）……」，单个正文段超预算时段内首尾对半砍；展不开时结尾分区（通常是最终答案）段内截断，永远不整块丢弃。另设约 20KB 的内容预算，防撞 patch 的 30KB 上限与单卡 200 元素上限；卡片发送 / patch 失败时退回原有文本降级链路（文本渲染路径保留为兜底，不删除）。
 
 ---
 

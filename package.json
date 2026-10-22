@@ -1,6 +1,6 @@
 {
   "name": "penguin-remote",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "飞书机器人 ⇄ PenguinHarness 桥接程序（Bridge）",
   "type": "module",
