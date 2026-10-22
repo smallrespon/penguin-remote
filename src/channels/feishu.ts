@@ -10,6 +10,7 @@ import { join } from "node:path";
 
 import type { ChannelAdapter, IncomingMessage, OutboundMessage } from "./types.js";
 import { runCommand, readLines, spawnManaged, type ManagedChild, type SpawnFn } from "../proc.js";
+import { extractImageKeys } from "../images.js";
 import type { Logger } from "../logger.js";
 import { redact } from "../logger.js";
 
@@ -33,8 +34,6 @@ interface LarkEnvelope {
 }
 
 const MENTION_PLACEHOLDER = /@_user_\d+/g;
-/** lark-cli 预渲染文本里的图片占位符：`![Image](img_v3_xxx)`（前导 `!` 可有可无）。 */
-const IMAGE_PLACEHOLDER = /!?\[Image\]\(([^)\s]+)\)/g;
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -52,19 +51,6 @@ export function stripMentions(text: string, mentionNames: readonly string[] = []
     out = out.replace(new RegExp(`^\\s*${escaped}(?=\\s|$)`, "u"), " ");
   }
   return out.replace(/\s+/g, " ").trim();
-}
-
-/**
- * 从 lark-cli 预渲染文本里提取图片 key（`![Image](img_xxx)`），并把占位符从文本中移除。
- * 先提取再剥离 @：key 取自原文，mention 的剥离逻辑与顺序都保持原样。
- */
-export function extractImageKeys(text: string): { keys: string[]; text: string } {
-  const keys: string[] = [];
-  const stripped = text.replace(IMAGE_PLACEHOLDER, (_match: string, key: string) => {
-    keys.push(key);
-    return " ";
-  });
-  return { keys, text: stripped };
 }
 
 /** content 可能是预渲染文本，也可能是 `{"text":"..."}` 原文；两者都取到可读文本。 */
@@ -312,9 +298,12 @@ export class FeishuChannel implements ChannelAdapter {
   /**
    * 下载一条入站消息里的图片：lark-cli 把二进制落到临时文件，读进内存后**立刻删除**（成功与失败都删）。
    * 临时文件落在 `os.tmpdir()`（lark-cli 的 --output 只接受允许目录内的路径）。
+   * 删除按信封回报的 `saved_path` 走（lark-cli 可能补扩展名，与实际落盘路径未必等于 --output），
+   * 同时兜底删一次请求路径，两个都删保证不残留。
    */
   async downloadImage(messageId: string, fileKey: string): Promise<Buffer> {
     const tmpPath = join(tmpdir(), `penguin-remote-image-${randomUUID()}`);
+    let savedPath: string | null = null;
     try {
       const result = await this.run(this.bin, [
         "im",
@@ -336,16 +325,21 @@ export class FeishuChannel implements ChannelAdapter {
           `下载图片失败（lark-cli exit=${result.status}）：${redact(envelope?.error?.message ?? result.stderr.trim())}`,
         );
       }
-      const savedPath = envelope.data?.saved_path;
-      if (savedPath === undefined || savedPath === "") {
+      const reported = envelope.data?.saved_path;
+      if (reported === undefined || reported === "") {
         throw new Error("lark-cli 未返回 saved_path，无法读取下载的图片");
       }
+      savedPath = reported;
       return await readFile(savedPath);
     } finally {
-      try {
-        await rm(tmpPath, { force: true });
-      } catch {
-        // 临时文件清理失败不影响结果：文件本来就是要丢的
+      // 清理失败不影响结果：文件本来就是要丢的
+      for (const path of new Set([tmpPath, savedPath])) {
+        if (path === null) continue;
+        try {
+          await rm(path, { force: true });
+        } catch {
+          // 见上
+        }
       }
     }
   }
