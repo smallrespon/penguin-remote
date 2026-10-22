@@ -345,6 +345,107 @@ test("换 Agent 后 /sessions 与 /use 只看当前 Agent 的会话", async () =
   assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
 });
 
+// ---- T10：会话列表实时化（ADR-0008）----
+
+test("/sessions 实时列出服务端未归档会话：→ 标当前会话、标题拍平并截断", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  // 远程（Web / CLI）新建的会话：Bridge 本地 Registry 历史里没有，只能来自服务端列表
+  server.addSession({
+    sessionId: "session-remote-1",
+    title: "远程会话\n第二行标题",
+    modelId: "step-3",
+    lastActiveAt: "2026-10-22T10:00:00.000Z",
+  });
+  server.addSession({ sessionId: "session-remote-2", title: null, lastActiveAt: "2026-10-22T09:00:00.000Z" });
+  server.addSession({
+    sessionId: "session-remote-3",
+    title: "超长标题".repeat(20),
+    lastActiveAt: "2026-10-22T08:00:00.000Z",
+  });
+  // 已归档：默认列表不出现
+  server.addSession({ sessionId: "session-archived", archived: true, lastActiveAt: "2026-10-22T11:00:00.000Z" });
+
+  await registry.update("oc_chat", (b) => {
+    b.sessionId = "session-remote-1";
+  });
+
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.match(text, /\*\*最近会话\*\*（当前：`session-remote-1`）/);
+  assert.ok(
+    text.includes("→ 1. 远程会话 第二行标题 — 2026-10-22 10:00 — `step-3` — `session-remote-1`"),
+    `当前会话行首应带 →、换行拍平、时间取 lastActiveAt：${text}`,
+  );
+  assert.ok(text.includes("2. （无标题） — 2026-10-22 09:00 — `session-remote-2`"), "空标题给占位");
+  const longTitle = "超长标题".repeat(20);
+  assert.ok(text.includes(`3. ${longTitle.slice(0, 40)}`), "长标题截断到 40 字");
+  assert.ok(!text.includes(longTitle), "截断后不应出现完整标题");
+  assert.ok(!text.includes("session-archived"), "已归档会话不列");
+  assert.match(text, /用 `\/use <序号>` 切回去续聊。/);
+});
+
+test("/use 跳到只存在于服务端实时列表的远程会话；越界提示不变", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  server.addSession({ sessionId: "session-remote-1", title: "远程会话", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /已切回会话 `session-remote-1`/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, "session-remote-1", "切换只改本聊天绑定");
+
+  // 越界：保持现有文案，且不动绑定
+  await channel.receive("/use 2");
+  assert.match(channel.lastSent(), /⚠️ 没有第 2 个会话，`\/sessions` 查看列表。/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, "session-remote-1");
+});
+
+test("实时列表查询失败：/sessions 与 /use 退回本地历史并首行注明", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript("答 1");
+  const channel = new FakeChannel();
+  const { gateway, registry } = await makeGateway(server, channel);
+  await gateway.start();
+
+  const first = channel.receive("第一问");
+  await first;
+  const sessionId = server.lastTaskSession() ?? "";
+  assert.notEqual(sessionId, "");
+
+  // 实时查询挂掉：退回 Registry 本地历史
+  server.nextListStatus = 500;
+  await channel.receive("/sessions");
+  const text = channel.lastSent();
+  assert.ok(text.startsWith("⚠️ 实时列表查询失败，显示本地历史"), `首行应注明兜底：${text}`);
+  assert.ok(text.includes(sessionId), "仍列出本地历史会话");
+  assert.ok(text.includes("**最近会话**"), "兜底渲染沿用现有版式");
+
+  server.nextListStatus = 500;
+  await channel.receive("/use 1");
+  assert.ok(channel.lastSent().startsWith("⚠️ 实时列表查询失败，显示本地历史"), "换会话也要注明列表来源降级");
+  assert.match(channel.lastSent(), /已切回会话/);
+  assert.equal(registry.bindingFor("oc_chat").sessionId, sessionId);
+});
+
+test("/sessions 无会话（实时与本地都空）：保持「还没有历史会话」提示", async () => {
+  const server = new FakeSessionServer();
+  const channel = new FakeChannel();
+  const { gateway } = await makeGateway(server, channel);
+  await gateway.start();
+
+  await channel.receive("/sessions");
+  assert.match(channel.lastSent(), /还没有历史会话/);
+
+  await channel.receive("/use 1");
+  assert.match(channel.lastSent(), /没有第 1 个会话/);
+});
+
 test("/status 显示绑定与会话状态；/stop 中断当前 Run", async () => {
   const server = new FakeSessionServer();
   server.defaultScript = hangingScript();

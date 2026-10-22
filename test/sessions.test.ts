@@ -153,3 +153,81 @@ test("stream：坏 JSON 帧抛出（调用方按断流处置）", async () => {
     for await (const _item of stream) void _item;
   });
 });
+
+// ---- 会话列表（ADR-0008）----
+
+test("listSessions：GET 当前 (project, agent) 的会话，按 lastActiveAt 倒序解析", async () => {
+  const server = new FakeSessionServer();
+  server.addSession({
+    sessionId: "s_old",
+    title: "旧会话",
+    modelId: "step-3",
+    lastActiveAt: "2026-10-20T09:00:00.000Z",
+  });
+  server.addSession({ sessionId: "s_new", title: null, lastActiveAt: "2026-10-22T09:00:00.000Z" });
+  server.addSession({ sessionId: "s_mid", title: "中间", lastActiveAt: "2026-10-21T09:00:00.000Z" });
+
+  const items = await client(server).listSessions("default_project", "default_agent");
+  assert.deepEqual(
+    items.map((item) => item.sessionId),
+    ["s_new", "s_mid", "s_old"],
+  );
+  assert.deepEqual(items[0], {
+    sessionId: "s_new",
+    title: null,
+    lastActiveAt: "2026-10-22T09:00:00.000Z",
+    modelId: null,
+  });
+  const request = server.requests.at(-1);
+  assert.equal(request?.method, "GET");
+  assert.equal(request?.path, "/projects/default_project/agents/default_agent/sessions");
+});
+
+test("listSessions：过滤已归档会话", async () => {
+  const server = new FakeSessionServer();
+  server.addSession({ sessionId: "s_live", lastActiveAt: "2026-10-22T09:00:00.000Z" });
+  server.addSession({ sessionId: "s_archived", archived: true, lastActiveAt: "2026-10-22T10:00:00.000Z" });
+
+  const items = await client(server).listSessions("default_project", "default_agent");
+  assert.deepEqual(
+    items.map((item) => item.sessionId),
+    ["s_live"],
+  );
+});
+
+test("listSessions：按 (project, agent) 隔离，别的 Agent 的会话看不到", async () => {
+  const server = new FakeSessionServer();
+  server.addSession({ sessionId: "s_mine", agentId: "default_agent", lastActiveAt: "2026-10-22T09:00:00.000Z" });
+  server.addSession({ sessionId: "s_other", agentId: "coder", lastActiveAt: "2026-10-22T10:00:00.000Z" });
+
+  const items = await client(server).listSessions("default_project", "default_agent");
+  assert.deepEqual(
+    items.map((item) => item.sessionId),
+    ["s_mine"],
+  );
+});
+
+test("listSessions：截断到 10 条（与 HISTORY_LIMIT 一致）", async () => {
+  const server = new FakeSessionServer();
+  for (let i = 1; i <= 12; i += 1) {
+    server.addSession({ sessionId: `s${i}`, lastActiveAt: `2026-10-22T09:${String(i).padStart(2, "0")}:00.000Z` });
+  }
+
+  const items = await client(server).listSessions("default_project", "default_agent");
+  assert.equal(items.length, 10);
+  assert.equal(items[0]?.sessionId, "s12", "最新的在前");
+  assert.equal(items[9]?.sessionId, "s3", "只保留最近 10 条");
+});
+
+test("listSessions：响应缺 sessions 字段（或条目畸形）时给空列表", async () => {
+  const api = new SessionClient({
+    fetchAuthed: async () => new Response(JSON.stringify({ sessions: [null, "x", { title: "没有 id" }] }), { status: 200 }),
+  });
+  assert.deepEqual(await api.listSessions("default_project", "default_agent"), []);
+});
+
+test("listSessions：非 2xx 抛 SessionApiError", async () => {
+  const server = new FakeSessionServer();
+  server.nextListStatus = 500;
+  await assert.rejects(() => client(server).listSessions("default_project", "default_agent"), SessionApiError);
+});
