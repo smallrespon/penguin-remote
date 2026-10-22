@@ -421,3 +421,76 @@ test("建会话失败：占位卡被 patch 成错误卡", async () => {
   assert.equal(channel.sent[0]?.message.kind, "card", "占位是卡片");
   assert.deepEqual(lastEdited(channel), { kind: "card", card: errorCard("执行失败：model not found") });
 });
+
+// ---- T12：图片入站投递（ADR-0009）----
+
+test("有图投递：text part 在前、image_url parts 按序在后", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
+  const channel = new FakeChannel();
+
+  const report = await runOnce(server, channel, {
+    input: "这两张图是什么",
+    images: ["data:image/png;base64,AAAA", "data:image/jpeg;base64,BBBB"],
+  });
+
+  assert.equal(report.status, "completed");
+  assert.deepEqual(server.taskPosts()[0]?.body, {
+    input: [
+      { type: "text", text: "这两张图是什么" },
+      { type: "image_url", imageUrl: "data:image/png;base64,AAAA" },
+      { type: "image_url", imageUrl: "data:image/jpeg;base64,BBBB" },
+    ],
+  });
+});
+
+test("无图投递：单 text part，与旧行为逐字一致（images 缺省与空数组等价）", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
+  const channel = new FakeChannel();
+
+  await runOnce(server, channel);
+  assert.deepEqual(server.taskPosts()[0]?.body, { input: [{ type: "text", text: "今天几号" }] });
+
+  server.defaultScript = happyScript();
+  await runOnce(server, channel, { images: [] });
+  assert.deepEqual(server.taskPosts()[1]?.body, { input: [{ type: "text", text: "今天几号" }] });
+});
+
+test("纯图片投递：空文本只投 image_url parts，不注入占位文本", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
+  const channel = new FakeChannel();
+
+  const report = await runOnce(server, channel, { input: "", images: ["data:image/png;base64,AAAA"] });
+
+  assert.equal(report.status, "completed");
+  assert.deepEqual(server.taskPosts()[0]?.body, {
+    input: [{ type: "image_url", imageUrl: "data:image/png;base64,AAAA" }],
+  });
+});
+
+test("发起 Run 日志只含文本摘要，不泄露 data URL", async () => {
+  const server = new FakeSessionServer();
+  server.defaultScript = happyScript();
+  const channel = new FakeChannel();
+  const lines: string[] = [];
+  const logger = createLogger("info", (line) => lines.push(line));
+
+  const report = await executeRun(
+    { channel, logger },
+    {
+      chatId: "oc_chat",
+      input: "看这张图",
+      images: ["data:image/png;base64,QUJD"],
+      agent: AGENT,
+      sessionId: null,
+      client: sessionClient(server),
+      preview: { throttleMs: 0, throttleChars: 0, maxChars: 3500 },
+    },
+  );
+
+  assert.equal(report.status, "completed");
+  assert.ok(lines.some((line) => line.includes("发起 Run：看这张图")), `应记录文本摘要：${lines.join("\n")}`);
+  assert.ok(!lines.some((line) => line.includes("data:image")), "日志不应出现 data URL");
+});

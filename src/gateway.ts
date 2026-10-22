@@ -3,6 +3,7 @@
 
 import type { ChannelAdapter, IncomingMessage } from "./channels/types.js";
 import type { BridgeConfig } from "./config.js";
+import { imageDataUrlOrNote } from "./images.js";
 import type { Lanes } from "./lanes.js";
 import { redact } from "./logger.js";
 import type { Logger } from "./logger.js";
@@ -59,6 +60,15 @@ const LIVE_LIST_FALLBACK_NOTE = "⚠️ 实时列表查询失败，显示本地�
 
 /** 标题拍平（服务端标题可能含换行）后截断到 40 字；空标题给占位。 */
 const TITLE_MAX_CHARS = 40;
+
+/** 图片占位符（与 channels/feishu.ts 的 IMAGE_PLACEHOLDER 同口径；解码时通常已剥，这里兜底）。 */
+const IMAGE_PLACEHOLDER = /!?\[Image\]\(([^)\s]+)\)/g;
+
+/** 本地历史标题：先移除图片占位符再拍平截断；纯图片消息（文本为空）回落占位标题。 */
+function runTitle(text: string): string {
+  const stripped = text.replace(IMAGE_PLACEHOLDER, " ").replace(/\s+/g, " ").trim();
+  return stripped === "" ? "（图片消息）" : stripped.slice(0, TITLE_MAX_CHARS);
+}
 
 function flattenTitle(title: string | null): string {
   if (title === null) return "（无标题）";
@@ -213,15 +223,28 @@ export class Gateway {
         b.skill = null;
       });
     }
-    const input = skill === null ? text : formatSkillInput(skill, text);
 
     const attempt = await this.deps.lanes.run(chatId, async () => {
+      // 图片入站（ADR-0009）：串行下载转 data URL；下载抛错直接冒泡，由 handleMessage
+      // 的统一错误路径脱敏回复（此时还没发占位卡、没投任务）；超限 / 嗅探失败的图
+      // 跳过，注明（去重）拼进输入文本——纯图片且全跳过时，注明就是全部输入。
+      const dataUrls: string[] = [];
+      const notes: string[] = [];
+      for (const key of message.images) {
+        const bytes = await this.deps.channel.downloadImage(message.messageId, key);
+        const decision = imageDataUrlOrNote(bytes);
+        if (decision.kind === "ok") dataUrls.push(decision.dataUrl);
+        else notes.push(decision.note);
+      }
+      const inputText = [text, ...new Set(notes)].filter(Boolean).join("\n");
+      const input = skill === null ? inputText : formatSkillInput(skill, inputText);
       try {
         return await executeRun(
           { channel: this.deps.channel, logger: this.logger },
           {
             chatId,
             input,
+            ...(dataUrls.length > 0 ? { images: dataUrls } : {}),
             agent: { projectId: binding.projectId, agentId: binding.agentId },
             sessionId: binding.sessionId,
             // 档位只在下发新建会话时生效；续接的会话保持它创建时的设置。
@@ -255,7 +278,7 @@ export class Gateway {
     if (report.sessionId !== null && report.sessionId !== binding.sessionId) {
       await this.deps.registry.noteSession(chatId, {
         sessionId: report.sessionId,
-        title: text.slice(0, 40),
+        title: runTitle(text),
         ...(report.modelId !== null ? { model: report.modelId } : {}),
         projectId: binding.projectId,
         agentId: binding.agentId,
