@@ -44,10 +44,12 @@ export interface TextPart {
   done?: boolean;
 }
 
-/** 思考分区：只记字符数与起止时间，不落思考全文。 */
+/** 思考分区：记全文、字符数与起止时间；全文只驻内存，供卡片的思考折叠面板使用（ADR-0007）。 */
 export interface ThoughtPart {
   kind: "thought";
   chars: number;
+  /** 思考全文（未脱敏；脱敏在渲染时做，见 card.ts 的 thoughtPanel）。 */
+  text: string;
   startedAt: string;
   endedAt?: string;
 }
@@ -125,22 +127,32 @@ export function applyEvent(state: PreviewState, event: RunEvent): PreviewState {
       // 未闭合的思考段接着数；否则以本事件的 at 开一段新的。
       if (last?.kind === "thought" && last.endedAt === undefined) {
         return {
-          parts: [...state.parts.slice(0, -1), { ...last, chars: last.chars + event.thinking.length }],
+          parts: [
+            ...state.parts.slice(0, -1),
+            { ...last, chars: last.chars + event.thinking.length, text: last.text + event.thinking },
+          ],
         };
       }
       return {
-        parts: [...state.parts, { kind: "thought", chars: event.thinking.length, startedAt: event.at }],
+        parts: [
+          ...state.parts,
+          { kind: "thought", chars: event.thinking.length, text: event.thinking, startedAt: event.at },
+        ],
       };
     }
     case "thinking.done": {
       const last = state.parts.at(-1);
       const unclosed = last?.kind === "thought" && last.endedAt === undefined ? last : undefined;
-      // thinking.done 带的长度为 0 时（有的引擎只发 done），保留 delta 累加出来的值。
+      // thinking.done 带的长度为 0 时（有的引擎只发 done），保留 delta 累加出来的值与文本；
+      // 带了非空全文则以它为准（与 text.done 同一口径：done 事件是权威全文）。
       const chars = event.thinking.length !== 0 ? event.thinking.length : (unclosed?.chars ?? event.thinking.length);
+      const text = event.thinking !== "" ? event.thinking : (unclosed?.text ?? event.thinking);
       if (unclosed !== undefined) {
-        return { parts: [...state.parts.slice(0, -1), { ...unclosed, chars, endedAt: event.at }] };
+        return { parts: [...state.parts.slice(0, -1), { ...unclosed, chars, text, endedAt: event.at }] };
       }
-      return { parts: [...state.parts, { kind: "thought", chars, startedAt: event.at, endedAt: event.at }] };
+      return {
+        parts: [...state.parts, { kind: "thought", chars, text, startedAt: event.at, endedAt: event.at }],
+      };
     }
     case "tool_call.done": {
       // 先 redact 再 truncate：反过来会让跨过截断切口的密钥只漏出不完整片段，redact 的正则匹配不到。
@@ -225,7 +237,7 @@ function renderPart(part: PreviewPart, mode: RenderMode): string {
     case "text":
       return part.text;
     case "thought":
-      return thoughtLabel(part, mode);
+      return thoughtTextLabel(part, mode);
     case "tool":
       return renderTool(part);
     case "notice":
@@ -233,9 +245,19 @@ function renderPart(part: PreviewPart, mode: RenderMode): string {
   }
 }
 
-/** 思考分区的一行标签：流式显示「思考中…（N 字）」，定稿按已闭合样式显示。 */
-export function thoughtLabel(part: ThoughtPart, mode: RenderMode): string {
-  // 定稿时还没闭合的思考段：按已闭合的样式显示，但拿不到耗时就省掉。
+/** 思考分区的一行标签（卡片路径，ADR-0007）：流式显示「运行中…」，定稿按已闭合样式显示「运行完毕」与耗时。 */
+export function thoughtPanelTitle(part: ThoughtPart, mode: RenderMode): string {
+  // 定稿时还没闭合的思考段：按已闭合的样式显示，但拿不到耗时就省掉，也不标「运行完毕」——
+  // 没等到 thinking.done 就没有终态，不谎报（ADR-0007）。
+  if (part.endedAt === undefined) {
+    return mode === "final" ? `**🧠 思考 · ${part.chars} 字**` : `**🧠 思考 · 运行中… · ${part.chars} 字**`;
+  }
+  const seconds = (Date.parse(part.endedAt) - Date.parse(part.startedAt)) / 1000;
+  return `**🧠 思考 · 运行完毕 · ${part.chars} 字 · ${seconds.toFixed(1)}s**`;
+}
+
+/** 思考分区的一行标签（文本兜底路径）：与卡片路径分流，状态词只出现在卡片里（ADR-0007）。 */
+function thoughtTextLabel(part: ThoughtPart, mode: RenderMode): string {
   if (part.endedAt === undefined) {
     return mode === "final" ? `**🧠 思考 · ${part.chars} 字**` : `**🧠 思考中…（${part.chars} 字）**`;
   }
@@ -255,13 +277,18 @@ function renderTool(part: ToolPart): string {
   return lines.join("\n");
 }
 
+/** 围栏长度：内容自带 ``` 时把围栏加长，否则代码块会被提前合上。 */
+export function fenceFor(text: string): string {
+  return text.includes("```") ? "````" : "```";
+}
+
 /** 工具输出的围栏代码块：保留末尾几行、每行限宽，超出行数时显式标注。 */
 export function fencedOutput(output: string): string {
   const lines = output.split("\n");
   const kept = lines.length > TOOL_OUTPUT_MAX_LINES ? lines.slice(-TOOL_OUTPUT_MAX_LINES) : lines;
   const body = kept.map((line) => truncateLine(line, TOOL_OUTPUT_LINE_WIDTH)).join("\n");
   // 输出里自带 ``` 时把围栏加长，否则代码块会被提前合上。
-  const fence = output.includes("```") ? "````" : "```";
+  const fence = fenceFor(output);
   const note =
     lines.length > TOOL_OUTPUT_MAX_LINES
       ? `\n（已截断，共 ${lines.length} 行，显示末尾 ${TOOL_OUTPUT_MAX_LINES} 行）`
