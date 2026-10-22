@@ -75,7 +75,7 @@ _Avoid_: streaming（那个指会话 SSE 事件流）、打字机效果
 _Avoid_: 消息板块、三段式
 
 **图片占位符**:
-lark-cli 把入站消息预渲染成可读文本时，图片统一呈现成的 `![Image](img_xxx)` 标记；真正的二进制要用 `im +messages-resources-download` 另取。Bridge 解码时把占位符提取成图片 key、从文本中移除，下载后以 `image_url` part 投给 Agent（见 ADR-0009）。
+lark-cli 把入站消息预渲染成可读文本时，图片呈现成的标记，两种形状均已实测：富文本（post）内嵌图片是 `![Image](img_xxx)`，纯图片（image）消息是 `[Image: img_xxx]`。真正的二进制要用 `im +messages-resources-download` 另取。Bridge 解码时把占位符提取成图片 key、从文本中移除，下载后以 `image_url` part 投给 Agent（见 ADR-0009）。
 _Avoid_: 图片标记、image tag
 
 **审批**:

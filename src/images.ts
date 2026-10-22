@@ -9,22 +9,24 @@ export const MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024;
 export type ImageDecision = { kind: "ok"; dataUrl: string } | { kind: "skip"; note: string };
 
 /**
- * lark-cli 预渲染文本里的图片占位符：`![Image](img_v3_xxx)`（前导 `!` 可有可无）。
- * 事件流与各读命令共用同一内容格式化器，图片一律渲染成这个形状（见 GLOSSARY「图片占位符」）。
+ * lark-cli 预渲染文本里的图片占位符，两种形状都已实测（见 GLOSSARY「图片占位符」）：
+ * - `![Image](img_v3_xxx)`——富文本（post）消息内嵌的图片；
+ * - `[Image: img_v3_xxx]`——纯图片（image）消息。
+ * 事件流与各读命令共用同一内容格式化器；前导 `!` 与冒号后的空格都可选。
  */
-export const IMAGE_PLACEHOLDER = /!?\[Image\]\(([^)\s]+)\)/g;
+export const IMAGE_PLACEHOLDER = /!?\[Image\]\(([^)\s]+)\)|\[Image:[ \t]*([^\]\s]+)\]/g;
 
 /**
- * 从预渲染文本提取图片 key（`![Image](img_xxx)`），并把占位符替换为空格后返回新文本。
+ * 从预渲染文本提取图片 key，并把占位符替换为空格后返回新文本。
  * 先提取再剥离 @：key 取自原文，mention 的剥离逻辑与顺序都不变。
  */
 export function extractImageKeys(text: string): { keys: string[]; text: string } {
   const keys: string[] = [];
-  const stripped = text.replace(IMAGE_PLACEHOLDER, (_match: string, key: string) => {
-    keys.push(key);
-    return " ";
-  });
-  return { keys, text: stripped };
+  for (const match of text.matchAll(IMAGE_PLACEHOLDER)) {
+    const key = match[1] ?? match[2];
+    if (key !== undefined && key !== "") keys.push(key);
+  }
+  return { keys, text: text.replace(IMAGE_PLACEHOLDER, " ") };
 }
 
 /** 移除文本中的图片占位符（标题清洗用；key 已在解码时提取过，这里只清文本）。 */
