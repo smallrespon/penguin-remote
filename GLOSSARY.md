@@ -15,7 +15,7 @@ Bridge 与外部 IM 之间的协议转换接口（发送消息、编辑消息、
 _Avoid_: 渠道插件、connector
 
 **Feishu 适配器**:
-基于 lark-cli 子进程的 Channel 适配器实现：两条 `event consume` 事件流入；出口是 `messages-send`（文本与交互卡片）与 `im messages patch`（更新 Run 回复卡片）——`messages-edit` 只剩文本兜底路径在用（卡片发送 / patch 失败时的降级链路，见 ADR-0006）。
+基于 lark-cli 子进程的 Channel 适配器实现：两条 `event consume` 事件流入；出口是 `messages-send`（文本与交互卡片）与 `im messages patch`（更新 Run 回复卡片）——`messages-edit` 只剩文本兜底路径在用（卡片发送失败时的降级链路，见 ADR-0006）。
 _Avoid_: 飞书通道、lark adapter
 
 **Lane**:
@@ -59,7 +59,7 @@ _Avoid_: 配置项、参数、设置
 ### 飞书侧
 
 **回复卡片**:
-Run 回复的承载形态：一张飞书交互卡片（Card 2.0），header 放状态文案（🦐 思考中… / 🦐 执行中… / ✅ 完成 / ❌ 未正常完成），内容是按 Run 真实时序排列的回复分区，页脚是分割线 + 用量行；预览与定稿经 `im messages patch` 更新同一张卡（见 ADR-0006）。
+Run 回复的承载形态：一张飞书交互卡片（Card 2.0），header 放状态文案（🦐 思考中… / 🦐 执行中… / ⏳ 请稍候 / ✅ 完成 / ❌ 未正常完成），内容是按 Run 真实时序排列的回复分区，页脚是分割线 + 用量行；预览与定稿经 `im messages patch` 更新同一张卡，会话忙（409）与 Run 级失败也 patch 同一张占位卡（忙卡 / 错误卡），不另发消息（见 ADR-0006）。
 _Avoid_: 消息卡片、卡片消息（指飞书卡片形态本身，不特指 Run 回复）
 
 **折叠面板**:

@@ -10,7 +10,7 @@ import { denyAll } from "../approvals.js";
 import { redact } from "../logger.js";
 import type { Logger } from "../logger.js";
 import type { RunEvent } from "../run-event.js";
-import { buildPreviewCard, buildRunCard, errorCard, placeholderCard, type RunCard } from "../card.js";
+import { buildPreviewCard, buildRunCard, busyCard, errorCard, placeholderCard, type RunCard } from "../card.js";
 import {
   BUSY_HINT,
   PLACEHOLDER_TEXT,
@@ -130,14 +130,15 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     } catch (error: unknown) {
       logger.warn(`预览编辑失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    // 这条消息一次都没更新成功过：换新的也白搭，直接放弃预览（发送本身出问题时走这条）。
-    if (editsOnCurrent === 0 || chains >= MAX_CHAINS) {
+    // 这条消息一次都没更新成功过，或卡片载体（ADR-0006：预览与定稿都 patch 同一张卡，
+    // 不换新消息续接）：放弃预览，定稿仍会新发卡片 / 文本，结果不丢。
+    if (editsOnCurrent === 0 || chains >= MAX_CHAINS || carrier === "card") {
       degraded = true;
       logger.warn("放弃流式预览，改为最终一次性发送");
       return;
     }
-    // 单条消息的更新次数有上限（文本消息实测 20 次，错误码 230072；卡片 patch 没有这条上限，
-    // 但频控 / 超限同样会让它失败）：长任务的后半程不能因此没有进度可见，换一条新消息继续承载预览。
+    // 文本载体：单条消息的更新次数有上限（实测 20 次，错误码 230072），
+    // 长任务的后半程不能因此没有进度可见，换一条新消息继续承载预览。
     try {
       liveMessageId = await deps.channel.send(spec.chatId, message);
       chains += 1;
@@ -214,14 +215,11 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     logger.warn(`会话准备失败：${message}`);
     await settlePreview();
     const failure = formatRunFailure(error);
-    await deliverFinal(
-      deps,
-      spec.chatId,
-      liveMessageId,
-      { card: carrier === "card" ? errorCard(failure) : null, text: failure },
+    await deliverFinal(deps, spec.chatId, liveMessageId, {
       carrier,
-      degraded,
-    );
+      card: carrier === "card" ? errorCard(failure) : null,
+      text: failure,
+    }, degraded);
     return failedReport(spec.chatId, null, message, startedAt);
   }
 
@@ -291,17 +289,15 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     // 会话忙（409）除外——那个在跑的任务不是我们起的，不能替别人中断。
     if (!aborted && !(streamFailure instanceof SessionBusyError)) await handle.abort();
     await settlePreview();
-    // 忙提示不是 Run 结果，是「请稍候」的普通提示：保持文本消息现状（ADR-0006 的边界）。
+    // 忙提示不是 Run 结果，是「请稍候」的普通提示：卡片载体下同样 patch 进占位卡
+    // （busyCard），不留「思考中」僵尸卡；其它失败仍走 errorCard；文本载体下编辑占位文本。
     const busy = streamFailure instanceof SessionBusyError;
     const text = busy ? BUSY_HINT : formatRunFailure(streamFailure);
-    await deliverFinal(
-      deps,
-      spec.chatId,
-      liveMessageId,
-      { card: carrier === "card" && !busy ? errorCard(text) : null, text },
+    await deliverFinal(deps, spec.chatId, liveMessageId, {
       carrier,
-      degraded,
-    );
+      card: carrier === "card" ? (busy ? busyCard(text) : errorCard(text)) : null,
+      text,
+    }, degraded);
     return failedReport(spec.chatId, sessionId, message, startedAt);
   }
 
@@ -309,17 +305,11 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   logger.info(`Run 完成：${outcome.status}，session=${sessionId}`);
   await settlePreview();
   const snapshot = preview.snapshot();
-  await deliverFinal(
-    deps,
-    spec.chatId,
-    liveMessageId,
-    {
-      card: carrier === "card" ? buildRunCard(outcome, snapshot) : null,
-      text: formatFinalText(outcome, snapshot),
-    },
+  await deliverFinal(deps, spec.chatId, liveMessageId, {
     carrier,
-    degraded,
-  );
+    card: carrier === "card" ? buildRunCard(outcome, snapshot) : null,
+    text: formatFinalText(outcome, snapshot),
+  }, degraded);
 
   const modelId = await spec.client
     .sessionInfo(sessionId)
@@ -350,8 +340,9 @@ function failedReport(chatId: string, sessionId: string | null, message: string,
   };
 }
 
-/** 定稿内容：卡片与文本双份；文本兜底保证结果不丢。 */
+/** 定稿内容：载体 + 卡片与文本双份；文本兜底保证结果不丢。 */
 interface FinalContent {
+  carrier: Carrier;
   card: RunCard | null;
   text: string;
 }
@@ -366,10 +357,9 @@ async function deliverFinal(
   chatId: string,
   messageId: string,
   content: FinalContent,
-  carrier: Carrier,
   degraded: boolean,
 ): Promise<void> {
-  if (carrier === "card" && content.card !== null) {
+  if (content.carrier === "card" && content.card !== null) {
     if (!degraded) {
       try {
         await deps.channel.edit(messageId, { kind: "card", card: content.card });

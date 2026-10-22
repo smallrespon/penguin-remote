@@ -10,15 +10,11 @@ import { executeRun, type RunHandle } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
 import type { OutboundMessage } from "../src/channels/types.js";
-import {
-  errorCard,
-  placeholderCard,
-  type CollapsiblePanelElement,
-  type RunCard,
-} from "../src/card.js";
+import { busyCard, errorCard, placeholderCard } from "../src/card.js";
 import { FakeSessionServer, frame, sessionClient } from "./helpers/fake-sessions.js";
-import { flatText } from "./helpers/flat-text.js";
-import { FakeChannel, textOf } from "./helpers/fake-channel.js";
+import { cardOf, flatText, footerOf, panelsOf } from "./helpers/card-shape.js";
+import { textOf } from "./helpers/flat-text.js";
+import { FakeChannel } from "./helpers/fake-channel.js";
 import { waitFor } from "./helpers/wait.js";
 
 const silent = createLogger("error", () => {});
@@ -39,27 +35,6 @@ function lastEdited(channel: FakeChannel): OutboundMessage {
 /** 最后一次发送出去的消息（降级后定稿新发一条时，定稿就是它；没有发送过时是空文本）。 */
 function lastSentMessage(channel: FakeChannel): OutboundMessage {
   return channel.sent.at(-1)?.message ?? { kind: "text", text: "" };
-}
-
-/** 断言这条消息是卡片并取出卡身（窄化小工具，断言失败即测试失败）。 */
-function cardOf(message: OutboundMessage): RunCard {
-  if (message.kind !== "card") {
-    throw new Error(`期望一条卡片消息，实际是 ${message.kind}`);
-  }
-  return message.card;
-}
-
-/** 卡片里的折叠面板（工具调用的载体）。 */
-function panelsOf(card: RunCard): CollapsiblePanelElement[] {
-  return card.body.elements.filter(
-    (element): element is CollapsiblePanelElement => element.tag === "collapsible_panel",
-  );
-}
-
-/** 定稿卡页脚：hr 之后那行 notation 小字。 */
-function footerOf(card: RunCard): string {
-  const last = card.body.elements.at(-1);
-  return last !== undefined && last.tag === "markdown" ? last.content : "";
 }
 
 /** 一轮正常 Run 的帧脚本：思考 → 工具 → 正文 → 用量 → idle。 */
@@ -165,7 +140,7 @@ test("续接会话：不再建会话，直接投递", async () => {
   assert.equal(report.status, "completed");
 });
 
-test("409 会话忙：提示 BUSY_HINT（保持文本消息），且不中断别人的任务", async () => {
+test("409 会话忙：占位卡被 patch 成忙卡（⏳ 请稍候），且不中断别人的任务", async () => {
   const server = new FakeSessionServer();
   server.nextTaskStatus = 409;
   const channel = new FakeChannel();
@@ -174,8 +149,26 @@ test("409 会话忙：提示 BUSY_HINT（保持文本消息），且不中断别
 
   assert.equal(report.status, "failed");
   assert.equal(channel.sent[0]?.message.kind, "card", "占位仍是卡片");
-  // 忙提示不是 Run 结果：保持文本消息现状（ADR-0006 的边界）
+  // 忙提示也 patch 进占位卡：不留「思考中」僵尸卡，也不另发新消息
+  assert.deepEqual(lastEdited(channel), { kind: "card", card: busyCard(BUSY_HINT) });
+  assert.ok(channel.edited.every((e) => e.message.kind === "card"), "没有对该卡发起过文本 edit");
+  assert.equal(channel.sent.length, 1, "忙提示不另发新消息");
+  assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), false);
+});
+
+test("409 会话忙（文本载体）：占位文本被编辑成 BUSY_HINT，且不中断别人的任务", async () => {
+  const server = new FakeSessionServer();
+  server.nextTaskStatus = 409;
+  const channel = new FakeChannel();
+  // 占位卡片就发不出去：整条 Run 走文本链路，忙提示编辑进占位文本
+  channel.failSendKinds = ["card"];
+
+  const report = await runOnce(server, channel);
+
+  assert.equal(report.status, "failed");
+  assert.equal(channel.sent[0]?.message.kind, "text", "占位退化为文本");
   assert.equal(lastEditedText(channel), BUSY_HINT);
+  assert.equal(channel.sent.length, 1, "忙提示不另发新消息");
   assert.equal(server.requests.some((r) => r.path.endsWith("/abort")), false);
 });
 
@@ -280,26 +273,24 @@ test("会话自愈：tasks 返回新 id 后改订阅新 id，定稿卡用新 id 
   assert.match(flatText(lastEdited(channel)), /自愈后完成/);
 });
 
-test("预览卡片 patch 失败：换新卡片续接，定稿 patch 失败后新发卡片落在最新消息上", async () => {
+test("预览卡片 patch 失败：放弃预览，定稿新发一张卡（最后一条 sent 是定稿卡）", async () => {
   const server = new FakeSessionServer();
   server.defaultScript = happyScript();
   const channel = new FakeChannel();
-  // 每条消息只许 patch 一次（模拟单条消息的更新次数上限）：预览会反复
-  // 「patch 失败 → 新发一张卡继续」，定稿那次 patch 也撞在已用尽的额度上。
+  // 每条消息只许 patch 一次（模拟单条消息的更新次数上限）：第一次预览 patch 成功，
+  // 之后一律失败。ADR-0006：卡片不换新消息续接，patch 失败即放弃预览，定稿新发卡片。
   channel.editLimitPerMessage = 1;
 
   const report = await runOnce(server, channel);
 
   assert.equal(report.status, "completed");
-  // happyScript 触发 5 次预览 flush：占位卡 + 两次续接 + 定稿新卡
-  assert.equal(channel.sent.length, 4, `实际 ${channel.sent.length}`);
-  assert.ok(channel.sent.every((s) => s.message.kind === "card"), "续接的也应是卡片");
+  assert.equal(channel.sent.length, 2, "占位卡 + 定稿新卡，不换消息续接");
+  assert.ok(channel.sent.every((s) => s.message.kind === "card"), "发出的都应是卡片");
+  // 占位卡只被成功 patch 过一次，之后没有再对任何卡片发起过编辑
   const placeholderId = channel.sent[0]?.messageId ?? "";
-  assert.ok(
-    channel.edited.some((e) => e.message.kind === "card" && e.messageId !== placeholderId),
-    "应有 preview patch 落在续接出来的新卡片上",
-  );
-  // 定稿 patch 失败 → 新发一张定稿卡，它就是最新一条消息
+  assert.equal(channel.edited.length, 1, "成功 patch 之后不应再有编辑");
+  assert.equal(channel.edited[0]?.messageId, placeholderId, "唯一一次编辑打在占位卡上");
+  // 定稿作为最新一条消息发出，内容不丢
   const final = cardOf(lastSentMessage(channel));
   assert.equal(final.header.title.content, "✅ 完成");
   assert.match(flatText(lastSentMessage(channel)), /今天 21 号/);
