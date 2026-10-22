@@ -2,13 +2,15 @@
 // 占位消息 → （续接或新建会话）→ 订阅 SSE → 投递任务 → 流式预览 → 定稿。
 // 订阅先于投递（服务端订阅后立刻发 task_state 快照，保证不丢事件）；
 // 流中断不会让服务端停止任务，所以断流时显式 abort，避免僵尸任务占住会话。
+// 占位 / 预览 / 定稿都承载为交互卡片（ADR-0006），卡片发送或更新失败时整体退回文本链路。
 
-import type { ChannelAdapter } from "../channels/types.js";
+import type { ChannelAdapter, OutboundMessage } from "../channels/types.js";
 import type { ApprovalPolicy } from "../approvals.js";
 import { denyAll } from "../approvals.js";
 import { redact } from "../logger.js";
 import type { Logger } from "../logger.js";
 import type { RunEvent } from "../run-event.js";
+import { buildPreviewCard, buildRunCard, errorCard, placeholderCard, type RunCard } from "../card.js";
 import {
   BUSY_HINT,
   PLACEHOLDER_TEXT,
@@ -21,8 +23,11 @@ import type { AgentRef, ModelRef, SessionClient } from "./sessions.js";
 import { SessionBusyError } from "./sessions.js";
 import { RunTracker, isApprovalRequest, isTaskState } from "./omni.js";
 
-/** 预览消息最多续接几条新消息（飞书单条消息编辑次数有限，长任务要换消息续）。 */
+/** 预览消息最多续接几条新消息（单条消息的更新次数有上限，长任务要换消息续）。 */
 const MAX_CHAINS = 10;
+
+/** 本次 Run 的出站承载：交互卡片（默认，ADR-0006）或文本（卡片发不出去时的降级）。 */
+type Carrier = "card" | "text";
 
 /** 新建会话时下发的档位（来自聊天的 binding）。 */
 export interface SessionSettings {
@@ -78,52 +83,66 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
   const policy = deps.approvals ?? denyAll;
   logger.info(`发起 Run：${spec.input.slice(0, 80)}`);
 
-  // 先发占位消息，拿到 message_id 后再开跑：事件到达时已有可编辑的消息。
-  const placeholderId = await deps.channel.send(spec.chatId, { kind: "text", text: PLACEHOLDER_TEXT });
+  // 先发占位消息，拿到 message_id 后再开跑：事件到达时已有可更新的消息。
+  // 默认走交互卡片（ADR-0006）；卡片发不出去时退回文本占位，整条 Run 走文本链路。
+  // 两者都发不出去才抛出（由 gateway 回复「出错了」）。
+  let carrier: Carrier;
+  let placeholderId: string;
+  try {
+    placeholderId = await deps.channel.send(spec.chatId, { kind: "card", card: placeholderCard() });
+    carrier = "card";
+  } catch (error: unknown) {
+    logger.warn(`占位卡片发送失败，退回文本消息：${error instanceof Error ? error.message : String(error)}`);
+    placeholderId = await deps.channel.send(spec.chatId, { kind: "text", text: PLACEHOLDER_TEXT });
+    carrier = "text";
+  }
 
   let degraded = false;
-  /** 已换过几条新消息继续预览（飞书单条消息最多编辑 20 次，实测）。 */
+  /** 已换过几条新消息继续预览（飞书单条文本消息最多编辑 20 次，实测）。 */
   let chains = 0;
-  /** 当前这条预览消息上成功编辑过的次数；0 = 它根本编辑不了，换新的也没用。 */
+  /** 当前这条预览消息上成功更新过的次数；0 = 它根本更新不了，换新的也没用。 */
   let editsOnCurrent = 0;
-  /** 当前承载预览的消息 id（换消息后指向新消息，定稿也编辑它）。 */
+  /** 当前承载预览的消息 id（换消息后指向新消息，定稿也更新它）。 */
   let liveMessageId = placeholderId;
-  /** 预览编辑串行化：避免上一次 flush 还没落地就改指向。 */
+  /** 预览更新串行化：避免上一次 flush 还没落地就改指向。 */
   let flushChain: Promise<void> = Promise.resolve();
-  /** Run 已结束：之后的预览 flush 一律作废，避免晚到的编辑盖掉定稿。 */
+  /** Run 已结束：之后的预览 flush 一律作废，避免晚到的更新盖掉定稿。 */
   let finished = false;
   let preview = new RunPreview(spec.preview);
 
-  /** 等未落地的预览编辑做完，并此后再不让预览覆盖定稿。 */
+  /** 等未落地的预览更新做完，并此后再不让预览覆盖定稿。 */
   const settlePreview = async (): Promise<void> => {
     await flushChain;
     finished = true;
   };
 
-  /** 把当前预览写进聊天里的消息；编辑不成就换一条新消息，再也发不出去才彻底放弃预览。 */
+  /** 把当前预览写进聊天里的消息；更新不成就换一条新消息，再也发不出去才彻底放弃预览。 */
   const flushOnce = async (): Promise<void> => {
     if (finished) return;
-    const markdown = preview.markdown();
+    const message: OutboundMessage =
+      carrier === "card"
+        ? { kind: "card", card: buildPreviewCard(preview.snapshot()) }
+        : { kind: "text", text: preview.markdown() };
     try {
-      await deps.channel.edit(liveMessageId, { kind: "text", text: markdown });
+      await deps.channel.edit(liveMessageId, message);
       editsOnCurrent += 1;
       return;
     } catch (error: unknown) {
       logger.warn(`预览编辑失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    // 这条消息一次都没编辑成功过：换新的也白搭，直接放弃预览（发送本身出问题时走这条）。
+    // 这条消息一次都没更新成功过：换新的也白搭，直接放弃预览（发送本身出问题时走这条）。
     if (editsOnCurrent === 0 || chains >= MAX_CHAINS) {
       degraded = true;
       logger.warn("放弃流式预览，改为最终一次性发送");
       return;
     }
-    // 飞书对单条消息的编辑次数有上限（实测 20 次，错误码 230072）。
-    // 长任务的后半程不能因此没有进度可见：换一条新消息继续承载预览。
+    // 单条消息的更新次数有上限（文本消息实测 20 次，错误码 230072；卡片 patch 没有这条上限，
+    // 但频控 / 超限同样会让它失败）：长任务的后半程不能因此没有进度可见，换一条新消息继续承载预览。
     try {
-      liveMessageId = await deps.channel.send(spec.chatId, { kind: "text", text: markdown });
+      liveMessageId = await deps.channel.send(spec.chatId, message);
       chains += 1;
       editsOnCurrent = 0;
-      logger.info(`预览消息编辑次数已用尽，换用新消息继续（第 ${chains} 次续接）`);
+      logger.info(`预览消息更新次数已用尽，换用新消息继续（第 ${chains} 次续接）`);
     } catch (error: unknown) {
       degraded = true;
       logger.warn(
@@ -194,7 +213,15 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     const message = error instanceof Error ? error.message : String(error);
     logger.warn(`会话准备失败：${message}`);
     await settlePreview();
-    await deliverFinal(deps, spec.chatId, liveMessageId, formatRunFailure(error), degraded);
+    const failure = formatRunFailure(error);
+    await deliverFinal(
+      deps,
+      spec.chatId,
+      liveMessageId,
+      { card: carrier === "card" ? errorCard(failure) : null, text: failure },
+      carrier,
+      degraded,
+    );
     return failedReport(spec.chatId, null, message, startedAt);
   }
 
@@ -264,16 +291,35 @@ export async function executeRun(deps: RunDeps, spec: RunSpec): Promise<RunRepor
     // 会话忙（409）除外——那个在跑的任务不是我们起的，不能替别人中断。
     if (!aborted && !(streamFailure instanceof SessionBusyError)) await handle.abort();
     await settlePreview();
-    const text =
-      streamFailure instanceof SessionBusyError ? BUSY_HINT : formatRunFailure(streamFailure);
-    await deliverFinal(deps, spec.chatId, liveMessageId, text, degraded);
+    // 忙提示不是 Run 结果，是「请稍候」的普通提示：保持文本消息现状（ADR-0006 的边界）。
+    const busy = streamFailure instanceof SessionBusyError;
+    const text = busy ? BUSY_HINT : formatRunFailure(streamFailure);
+    await deliverFinal(
+      deps,
+      spec.chatId,
+      liveMessageId,
+      { card: carrier === "card" && !busy ? errorCard(text) : null, text },
+      carrier,
+      degraded,
+    );
     return failedReport(spec.chatId, sessionId, message, startedAt);
   }
 
   const outcome = tracker.outcome;
   logger.info(`Run 完成：${outcome.status}，session=${sessionId}`);
   await settlePreview();
-  await deliverFinal(deps, spec.chatId, liveMessageId, formatFinalText(outcome, preview.snapshot()), degraded);
+  const snapshot = preview.snapshot();
+  await deliverFinal(
+    deps,
+    spec.chatId,
+    liveMessageId,
+    {
+      card: carrier === "card" ? buildRunCard(outcome, snapshot) : null,
+      text: formatFinalText(outcome, snapshot),
+    },
+    carrier,
+    degraded,
+  );
 
   const modelId = await spec.client
     .sessionInfo(sessionId)
@@ -304,17 +350,50 @@ function failedReport(chatId: string, sessionId: string | null, message: string,
   };
 }
 
-/** 定稿：优先编辑占位消息；编辑失败（或已降级）就新发一条，保证结果不丢。 */
+/** 定稿内容：卡片与文本双份；文本兜底保证结果不丢。 */
+interface FinalContent {
+  card: RunCard | null;
+  text: string;
+}
+
+/**
+ * 定稿：优先更新占位消息（卡片 patch / 文本 edit），失败则新发一条，再失败退回另一种载体，
+ * 任何路径都保证结果不丢；只有最后的发送本身失败才抛出（由 gateway 回复「出错了」）。
+ * carrier = "text"（或没有卡片内容）时走原有文本链路，一字不改。
+ */
 async function deliverFinal(
   deps: RunDeps,
   chatId: string,
-  placeholderId: string,
-  finalText: string,
+  messageId: string,
+  content: FinalContent,
+  carrier: Carrier,
   degraded: boolean,
 ): Promise<void> {
+  if (carrier === "card" && content.card !== null) {
+    if (!degraded) {
+      try {
+        await deps.channel.edit(messageId, { kind: "card", card: content.card });
+        return;
+      } catch (error: unknown) {
+        deps.logger.warn(
+          `定稿编辑失败，改为新发消息：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    try {
+      await deps.channel.send(chatId, { kind: "card", card: content.card });
+      return;
+    } catch (error: unknown) {
+      deps.logger.warn(
+        `定稿卡片发送失败，改为发送文本：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    await deps.channel.send(chatId, { kind: "text", text: content.text });
+    return;
+  }
   if (!degraded) {
     try {
-      await deps.channel.edit(placeholderId, { kind: "text", text: finalText });
+      await deps.channel.edit(messageId, { kind: "text", text: content.text });
       return;
     } catch (error: unknown) {
       deps.logger.warn(
@@ -322,5 +401,5 @@ async function deliverFinal(
       );
     }
   }
-  await deps.channel.send(chatId, { kind: "text", text: finalText });
+  await deps.channel.send(chatId, { kind: "text", text: content.text });
 }

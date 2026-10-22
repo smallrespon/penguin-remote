@@ -14,7 +14,8 @@ import {
 import { executeRun } from "../src/penguin/runner.js";
 import { createLogger } from "../src/logger.js";
 import type { OutboundMessage } from "../src/channels/types.js";
-import { FakeChannel, textOf } from "./helpers/fake-channel.js";
+import { FakeChannel } from "./helpers/fake-channel.js";
+import { flatText } from "./helpers/flat-text.js";
 import { FakeSessionServer, frame, sessionClient, waitForTask } from "./helpers/fake-sessions.js";
 import type { RunEvent } from "../src/run-event.js";
 
@@ -440,23 +441,23 @@ test("流式预览：Run 过程中按节流编辑占位消息，最终定稿一�
   await report;
 
   assert.equal(channel.sent.length, 1);
-  assert.equal(textOf(channel.sent[0]?.message ?? { kind: "text", text: "" }), PLACEHOLDER_TEXT);
+  assert.equal(flatText(channel.sent[0]?.message ?? { kind: "text", text: "" }), PLACEHOLDER_TEXT);
   assert.ok(channel.edited.length >= 4, `应有多次增量编辑，实际 ${channel.edited.length}`);
-  assert.match(textOf(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /全部完成/);
-  assert.match(textOf(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
+  assert.match(flatText(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /全部完成/);
+  assert.match(flatText(channel.edited.at(-1)?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
   // 中间某次编辑应包含思考行与工具行
-  assert.ok(channel.edited.some((e) => /\*\*🧠 思考中…（4 字）\*\*/.test(textOf(e.message))));
-  assert.ok(channel.edited.some((e) => /\*\*🔧 exec_command\*\*/.test(textOf(e.message))));
+  assert.ok(channel.edited.some((e) => /\*\*🧠 思考中…（4 字）\*\*/.test(flatText(e.message))));
+  assert.ok(channel.edited.some((e) => /\*\*🔧 exec_command\*\*/.test(flatText(e.message))));
 });
 
 /**
  * 编辑快慢不一的 Channel：预览编辑慢、定稿编辑快。
- * 真实飞书里每次编辑是一次独立的 lark-cli 调用，耗时不稳——在途的预览编辑
- * 完全可能比后发出的定稿编辑更晚落地，把定稿盖掉。
+ * 真实飞书里每次更新是一次独立的 lark-cli 调用，耗时不稳——在途的预览更新
+ * 完全可能比后发出的定稿更新更晚落地，把定稿盖掉。
  */
 class UnfairEditChannel extends FakeChannel {
   override async edit(messageId: string, message: OutboundMessage): Promise<void> {
-    const delay = textOf(message).includes("用量") ? 0 : 60;
+    const delay = flatText(message).includes("用量") ? 0 : 60;
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     await super.edit(messageId, message);
   }
@@ -478,9 +479,9 @@ test("流式预览：在途的预览编辑不得盖掉定稿（晚到的编辑�
   await new Promise((resolve) => setTimeout(resolve, 250));
 
   const last = channel.edited.at(-1);
-  assert.match(textOf(last?.message ?? { kind: "text", text: "" }), /最终答案/, "最后一次编辑必须是定稿");
-  assert.match(textOf(last?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
-  const finals = channel.edited.filter((e) => textOf(e.message).includes("用量 42 tokens"));
+  assert.match(flatText(last?.message ?? { kind: "text", text: "" }), /最终答案/, "最后一次编辑必须是定稿");
+  assert.match(flatText(last?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
+  const finals = channel.edited.filter((e) => flatText(e.message).includes("用量 42 tokens"));
   assert.equal(finals.length, 1, "定稿只应写一次");
   assert.equal(finals[0]?.messageId, last?.messageId, "定稿必须是最后一次落地");
 });
@@ -506,8 +507,8 @@ test("流式预览：编辑次数反复用尽时持续换新消息，定稿落�
   // 定稿落在最新一条消息上：它还有编辑额度就编辑它，额度已用尽就作为最新一条消息直接发出
   const finalMarkdown =
     finalEdit !== undefined && finalEdit.messageId === last?.messageId
-      ? textOf(finalEdit.message)
-      : (last === undefined ? "" : textOf(last.message));
+      ? flatText(finalEdit.message)
+      : flatText(last?.message ?? { kind: "text", text: "" });
   assert.match(finalMarkdown, /最终答案/, "定稿应落在最新一条消息上");
   assert.match(finalMarkdown, /用量 42 tokens/, "定稿带用量页脚");
   // 每条消息都被编辑过，且编辑次数都不超过上限
@@ -516,10 +517,11 @@ test("流式预览：编辑次数反复用尽时持续换新消息，定稿落�
   assert.ok([...counts.values()].every((n) => n <= 1), "不该有消息被编辑超过上限");
 });
 
-test("流式预览：编辑从未成功过时直接降级为最终一次性发送，不白换消息", async () => {
+test("流式预览：更新从未成功过时直接降级为最终一次性发送，不白换消息", async () => {
   const server = new FakeSessionServer();
   const channel = new FakeChannel();
-  channel.failEditKinds = ["text"];
+  // 卡片承载（ADR-0006）：让卡片的更新一律失败
+  channel.failEditKinds = ["card"];
   const report = startRun(server, channel);
   const sessionId = await startedSession(server);
   server.pushLive(sessionId, frame.taskState("running"));
@@ -528,9 +530,9 @@ test("流式预览：编辑从未成功过时直接降级为最终一次性发�
   finish(server, sessionId, "最终答案");
   await report;
 
-  assert.equal(channel.edited.length, 0, "编辑从未成功，不该换消息白试");
+  assert.equal(channel.edited.length, 0, "更新从未成功，不该换消息白试");
   assert.equal(channel.sent.length, 2, "占位 + 降级后的总结");
-  assert.match(channel.lastSent(), /最终答案/);
+  assert.match(flatText(channel.sent.at(-1)?.message ?? { kind: "text", text: "" }), /最终答案/);
 });
 
 test("流式预览：单条消息编辑次数用尽后换新消息继续，定稿落在新消息上", async () => {
@@ -550,15 +552,15 @@ test("流式预览：单条消息编辑次数用尽后换新消息继续，定�
   // 占位消息被编辑满 3 次，随后换一条新消息继续
   assert.equal(channel.sent.length, 2, "占位 + 换的新预览消息");
   const [placeholder, chained] = channel.sent;
-  assert.equal(textOf(placeholder?.message ?? { kind: "text", text: "" }), PLACEHOLDER_TEXT);
-  assert.match(textOf(chained?.message ?? { kind: "text", text: "" }), /第四段/, "新消息带着当前进度出现");
+  assert.equal(flatText(placeholder?.message ?? { kind: "text", text: "" }), PLACEHOLDER_TEXT);
+  assert.match(flatText(chained?.message ?? { kind: "text", text: "" }), /第四段/, "新消息带着当前进度出现");
   const chainedId = chained?.messageId ?? "";
   assert.ok(channel.edited.some((e) => e.messageId === chainedId), "后续编辑应打到新消息上");
   // 定稿编辑在新消息上，而不是再发一条
   const finalEdit = channel.edited.at(-1);
   assert.equal(finalEdit?.messageId, chainedId);
-  assert.match(textOf(finalEdit?.message ?? { kind: "text", text: "" }), /最终答案/);
-  assert.match(textOf(finalEdit?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
+  assert.match(flatText(finalEdit?.message ?? { kind: "text", text: "" }), /最终答案/);
+  assert.match(flatText(finalEdit?.message ?? { kind: "text", text: "" }), /用量 42 tokens/);
 });
 
 function tick(): Promise<void> {
