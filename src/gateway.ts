@@ -64,6 +64,9 @@ const LIVE_LIST_FALLBACK_NOTE = "⚠️ 实时列表查询失败，显示本地�
  */
 const SESSION_DISPLAY_LIMIT = 50;
 
+/** 展示层截断：截断前的真实总数由调用方另算（ADR-0011）。 */
+const capEntries = (entries: SessionListEntry[]): SessionListEntry[] => entries.slice(0, SESSION_DISPLAY_LIMIT);
+
 /** 标题拍平（服务端标题可能含换行）后截断到 40 字；空标题给占位。 */
 const TITLE_MAX_CHARS = 40;
 
@@ -323,7 +326,7 @@ export class Gateway {
         at: item.lastActiveAt,
         model: item.modelId,
       }));
-      return { entries: entries.slice(0, SESSION_DISPLAY_LIMIT), total: entries.length, live: true };
+      return { entries: capEntries(entries), total: entries.length, live: true };
     } catch (error: unknown) {
       const text = redact(error instanceof Error ? error.message : String(error));
       this.logger.warn(`实时会话列表查询失败，改用本地历史：${text}`);
@@ -333,7 +336,7 @@ export class Gateway {
         at: item.at,
         model: item.model ?? null,
       }));
-      return { entries: entries.slice(0, SESSION_DISPLAY_LIMIT), total: entries.length, live: false };
+      return { entries: capEntries(entries), total: entries.length, live: false };
     }
   }
 
@@ -351,11 +354,13 @@ export class Gateway {
     const binding = this.deps.registry.bindingFor(chatId);
     const lines = entries.map((entry, index) => sessionLine(entry, index, binding.sessionId));
     // ADR-0011：头部注明截断前的真实总数；超出展示条数时如实说明更早的会话未列出、暂不可跳。
+    // 兜底路径只拿到 Registry 本地历史，不保证未归档——头部口径跟着来源走，不冒充全量。
+    const header = live ? "**未归档会话**" : "**本地历史会话**";
     const truncationNote =
       total > SESSION_DISPLAY_LIMIT
         ? `\n（显示最近 ${SESSION_DISPLAY_LIMIT} 个，更早的会话未列出、暂不可 \`/use\` 跳转）`
         : "";
-    const body = `**未归档会话**（共 ${total} 个）${truncationNote}\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
+    const body = `${header}（共 ${total} 个）${truncationNote}\n${lines.join("\n")}\n\n用 \`/use <序号>\` 切回去续聊。`;
     await this.reply(chatId, withFallbackNote(live, body));
   }
 

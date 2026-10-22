@@ -266,20 +266,33 @@ export function thoughtPanelTitle(part: ThoughtPart, mode: RenderMode): string {
   if (part.endedAt === undefined) {
     return mode === "final" ? `**🧠 思考 · ${part.chars} 字**` : `**🧠 思考 · 运行中… · ${part.chars} 字**`;
   }
-  const seconds = (Date.parse(part.endedAt) - Date.parse(part.startedAt)) / 1000;
-  return `**🧠 思考 · 运行完毕 · ${part.chars} 字 · ${seconds.toFixed(1)}s**`;
+  const span = durationLabel(part.startedAt, part.endedAt);
+  return `**🧠 思考 · 运行完毕 · ${part.chars} 字${span === undefined ? "" : ` · ${span}`}**`;
 }
 
 /**
- * 起止时间 → 「X.Xs」（卡片路径的步耗时，ADR-0010）。
- * 任一端缺失或解析不出时返回 undefined：缺时间戳的事件不参与耗时计算，也不编造数字。
+ * 一组时间戳 → 「X.Xs」（组耗时与步耗时的共同算法，ADR-0010）。
+ * 可解析的少于两个、或跨度非正时返回 undefined：缺时间戳的事件不参与耗时计算，也不编造数字。
  */
+export function spanLabel(ats: readonly (string | undefined)[]): string | undefined {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  let parsed = 0;
+  for (const at of ats) {
+    if (at === undefined) continue;
+    const millis = Date.parse(at);
+    if (Number.isNaN(millis)) continue;
+    parsed += 1;
+    if (millis < min) min = millis;
+    if (millis > max) max = millis;
+  }
+  if (parsed < 2 || max < min) return undefined;
+  return `${((max - min) / 1000).toFixed(1)}s`;
+}
+
+/** 起止时间 → 「X.Xs」（卡片路径的步耗时，ADR-0010）。 */
 export function durationLabel(startedAt: string | undefined, endedAt: string | undefined): string | undefined {
-  if (startedAt === undefined || endedAt === undefined) return undefined;
-  const start = Date.parse(startedAt);
-  const end = Date.parse(endedAt);
-  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return undefined;
-  return `${((end - start) / 1000).toFixed(1)}s`;
+  return spanLabel([startedAt, endedAt]);
 }
 
 /** 思考分区的一行标签（文本兜底路径）：与卡片路径分流，状态词只出现在卡片里（ADR-0007）。 */

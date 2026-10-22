@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { runCommand } from "./proc.js";
+import { escapeRegExp } from "./text.js";
 
 /** 飞书文件消息的量级上限：超过这个量级的页面不上传（上传会失败，也超出「一页」的体感）。 */
 export const HTML_PAGE_MAX_BYTES = 20 * 1024 * 1024;
@@ -53,10 +54,6 @@ export function extractPagePaths(text: string): string[] {
     paths.push(path);
   }
   return paths;
-}
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** 剥链后的空白收敛：行尾空白清掉、3+ 连续换行折叠成一个空行、去掉文尾空白。 */
@@ -597,8 +594,6 @@ export type RenderRun = (
 export interface RenderPageOptions {
   /** answer-me-with-html 渲染器脚本（am.mjs）的路径。 */
   script: string;
-  /** node 可执行文件；默认当前进程的 node。 */
-  nodeBin?: string;
   /** 注入用：渲染器子进程的执行方式。 */
   run?: RenderRun;
   /** 注入用：产物路径的生成方式。 */
@@ -637,7 +632,7 @@ export async function renderPage(draft: string, options: RenderPageOptions): Pro
   const home = await mkdtemp(join(tmpdir(), "penguin-remote-amwh-"));
   let produced = false;
   try {
-    const result = await run(options.nodeBin ?? process.execPath, [
+    const result = await run(process.execPath, [
       options.script,
       "render",
       "-",

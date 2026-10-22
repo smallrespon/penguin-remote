@@ -11,6 +11,7 @@ import { Registry } from "../src/registry.js";
 import { RunLog } from "../src/runlog.js";
 import { loadConfig } from "../src/config.js";
 import { formatSkillInput, helpText, parseCommand } from "../src/router.js";
+import { escapeRegExp } from "../src/text.js";
 import { FakeSessionServer, frame, sessionClient, waitForTask, type FrameScript } from "./helpers/fake-sessions.js";
 import { flatText } from "./helpers/flat-text.js";
 import { BUSY_HINT, PLACEHOLDER_TEXT } from "../src/render.js";
@@ -97,10 +98,6 @@ function lastTaskPath(server: FakeSessionServer): string {
 function markIdle(server: FakeSessionServer, sessionId: string): void {
   const session = server.sessions.get(sessionId);
   if (session !== undefined) session.status = "idle";
-}
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ---- T4 回归：最小闭环 ----
@@ -465,7 +462,7 @@ test("实时列表查询失败：/sessions 与 /use 退回本地历史并首行�
   const text = channel.lastSent();
   assert.ok(text.startsWith("⚠️ 实时列表查询失败，显示本地历史"), `首行应注明兜底：${text}`);
   assert.ok(text.includes(sessionId), "仍列出本地历史会话");
-  assert.ok(text.includes("**未归档会话**"), "兜底渲染与实时同版式");
+  assert.ok(text.includes("**本地历史会话**"), "兜底路径用本地历史口径，不冒充未归档全量");
 
   server.nextListStatus = 500;
   await channel.receive("/use 1");

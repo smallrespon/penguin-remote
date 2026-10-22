@@ -420,10 +420,10 @@ function stripParts(state: PreviewState, paths: readonly string[]): PreviewState
  */
 async function discardArtifact(path: string): Promise<void> {
   const parent = dirname(path);
-  const ours = dirname(parent) === tmpdir();
+  const weOwnParentDir = dirname(parent) === tmpdir();
   try {
     await rm(path, { force: true });
-    if (ours) await rm(parent, { recursive: true, force: true });
+    if (weOwnParentDir) await rm(parent, { recursive: true, force: true });
   } catch {
     // 见上
   }

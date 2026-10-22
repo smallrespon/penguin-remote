@@ -240,17 +240,26 @@ state/
 │   ├── index.ts             # 装配 + 启动 + 优雅退出（SIGTERM → 关 consume 子进程）
 │   ├── config.ts            # env 加载与校验（fail-fast）
 │   ├── gateway.ts           # 控制平面：把下面各层接起来
-│   ├── channels/types.ts    # Channel 适配器接口（send/edit/onMessage）
-│   ├── channels/feishu.ts   # lark-cli 子进程：consume 两条事件流 + send/edit
 │   ├── router.ts            # 命令解析与分发
 │   ├── lanes.ts             # 按 chatId 串行队列
 │   ├── registry.ts          # bindings 持久化
+│   ├── tiers.ts             # 档位命令（/project /agent /model /thinking /workspace）
+│   ├── logger.ts            # 日志：级别过滤 + 密钥打码
+│   ├── runlog.ts            # runs.jsonl 审计轨迹（每次 Run 一行）
+│   ├── proc.ts              # 子进程执行：一次性命令 + 长驻子进程（可注入 mock）
+│   ├── text.ts              # 文本小工具（正则转义等）
+│   ├── images.ts            # 入站图片：占位符解析 + 字节 → data URL（ADR-0009）
+│   ├── channels/types.ts    # Channel 适配器接口（send/edit/onMessage）
+│   ├── channels/feishu.ts   # lark-cli 子进程：consume 两条事件流 + send/edit/文件消息
 │   ├── penguin/owner.ts     # owner 会话：penguin auth token 铸/换 + settings/agents 路由 + fetchAuthed（供会话 API 复用）
 │   ├── penguin/sessions.ts  # 会话 API 客户端（建会话/PATCH/SSE 订阅/tasks/abort/approvals，ADR-0005）
 │   ├── penguin/omni.ts      # OmniMessage → RunEvent 翻译 + RunTracker（终局/用量/正文）
-│   ├── penguin/runner.ts    # 单次 Run 生命周期（续接或新建会话→订阅→投递→守终局→定稿）
+│   ├── penguin/runner.ts    # 单次 Run 生命周期（续接或新建会话→订阅→投递→守终局→定稿→HTML 页交付）
 │   ├── run-event.ts         # Bridge 自有 RunEvent 联合类型（渲染层只认这套）
-│   ├── render.ts            # RunEvent → 增量 markdown
+│   ├── render.ts            # RunEvent → 增量 markdown（文本兜底路径）
+│   ├── card.ts              # RunEvent → 飞书交互卡片（Card 2.0，步骤分组折叠面板）
+│   ├── budget.ts            # 卡片预算装配：超 20KB 从最中间整块丢分区，保尾优先
+│   ├── htmlpage.ts          # 富内容 → 单文件 HTML 页（a2ui/mermaid 转换 + 渲染，ADR-0012）
 │   └── approvals.ts         # 审批策略接缝（v1 默认一律拒绝）
 ├── state/                   # 运行时状态（bindings.json / runs.jsonl）
 └── scripts/start.sh         # 前台启动；systemd unit 另附

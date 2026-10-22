@@ -4,7 +4,7 @@
 // 结构按 lark-cli 实测可发送、可 patch 的形态组织：思考与工具调用都放进默认收起的折叠面板。
 
 import type { FinalOutcome, PreviewPart, PreviewState, ThoughtPart, ToolPart } from "./render.js";
-import { durationLabel, fenceFor, finalParts, fencedOutput, thoughtPanelTitle } from "./render.js";
+import { durationLabel, fenceFor, finalParts, fencedOutput, spanLabel, thoughtPanelTitle } from "./render.js";
 import { fitMiddleDroppingPreferred } from "./budget.js";
 import { redact } from "./logger.js";
 
@@ -211,21 +211,7 @@ function stepClosed(step: ThoughtPart | ToolPart): boolean {
  * 缺时间戳的事件不参与耗时计算，也不编造（ADR-0010）。
  */
 function groupSpan(steps: Array<ThoughtPart | ToolPart>): string | undefined {
-  let min = Number.POSITIVE_INFINITY;
-  let max = Number.NEGATIVE_INFINITY;
-  let seen = 0;
-  for (const step of steps) {
-    for (const at of [step.startedAt, step.endedAt]) {
-      if (at === undefined) continue;
-      const millis = Date.parse(at);
-      if (Number.isNaN(millis)) continue;
-      seen += 1;
-      if (millis < min) min = millis;
-      if (millis > max) max = millis;
-    }
-  }
-  if (seen < 2) return undefined;
-  return `${((max - min) / 1000).toFixed(1)}s`;
+  return spanLabel(steps.flatMap((step) => [step.startedAt, step.endedAt]));
 }
 
 /** 思考分区 → 折叠面板：标题是思考标签（带运行状态），面板里是完整思考全文（ADR-0007）。 */

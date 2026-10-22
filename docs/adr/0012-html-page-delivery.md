@@ -9,9 +9,9 @@
 **决策**：
 
 - **转发 agent 产出的页面（默认开启，无需配置）**：Run 定稿后，从定稿文本提取绝对路径的 `.html` 页面链接（技能约定的 `[/abs/path.html](</abs/path.html>)` 尾链、`file://` URL、`-o` 自定义路径都覆盖）；校验存在、是文件、扩展名为 `.html`、大小 ≤ 20MB（飞书文件消息量级）后，经 Channel 适配器发文件消息（`im files create` 拿 file_key → `im +messages-send --msg-type file`）。提取不到 / 校验不过 / 发送失败都只记日志，不影响卡片定稿——结果不丢是老原则。
-- **剥死链**：被转发的页面链接在定稿文本里剥掉（飞书里点不动的本地链接没有意义）。剥除对 `outcome.text` 与流式正文分区**同构**应用，保证 `finalParts` 的「流式累积 vs outcome 权威全文」比较不被单侧修改破坏（同构变换保持相等性）。
+- **剥死链**：被转发的页面**链接**在定稿文本里剥掉（飞书里点不动的本地链接没有意义）——只剥链接形态（markdown 链接 / `file://` URL）；正文里提到的裸绝对路径不是链接，原样保留（文件消息已把内容带进聊天，路径留着可溯源）。剥除对 `outcome.text` 与流式正文分区**同构**应用，保证 `finalParts` 的「流式累积 vs outcome 权威全文」比较不被单侧修改破坏（同构变换保持相等性）。
 - **富内容自动渲染（opt-in）**：配置项 `AMWH_RENDER_SCRIPT` 指向渲染器（本机 `.env` 指向插件技能内的 `am.mjs`）；未配置 = 关闭。开启且定稿文本含 ` ```a2ui ` 或 ` ```mermaid ` 围栏、且没有已转发页面时，Bridge 把回复转换成 amwh 草稿后渲染成 HTML，走同一条文件消息通道发出。转换是纯函数、可离线测试；渲染失败（CLI 报错 / 超时 / 产物不存在）只记日志。
-- **a2ui → amwh 组件映射**：`choice` → `ask`（`*` 标记推荐项）；`form` → 表格（字段/类型/选项/必填）；`steps` → 编号列表（warning/caution 置于步骤前、note 置于后、code 进代码围栏）；`callout` → `callout`（tone 映射 note→note、tip→ok、caution→warn、warning→no）；`metrics` → 表格；`weather`/`clock`/`countdown` → `kv`。未知类型 / 解析失败 → 原样保留代码围栏（不猜、不炸）。
+- **a2ui → amwh 组件映射**：`choice` → `ask`（`*` 标记推荐项）；`form` → 表格（字段/类型/选项/必填）；`steps` → 编号列表（warning/caution 置于步骤前、note 置于后、code 进代码围栏）；`callout` → `callout`（tone 映射 note→info、tip→ok、caution→warn、warning→err——amwh 只认 info|ok|warn|err 四档）；`metrics` → 表格；`weather`/`clock`/`countdown` → `kv`。未知类型 / 解析失败 → 原样保留代码围栏（不猜、不炸）。
 - **mermaid 保守转换**：仅转换可无损解析的简单形态——flowchart/graph 的 `A[标签] --> B{标签}` / `A -- 说明 --> B` 简单边（节点标签须为无空格的简单token，否则整体留代码围栏）、sequenceDiagram 的简单消息行；出现子图 / 样式 / classDef / participant 别名等一概不转，保留 ` ```mermaid ` 代码围栏。**宁可留源码，不产出错图**。
 - **不 vendor 渲染器**：渲染器由插件分发与升级，Bridge 只按配置路径调用——不在仓库里塞 945KB 第三方产物，也不与插件版本打架。代价：未配置 `AMWH_RENDER_SCRIPT` 的部署没有自动渲染（转发页面始终可用）。
 - **a2ui 交互性丢失是固有边界**：choice/form 的「页面上选择 → 复制回传」回路在飞书文件里断裂，HTML 页是静态展示；README 明示。

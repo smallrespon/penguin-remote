@@ -13,6 +13,7 @@ import { runCommand, readLines, spawnManaged, type ManagedChild, type SpawnFn } 
 import { extractImageKeys } from "../images.js";
 import type { Logger } from "../logger.js";
 import { redact } from "../logger.js";
+import { escapeRegExp } from "../text.js";
 
 export interface FeishuChannelOptions {
   /** lark-cli 可执行文件。 */
@@ -34,10 +35,6 @@ interface LarkEnvelope {
 }
 
 const MENTION_PLACEHOLDER = /@_user_\d+/g;
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 /**
  * 剥掉文本里的 @：占位符（`@_user_1`）与已渲染成显示名的 @（`@名字` / 行首的名字）。
