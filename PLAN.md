@@ -142,7 +142,7 @@ OpenClaw（前身 Clawdbot）是「本地优先的开源 AI 智能体执行网�
 
 ### 4.3 会话与「换对话」
 
-- Registry 记录每个 chat 用过的所有 session（task 投递返回时落盘），作为审计轨迹与**兜底**列表；`/sessions` 默认**实时查询服务端**当前 Project/Agent 下的未归档会话（`GET /api/projects/:p/agents/:a/sessions`，按 lastActiveAt 倒序前 10 条），`/use <n>` 在这份实时列表上切换——远程（Web/CLI/其他客户端）新建的未归档会话可直接看见并跳入；查询失败才退回 Registry 本地历史并在回复中注明（ADR-0008，2026-10-22）。
+- Registry 记录每个 chat 用过的所有 session（task 投递返回时落盘），作为审计轨迹与**兜底**列表；`/sessions` 默认**实时查询服务端**当前 Project/Agent 下的未归档会话（`GET /api/projects/:p/agents/:a/sessions`，按 lastActiveAt 倒序），展示截断到 50 条并注明总数，`/use <n>` 在这份列表上切换——远程（Web/CLI/其他客户端）新建的未归档会话可直接看见并跳入；查询失败才退回 Registry 本地历史并在回复中注明（ADR-0008；截断口径 2026-10-22 改为 50 条，见 ADR-0011）。
 - 为什么改：v1.0–v1.3 的「自持列表」让 Bridge 看不见任何非自己创建的会话，用户在远程新建的对话无法跳转；服务端列表接口一直存在（`penguin session ls` 就在用），Bridge 建的会话本就不归档，实时列表天然覆盖自己建的会话，不存在「列出去了却续不了」。
 - `/new` = 清掉当前 sessionId 绑定，下一条消息新建（新建时带上当前档位）。
 - 迁移约定：v1.0 时期 AMSP 建的会话是 `source: "api"`（已归档）。2026-10-21 实测：默认 Agent 名下的旧会话仍可被会话 API 续接（续了也保持归档），绑定保留、自然老化；按聊天懒建的 `feishu_*` 专属 Agent 名下的旧会话经会话 API 不可达（404，随 Agent 清理一并消失），这类绑定在 Registry 加载时迁回默认 Agent 并清掉会话引用（历史记录按归属自然过滤）。自 ADR-0005 起新建的会话都是普通会话（`source: "user"`，不归档）。
@@ -181,7 +181,7 @@ PenguinHarness 的 Skill 是 Agent 本地的 `SKILL.md` 指令包（Agent 自己
 |---|---|
 | `/help` | 命令列表 |
 | `/new` | 新开会话（清 session 绑定） |
-| `/sessions` | 实时列出当前 Project/Agent 下最近 10 个未归档会话（序号/标题/时间/模型，当前会话以 `→` 标出）；查询失败退回本地历史并注明（ADR-0008） |
+| `/sessions` | 实时列出当前 Project/Agent 下未归档会话（序号/标题/时间/模型，最近 50 条并注明总数；当前会话以 `→` 标出）；查询失败退回本地历史并注明（ADR-0008 / ADR-0011） |
 | `/use <n>` | 切到实时列表的第 n 个会话（含远程新建的未归档会话） |
 | `/project` / `/project <名字>` | 列出（owner 会话拉 `GET /api/projects`）/ 切换项目；切项目 = Agent 归位默认 + 换对话（session 按 Agent 隔离） |
 | `/agent` / `/agent <名字>` | 列出（`GET /api/projects/:p/agents`）/ 切换 Agent；切 Agent = 换对话（session 按 Agent 隔离） |
@@ -463,3 +463,15 @@ v1.0.0 发布清单与唯一剩余步骤。
 1. **会话列表实时化（ADR-0008）**：`/sessions` 与 `/use` 改查服务端 `GET /api/projects/:p/agents/:a/sessions`——未归档、按 `lastActiveAt` 倒序前 10 条；本地 Registry 历史降级为查询失败时的兜底（回复中注明）。用户在任何客户端新建的对话从此可见、可跳。
 2. **图片入站（ADR-0009）**：入站消息的 `![Image](img_key)` 占位符在解码时提取为图片 key 并从文本中移除；`message_type` 白名单扩到含 `image`；Channel 适配器新增 `downloadImage(messageId, fileKey)`（lark-cli `im +messages-resources-download`，临时文件即用即删）；`src/images.ts` 纯函数按魔数嗅探 mime、拼 base64 data URL，超服务端 20MB inline 上限或嗅探失败的图片跳过并在输入里注明；`startTask` 入参扩为「字符串或 part 数组」，有图片时投 `[{type:"text"},…{type:"image_url",imageUrl}]`，纯图片消息只投 image_url parts（不注入占位文本，用户拍板）。
 3. **边界**：文件 / 音频 / 视频类消息仍不响应；回复方向不出图；data URL 不落 `runs.jsonl`、不进日志。
+
+---
+
+## 18. v1.5：步骤分组折叠 + /sessions 全量 + HTML 页交付（2026-10-22）
+
+**动因（用户原话）**：「我要的是思考和工具调用等等能被折叠在一起形如图片所示，运行完毕那两步可以被折叠」「/sessions 能展示当前工作区未归档的所有对话，然后 use 支持跳换到那次对话」「要支持对 a2ui 的 ui 图的渲染在飞书中，或者找类似的解决方法，或者可以用 answermewithhtml 找办法」。
+
+三项决策经 a2ui form 拍板（2026-10-22）：① 分组超预算直接丢中间整组（不做组内二级预算）；② `/sessions` 截断到 50 条并注明总数；③ a2ui/mermaid 走 answer-me-with-html 路线（产出单文件 HTML 发进飞书）；④ 分组标题用「🧰 运行完毕 · 2 步 · 41.4s」式（带图标前缀，沿用现有 · 分隔风格）。
+
+1. **步骤分组折叠（ADR-0010）**：连续的思考/工具分区合并为一个默认收起的 `collapsible_panel`，标题「🧰 运行完毕 · N 步 · X.Xs」（流式「🧰 运行中… · N 步」；定稿有步未闭合时不标状态），组内每步一个嵌套折叠面板（工具「🔧 名称 · 状态 · X.Xs · 参数」、思考沿用 ADR-0007 标题），正文与提示行打断分组。`tool_call`/`tool_result` 事件补 `at` 时间戳（omni.ts 从 OmniMessage.timestamp 带出）供每步耗时计算。文本兜底路径不变。
+2. **/sessions 全量（ADR-0011）**：`listSessions` 去掉 10 条截断返回全部未归档会话；展示层截断 50 条 + 头部注明总数；`/use <n>` 口径不变。
+3. **HTML 页交付（ADR-0012）**：远程回复里的 a2ui / mermaid 等富内容，Bridge 用 answer-me-with-html 的渲染器生成单文件 HTML，随 Run 定稿一并作为文件消息发进聊天；飞书卡片保持现状（正文 + 分组折叠），HTML 是「点开即看」的富载体。详见 ADR-0012 与 GLOSSARY「HTML 页」词条。
