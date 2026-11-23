@@ -2,6 +2,8 @@ node_modules/
 dist/
 releases/
 .env
+.env.*
+!.env.example
 state/
 logs/
 *.log

@@ -29,7 +29,8 @@ rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE/dist"
 # 只带运行时入口 dist/src/（dist/test/ 是测试编译产物，运行时不需要）
 cp -r dist/src "$STAGE/dist/"
-cp package.json pnpm-lock.yaml pnpm-workspace.yaml README.md LICENSE CHANGELOG.md .env.example "$STAGE/"
+cp package.json pnpm-lock.yaml pnpm-workspace.yaml README.md LICENSE CHANGELOG.md .env.example THIRD_PARTY_NOTICES.md "$STAGE/"
+cp -r third_party "$STAGE/"
 cp -r scripts deploy "$STAGE/"
 
 echo "==> 安装生产依赖（hoisted 布局，随包分发；--prod 不含 devDependencies）"

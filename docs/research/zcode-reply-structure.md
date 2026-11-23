@@ -2,6 +2,7 @@
 
 - 调研日期：2026-10-21
 - 仓库：https://github.com/zai-org/ZCode （Apache-2.0）
+- 本文包含该项目的源码摘录，许可文本与来源说明见 [第三方声明](../../THIRD_PARTY_NOTICES.md)。
 - 获取方式：`git clone --depth 1` 成功（非逐文件拉取）
 - Commit：`3c5b227649371507ddc4eb46ac5133afe6db1cab`（2026-10-20 14:23:05 +0800，提交信息 "chore: sync ZCode source"）
 - 版本：仓库根 `package.json` version = `3.16.2`；`apps/zcode-cli/package.json` version = `0.17.0`。浅克隆无 tag，故以 package.json 为准。
